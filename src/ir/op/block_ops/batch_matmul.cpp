@@ -20,6 +20,7 @@
 #include <any>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -122,7 +123,9 @@ TypePtr DeduceBlockBatchMatMulType(const std::vector<ExprPtr>& args,
   CHECK(result_dtype) << "The operator " << op_name << " requires compatible data types, but got "
                       << lhs_type->dtype_.ToString() << " and " << rhs_type->dtype_.ToString();
 
-  return std::make_shared<TileType>(output_shape, *result_dtype);
+  TileView tile_view;
+  tile_view.valid_shape = output_shape;
+  return std::make_shared<TileType>(output_shape, *result_dtype, std::nullopt, tile_view);
 }
 
 // ============================================================================

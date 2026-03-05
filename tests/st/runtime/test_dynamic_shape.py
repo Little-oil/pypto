@@ -81,7 +81,7 @@ class DynShapeAddTestCase(PTOTestCase):
                 a_tile = pl.load(a, [0, 0], [rows, cols], target_memory=pl.MemorySpace.Vec)
                 b_tile = pl.load(b, [0, 0], [rows, cols])
                 result = pl.add(a_tile, b_tile)
-                out = pl.store(result, [0, 0], [rows, cols], c)
+                out = pl.store(result, [0, 0], c)
                 return out
 
             @pl.function(type=pl.FunctionType.Orchestration)
@@ -163,7 +163,7 @@ class ValidShapeAddTestCase(PTOTestCase):
                 a_tile = pl.load(a, [0, 0], [rows, cols], valid_shapes=[m, n])
                 b_tile = pl.load(b, [0, 0], [rows, cols], valid_shapes=[m, n])
                 result = pl.add(a_tile, b_tile)
-                out = pl.store(result, [0, 0], [rows, cols], c)
+                out = pl.store(result, [0, 0], c)
                 return out
 
             @pl.function(type=pl.FunctionType.Orchestration)
@@ -239,7 +239,7 @@ class LoopDynShapeAddTestCase(PTOTestCase):
                     a_tile = pl.load(a, [offset, 0], [2, cols], target_memory=pl.MemorySpace.Vec)
                     b_tile = pl.load(b, [offset, 0], [2, cols], target_memory=pl.MemorySpace.Vec)
                     result = pl.add(a_tile, b_tile)
-                    out = pl.store(result, [offset, 0], [2, cols], c)
+                    out = pl.store(result, [offset, 0], c)
                 return out
 
             @pl.function(type=pl.FunctionType.Orchestration)
@@ -279,7 +279,7 @@ class TestDynamicShapeOperations:
         result = test_runner.run(test_case)
         assert result.passed, f"Test failed for shape {shape}: {result.error}"
 
-    @pytest.mark.skip(reason="valid shape expected codegen needs to be clarified")
+    # @pytest.mark.skip(reason="valid shape expected codegen needs to be clarified")
     @pytest.mark.parametrize("shape,valid_shape", [((128, 128), (64, 64))])
     def test_valid_shape_add(self, test_runner, shape, valid_shape):
         """Test add with static tensors and valid_shapes read from an input tensor."""
