@@ -26,6 +26,7 @@ __all__ = [
     "load",
     "store",
     "assemble",
+    "concat",
     "move",
     "full",
     "fillpad",
@@ -108,7 +109,7 @@ __all__ = [
 from pypto.ir.op import tile_ops as _ir_ops
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
-from pypto.pypto_core.ir import Expr, MemorySpace, TilePad
+from pypto.pypto_core.ir import Expr, MemorySpace, PadValue
 
 from ..typing import IntLike, Scalar, Tensor, Tile
 from .system_ops import (  # noqa: F401
@@ -232,6 +233,7 @@ def store(
     tile: Tile,
     offsets: Sequence[IntLike],
     output_tensor: Tensor,
+    shapes: Sequence[IntLike] | None = None,
 ) -> Tensor:
     """Copy data from tile back to tensor.
 
@@ -239,17 +241,20 @@ def store(
         tile: Source tile
         offsets: Offsets in each dimension
         output_tensor: Output tensor
+        shapes: Optional ND partition shape. Injected by FlattenTileNdTo2D for ND tensors.
 
     Returns:
         Tensor wrapping the store operation
 
     Example:
         >>> # 2D store
-        >>> result = store(tile, offsets=[0, 0], output_tensor=tensor)
+        >>> result = store(tile, [0, 0], tensor)
         >>> # 3D store
-        >>> result = store(tile, offsets=[0, 0, 0], output_tensor=tensor)
+        >>> result = store(tile, [0, 0, 0], tensor)
     """
-    call_expr = _ir_ops.store(tile.unwrap(), _normalize_intlike(offsets), output_tensor.unwrap())
+    normalized_offsets = _normalize_intlike(offsets)
+    normalized_shapes = _normalize_intlike(shapes) if shapes is not None else None
+    call_expr = _ir_ops.store(tile.unwrap(), normalized_offsets, output_tensor.unwrap(), normalized_shapes)
     return Tensor(expr=call_expr)
 
 
@@ -265,6 +270,20 @@ def assemble(target: Tile, source: Tile, offset: Sequence[IntLike]) -> Tile:
         Tile wrapping the assemble operation
     """
     call_expr = _ir_ops.assemble(target.unwrap(), source.unwrap(), _normalize_intlike(offset))
+    return Tile(expr=call_expr)
+
+
+def concat(src0: Tile, src1: Tile) -> Tile:
+    """Concatenate two tiles along the column dimension.
+
+    Args:
+        src0: First source tile
+        src1: Second source tile
+
+    Returns:
+        Tile with concatenated columns
+    """
+    call_expr = _ir_ops.concat(src0.unwrap(), src1.unwrap())
     return Tile(expr=call_expr)
 
 
@@ -297,12 +316,12 @@ def full(shape: list[int], dtype: DataType, value: int | float) -> Tile:
     return Tile(expr=call_expr)
 
 
-def fillpad(tile: Tile, pad_value: TilePad = TilePad.zero) -> Tile:
+def fillpad(tile: Tile, pad_value: PadValue = PadValue.zero) -> Tile:
     """Fill remaining tile elements with specified padding value.
 
     Args:
         tile: Input tile
-        pad_value: Padding mode (TilePad.zero, TilePad.max, or TilePad.min). Default is zero.
+        pad_value: Padding mode (PadValue.zero, PadValue.max, or PadValue.min). Default is zero.
 
     Returns:
         Tile wrapping the fillpad operation

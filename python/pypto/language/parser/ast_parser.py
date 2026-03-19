@@ -123,6 +123,7 @@ class ASTParser:
 
         # Track loop kinds for break/continue validation
         self._loop_kind_stack: list[str] = []
+        self._scope_kind_stack: list[ir.ScopeKind] = []
 
         # Inline function expansion state
         self._inline_mode = False
@@ -177,6 +178,19 @@ class ASTParser:
         if self._current_yield_types is not None:
             if len(yield_exprs) == 1:
                 self._current_yield_types.setdefault(var_name, yield_exprs[0].type)
+
+    @contextmanager
+    def _scope_kind_context(self, scope_kind: ir.ScopeKind) -> Iterator[None]:
+        """Track scope nesting during parsing for context-sensitive validation."""
+        self._scope_kind_stack.append(scope_kind)
+        try:
+            yield
+        finally:
+            self._scope_kind_stack.pop()
+
+    def _is_inside_scope(self, scope_kind: ir.ScopeKind) -> bool:
+        """Return whether parsing is currently nested inside the given scope kind."""
+        return scope_kind in self._scope_kind_stack
 
     def parse_function(
         self,
@@ -725,6 +739,12 @@ class ASTParser:
 
     def _validate_chunk_args(self, chunk_expr: Any, init_values: list[Any], iter_call: ast.Call) -> None:
         """Validate chunk arguments for range/parallel/unroll loops."""
+        if not self._is_inside_scope(ir.ScopeKind.AutoInCore):
+            raise ParserSyntaxError(
+                "chunk=... loops are only valid inside with pl.auto_incore():",
+                span=self.span_tracker.get_span(iter_call),
+                hint="Wrap the loop in 'with pl.auto_incore():' or remove the chunk= argument.",
+            )
         if not _is_const_int(chunk_expr):
             raise ParserSyntaxError(
                 "chunk must be a compile-time constant positive integer",
@@ -1195,6 +1215,28 @@ class ASTParser:
             self._loop_kind_stack.pop()
             self.current_loop_builder = None
 
+    def _parse_if_else_branch(
+        self,
+        stmt: ast.If,
+        if_builder: Any,
+        should_leak: bool,
+        pre_if_parent_scope: dict | None,
+        post_then_parent_scope: dict | None,
+    ) -> None:
+        """Parse the else branch of an if statement and restore then-branch leaks."""
+        if should_leak and pre_if_parent_scope is not None:
+            self.scope_manager.scopes[-1] = dict(pre_if_parent_scope)
+        if_builder.else_()
+        self.scope_manager.enter_scope("else")
+        for else_stmt in stmt.orelse:
+            self.parse_statement(else_stmt)
+        self.scope_manager.exit_scope(leak_vars=should_leak)
+        # Re-apply then-branch leaks so they are visible after the if.
+        if should_leak and post_then_parent_scope is not None:
+            for name, val in post_then_parent_scope.items():
+                if name not in (pre_if_parent_scope or {}):
+                    self.scope_manager.scopes[-1][name] = val
+
     def parse_if_statement(self, stmt: ast.If) -> None:
         """Parse if statement with phi nodes.
 
@@ -1233,19 +1275,24 @@ class ASTParser:
                 # Determine if we should leak variables (no explicit yields)
                 should_leak = not bool(then_yield_vars)
 
+                # Snapshot parent scope before then branch so else branch
+                # does not see variables leaked from then branch.
+                pre_if_parent_scope = dict(self.scope_manager.scopes[-1]) if should_leak else None
+
                 # Parse then branch (yield types captured via _current_yield_types)
                 self.scope_manager.enter_scope("if")
                 for then_stmt in stmt.body:
                     self.parse_statement(then_stmt)
                 self.scope_manager.exit_scope(leak_vars=should_leak)
 
+                # Capture what then branch leaked into parent scope before restoring.
+                post_then_parent_scope = dict(self.scope_manager.scopes[-1]) if should_leak else None
+
                 # Parse else branch if present
                 if stmt.orelse:
-                    if_builder.else_()
-                    self.scope_manager.enter_scope("else")
-                    for else_stmt in stmt.orelse:
-                        self.parse_statement(else_stmt)
-                    self.scope_manager.exit_scope(leak_vars=should_leak)
+                    self._parse_if_else_branch(
+                        stmt, if_builder, should_leak, pre_if_parent_scope, post_then_parent_scope
+                    )
 
                 # Declare return vars AFTER parsing branches so captured yield types
                 # are available for unannotated yields (fixes issue #233 / #234)
@@ -1379,10 +1426,11 @@ class ASTParser:
                     span = self.span_tracker.get_span(stmt)
 
                     with self.builder.scope(scope_kind, span):
-                        self.scope_manager.enter_scope("scope")
-                        for body_stmt in stmt.body:
-                            self.parse_statement(body_stmt)
-                        self.scope_manager.exit_scope(leak_vars=True)
+                        with self._scope_kind_context(scope_kind):
+                            self.scope_manager.enter_scope("scope")
+                            for body_stmt in stmt.body:
+                                self.parse_statement(body_stmt)
+                            self.scope_manager.exit_scope(leak_vars=True)
                     return
 
                 # NEW: pl.at(level=..., role=...)
@@ -1391,10 +1439,11 @@ class ASTParser:
                     span = self.span_tracker.get_span(stmt)
 
                     with self.builder.scope(ir.ScopeKind.Hierarchy, span, level=level, role=role):
-                        self.scope_manager.enter_scope("scope")
-                        for body_stmt in stmt.body:
-                            self.parse_statement(body_stmt)
-                        self.scope_manager.exit_scope(leak_vars=True)
+                        with self._scope_kind_context(ir.ScopeKind.Hierarchy):
+                            self.scope_manager.enter_scope("scope")
+                            for body_stmt in stmt.body:
+                                self.parse_statement(body_stmt)
+                            self.scope_manager.exit_scope(leak_vars=True)
                     return
 
         # Unsupported context manager
