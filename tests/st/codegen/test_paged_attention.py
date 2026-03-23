@@ -103,23 +103,34 @@ class QKMatmulTestCase(PTOTestCase):
 
 
 class SoftmaxPrepareTestCase(PTOTestCase):
-    """Test case for softmax_prepare kernel.
+    """Test case for softmax_prepare kernel with unaligned support.
 
     Computes:
-      sij_scaled = sij * scale
+      sij_scaled = sij * scale  (invalid positions padded with -inf via fillpad)
       mij = row_max(sij_scaled)        -> (num_heads, 1)
       pij = exp(sij_scaled - mij)      -> (num_heads, block_size)
       lij = row_sum(pij)               -> (num_heads, 1)
+
+    valid_len controls how many columns are valid. When valid_len < block_size,
+    positions beyond valid_len are padded with -inf before softmax.
     """
 
-    def __init__(self, num_heads: int = 16, block_size: int = 16, scale: float = DEFAULT_SCALE, **kwargs):
+    def __init__(
+        self,
+        num_heads: int = 16,
+        block_size: int = 16,
+        scale: float = DEFAULT_SCALE,
+        valid_len: int | None = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.num_heads = num_heads
         self.block_size = block_size
         self.scale = scale
+        self.valid_len = valid_len if valid_len is not None else block_size
 
     def get_name(self) -> str:
-        return f"softmax_prepare_{self.num_heads}h_{self.block_size}b"
+        return f"softmax_prepare_{self.num_heads}h_{self.block_size}b_v{self.valid_len}"
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
@@ -127,8 +138,14 @@ class SoftmaxPrepareTestCase(PTOTestCase):
                 "sij", [self.num_heads, self.block_size], DataType.FP32, init_value=1.0
             ),  # attention scores input: [num_heads, block_size]
             TensorSpec(
-                "config", [1], DataType.FP32, init_value=self.scale
+                "scale_config", [1], DataType.FP32, init_value=self.scale
             ),  # single-element FP32 tensor storing the scale factor
+            TensorSpec(
+                "valid_len_config",
+                [1],
+                DataType.INT64,
+                init_value=torch.tensor([self.valid_len], dtype=torch.int64),
+            ),  # valid column count for unaligned support
             TensorSpec(
                 "pij", [self.num_heads, self.block_size], DataType.BF16, is_output=True
             ),  # exp(sij_scaled - mij) output: [num_heads, block_size]
@@ -147,25 +164,33 @@ class SoftmaxPrepareTestCase(PTOTestCase):
             def orchestrator(
                 self,
                 sij: pl.Tensor[[16, 128], pl.FP32],
-                config: pl.Tensor[[1], pl.FP32],
+                scale_config: pl.Tensor[[1], pl.FP32],
+                valid_len_config: pl.Tensor[[1], pl.INT64],
                 pij_out: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
                 mij_out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
                 lij_out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
             ) -> tuple[
                 pl.Tensor[[16, 128], pl.BF16], pl.Tensor[[16, 1], pl.FP32], pl.Tensor[[16, 1], pl.FP32]
             ]:
-                # Read scale value from config tensor
-                scale: pl.Scalar[pl.FP32] = pl.tensor.read(config, [0])
-                pij_out, mij_out, lij_out = kernel_softmax_prepare(sij, scale, pij_out, mij_out, lij_out)
+                # Read scale and valid_len from config tensors
+                scale: pl.Scalar[pl.FP32] = pl.tensor.read(scale_config, [0])
+                valid_len: pl.Scalar[pl.INT64] = pl.tensor.read(valid_len_config, [0])
+                pij_out, mij_out, lij_out = kernel_softmax_prepare(
+                    sij, valid_len, scale, pij_out, mij_out, lij_out
+                )
                 return pij_out, mij_out, lij_out
 
         return SoftmaxPrepareProgram
 
     def compute_expected(self, tensors, params=None):
-        # Read scale directly from the FP32 config tensor
-        scale = tensors["config"][0]
+        scale = tensors["scale_config"][0]
+        valid_len = int(tensors["valid_len_config"][0].item())
 
-        sij = tensors["sij"]
+        sij = tensors["sij"].clone()
+        # Mask invalid positions with -inf for unaligned support
+        if valid_len < sij.shape[1]:
+            sij[:, valid_len:] = float("-inf")
+
         sij_scaled = sij * scale
         mij = torch.max(sij_scaled, axis=1, keepdims=True).values
         pij = torch.exp(sij_scaled - mij)
@@ -521,7 +546,7 @@ class SoftmaxPreparePTOASTestCase(PTOASTestCaseMixin, SoftmaxPrepareTestCase):
     """Test softmax prepare with PTO backend and PTOAS optimization strategy."""
 
     def get_name(self) -> str:
-        return f"softmax_prepare_ptoas_{self.num_heads}h_{self.block_size}b"
+        return f"softmax_prepare_ptoas_{self.num_heads}h_{self.block_size}b_v{self.valid_len}"
 
 
 class PVMatmulPTOASTestCase(PTOASTestCaseMixin, PVMatmulTestCase):
@@ -561,9 +586,9 @@ class TestPagedAttentionKernels:
         assert result.passed, f"QK matmul test failed: {result.error}"
 
     @pytest.mark.skip("Skip CCE backend")
-    @pytest.mark.parametrize("num_heads,block_size", [(16, 128)])
-    def test_softmax_prepare(self, test_runner, num_heads, block_size):
-        test_case = SoftmaxPrepareTestCase(num_heads=num_heads, block_size=block_size)
+    @pytest.mark.parametrize("num_heads,block_size,valid_len", [(16, 128, 128), (16, 128, 100)])
+    def test_softmax_prepare(self, test_runner, num_heads, block_size, valid_len):
+        test_case = SoftmaxPrepareTestCase(num_heads=num_heads, block_size=block_size, valid_len=valid_len)
         result = test_runner.run(test_case)
         assert result.passed, f"Softmax prepare test failed: {result.error}"
 
@@ -623,10 +648,12 @@ class TestPagedAttentionKernels:
         result = test_runner.run(test_case)
         assert result.passed, f"QK matmul PTOAS test failed: {result.error}"
 
-    @pytest.mark.parametrize("num_heads,block_size", [(16, 128)])
-    def test_softmax_prepare_ptoas(self, test_runner, num_heads, block_size):
+    @pytest.mark.parametrize("num_heads,block_size,valid_len", [(16, 128, 128), (16, 128, 100)])
+    def test_softmax_prepare_ptoas(self, test_runner, num_heads, block_size, valid_len):
         """Test softmax prepare with PTO backend and PTOAS optimization."""
-        test_case = SoftmaxPreparePTOASTestCase(num_heads=num_heads, block_size=block_size)
+        test_case = SoftmaxPreparePTOASTestCase(
+            num_heads=num_heads, block_size=block_size, valid_len=valid_len
+        )
         result = test_runner.run(test_case)
         assert result.passed, f"Softmax prepare PTOAS test failed: {result.error}"
 
@@ -659,7 +686,8 @@ class TestPagedAttentionKernels:
     @pytest.mark.parametrize(
         "batch,num_heads,head_dim,block_size,context_len,max_model_len",
         [
-            (64, 16, 128, 128, 8192, 32768),
+            (64, 16, 128, 128, 8192, 32768),  # aligned: context_len % block_size == 0
+            (64, 16, 128, 128, 8100, 32768),  # unaligned: context_len % block_size != 0
         ],
     )
     def test_paged_attention_ptoas(

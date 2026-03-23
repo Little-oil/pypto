@@ -77,6 +77,7 @@ def kernel_qk_matmul(
 @pl.function(type=pl.FunctionType.InCore)
 def kernel_softmax_prepare(
     sij: pl.Tensor[[16, 128], pl.FP32],
+    valid_len: pl.Scalar[pl.INT64],
     scale: pl.Scalar[pl.FP32],
     out_pij: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
     out_mi: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
@@ -86,9 +87,14 @@ def kernel_softmax_prepare(
     pl.Tensor[[16, 1], pl.FP32],
     pl.Tensor[[16, 1], pl.FP32],
 ]:
-    """Softmax prepare: scale, row_max, exp, row_sum (VECTOR)."""
-    s_tile = pl.load(sij, [0, 0], [16, 128], target_memory=pl.MemorySpace.Vec)
-    scaled = pl.mul(s_tile, scale)
+    """Softmax prepare: scale, row_max, exp, row_sum (VECTOR).
+
+    Supports unaligned sequences via valid_len: positions beyond valid_len
+    are padded with -inf (PadValue.min) so that exp(-inf) = 0.
+    """
+    s_tile = pl.load(sij, [0, 0], [16, 128], target_memory=pl.MemorySpace.Vec, valid_shapes=[16, valid_len])
+    s_padded = pl.tile.fillpad(s_tile, pad_value=pl.PadValue.min)
+    scaled = pl.mul(s_padded, scale)
     tmp_tile = pl.create_tile([16, 128], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
     mi_tile = pl.row_max(scaled, tmp_tile)
     sij_centered = pl.row_expand_sub(scaled, mi_tile)
@@ -322,11 +328,6 @@ def build_paged_attention_program(
 
                         # QK matmul (CUBE) via shared module-level InCore kernel
                         sij = kernel_qk_matmul(qi, kj, sij_buf)
-                        sij_valid: pl.Tensor[[q_tile, valid_len], pl.FP32] = pl.slice(
-                            sij,
-                            [q_tile, valid_len],
-                            [0, 0],
-                        )
 
                         pij_f16_buf: pl.Tensor[[q_tile, block_size_cfg], pl.BF16] = pl.create_tensor(
                             [q_tile, block_size_cfg],
@@ -341,7 +342,8 @@ def build_paged_attention_program(
 
                         # Softmax prepare (VECTOR) via shared module-level InCore kernel
                         pij_f16, mi, li = kernel_softmax_prepare(
-                            sij_valid,
+                            sij,
+                            valid_len,
                             1.0,  # type: ignore[reportArgumentType]
                             pij_f16_buf,
                             mi_sm_buf,

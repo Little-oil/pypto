@@ -707,12 +707,12 @@ void PTOCodegen::EmitAllocTileForVar(const ir::VarPtr& tile_var,
     const auto& tv = tile_type->tile_view_.value();
     if (tv.valid_shape.size() >= 1) {
       if (auto var = As<ir::Var>(tv.valid_shape[0])) {
-        valid_row_mlir = GetVarName(var);
+        valid_row_mlir = EmitCastToIndex(var, GetVarName(var));
       }
     }
     if (tv.valid_shape.size() >= 2) {
       if (auto var = As<ir::Var>(tv.valid_shape[1])) {
-        valid_col_mlir = GetVarName(var);
+        valid_col_mlir = EmitCastToIndex(var, GetVarName(var));
       }
     }
   }
@@ -1355,6 +1355,18 @@ std::string PTOCodegen::EmitArithCmpi(const std::string& predicate, const std::s
   std::string result = NewTemp();
   Emit(result + " = arith.cmpi " + predicate + ", " + lhs + ", " + rhs + " : " + operand_type);
   return result;
+}
+
+std::string PTOCodegen::EmitCastToIndex(const ir::VarPtr& var, const std::string& mlir_name) {
+  if (auto scalar_type = As<ScalarType>(var->GetType())) {
+    if (scalar_type->dtype_ != DataType::INDEX) {
+      std::string idx_name = NewNamedTemp(var->name_hint_ + "_idx");
+      std::string src_type = GetTypeString(scalar_type->dtype_);
+      Emit(idx_name + " = arith.index_cast " + mlir_name + " : " + src_type + " to index");
+      return idx_name;
+    }
+  }
+  return mlir_name;
 }
 
 void PTOCodegen::VisitBinaryArithExpr(const BinaryExprPtr& op, const std::string& int_op,

@@ -425,6 +425,9 @@ class PTOCodegen : public CodegenBase {
   std::string EmitArithCmpi(const std::string& predicate, const std::string& lhs, const std::string& rhs,
                             const std::string& operand_type);
 
+  /// Emit arith.index_cast if the variable is not index type, return SSA result name
+  std::string EmitCastToIndex(const ir::VarPtr& var, const std::string& mlir_name);
+
   /// Helper for binary expression visitors
   void VisitBinaryArithExpr(const ir::BinaryExprPtr& op, const std::string& int_op,
                             const std::string& float_op);
