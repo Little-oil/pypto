@@ -262,6 +262,10 @@ static std::string MakePrintCodegenPTO(const std::string& pto_op_name, const Cal
 }
 
 // tile.load: emit pto.subview + pto.tload
+// When the output tile has dynamic v_col (from valid_shapes), TLOAD with a dynamic tile
+// causes DMA row stride mismatch: gmGap = (gStride3 - gShape4) * sizeof(T) = 0 but
+// lenBurst = validCol * sizeof(T) < row_size, shifting subsequent rows.
+// Fix: allocate a static temp tile for TLOAD, then pto.tmov to the dynamic tile.
 static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
   auto tensor = AsVarLike(op->args_[0]);
@@ -286,6 +290,11 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
 
   std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
   std::string tile_buf_type = codegen.GetCurrentResultTileBufTypeString();
+  std::string static_tile_buf_type = codegen.GetCurrentResultStaticTileBufTypeString();
+
+  // Check if the output tile has dynamic v_col/v_row (types differ when dynamic)
+  bool has_dynamic_valid_shape = (tile_buf_type != static_tile_buf_type);
+
   // Build partition type with all ND dimensions to match the sizes attribute.
   std::string partition_type = "!pto.partition_tensor_view<";
   for (size_t i = 0; i < ndim; ++i) {
@@ -313,10 +322,29 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   partition_line << " : " << tensor_view_type << " -> " << partition_type;
   codegen.Emit(partition_line.str());
 
-  std::ostringstream tload_line;
-  tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
-  tload_line << tile_buf << " : " << tile_buf_type << ")";
-  codegen.Emit(tload_line.str());
+  if (has_dynamic_valid_shape) {
+    // Dynamic v_col: TLOAD into a static temp tile, then TMOV to the dynamic tile.
+    // This ensures PTOAS uses the static buffer tile for DMA (correct row stride),
+    // while the dynamic tile retains its v_col for downstream TFILLPAD boundary.
+    std::string static_buf = codegen.AllocNewTileBuf(static_tile_buf_type, "tload_static");
+    codegen.RegisterTileBufType(static_buf, static_tile_buf_type);
+
+    std::ostringstream tload_line;
+    tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
+    tload_line << static_buf << " : " << static_tile_buf_type << ")";
+    codegen.Emit(tload_line.str());
+
+    // TMOV from static tile to dynamic tile
+    std::ostringstream tmov_line;
+    tmov_line << "pto.tmov ins(" << static_buf << " : " << static_tile_buf_type << ") outs(";
+    tmov_line << tile_buf << " : " << tile_buf_type << ")";
+    codegen.Emit(tmov_line.str());
+  } else {
+    std::ostringstream tload_line;
+    tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
+    tload_line << tile_buf << " : " << tile_buf_type << ")";
+    codegen.Emit(tload_line.str());
+  }
   return "";
 }
 

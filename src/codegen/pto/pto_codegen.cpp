@@ -152,11 +152,90 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
     ir::IRVisitor::VisitExpr_(op);
   }
 
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    // Normal traversal first (adds MemRefs for both input and output tiles)
+    ir::IRVisitor::VisitStmt_(op);
+
+    auto call = ir::As<ir::Call>(op->value_);
+    if (!call || !call->op_ || call->args_.empty()) return;
+
+    if (call->op_->name_ == "tile.fillpad") {
+      // TFILLPAD reads the padding boundary from the INPUT tile's v_col, not the
+      // output's.  After fillpad, ALL positions in the output buffer are valid
+      // (real data in [0, v_col) and pad value in [v_col, cols)), so the output
+      // must keep static v_col (the full column count).  DO NOT propagate the
+      // input's dynamic valid_shape to the output — that would make downstream
+      // compute ops (TMULS, TROWMAX, …) process only v_col elements instead of
+      // the full tile width, leaving the padded positions as uninitialised garbage.
+      //
+      // The only thing we need to ensure is that the output MemRef carries the
+      // pad attribute (e.g. pad=3 for PadValue::Min) so PTOAS emits the correct
+      // PadValue on the static alloc_tile.
+      auto output_type = ir::As<ir::TileType>(op->var_->GetType());
+      if (!output_type || !output_type->memref_.has_value()) return;
+
+      const ir::MemRef* out_memref = output_type->memref_->get();
+      auto it = memref_tile_types_.find(out_memref);
+      if (it == memref_tile_types_.end()) return;
+
+      auto existing = it->second;
+      ir::TileView merged_view;
+      if (existing->tile_view_.has_value()) {
+        merged_view = existing->tile_view_.value();
+      }
+
+      // Ensure pad value from the DSL (e.g. pad_value=PadValue.min) is preserved.
+      if (output_type->tile_view_.has_value() && output_type->tile_view_->pad != ir::PadValue::null) {
+        merged_view.pad = output_type->tile_view_->pad;
+      }
+
+      it->second = std::make_shared<TileType>(existing->shape_, existing->dtype_, existing->memref_,
+                                              merged_view, existing->memory_space_);
+      // Mark as post-fillpad so downstream logic can clear any stale valid_shape.
+      post_fillpad_memrefs_.insert(out_memref);
+      return;
+    }
+
+    // For tile ops downstream of fillpad: clear dynamic v_col.
+    // After fillpad, all positions contain valid data (real data or pad value),
+    // so downstream compute/store ops should process the full tile.
+    if (call->op_->name_.compare(0, 5, "tile.") != 0) return;
+
+    bool any_input_post_fillpad = false;
+    for (const auto& arg : call->args_) {
+      auto arg_type = ir::As<ir::TileType>(arg->GetType());
+      if (!arg_type || !arg_type->memref_.has_value()) continue;
+      if (post_fillpad_memrefs_.count(arg_type->memref_->get())) {
+        any_input_post_fillpad = true;
+        break;
+      }
+    }
+    if (!any_input_post_fillpad) return;
+
+    auto output_type = ir::As<ir::TileType>(op->var_->GetType());
+    if (!output_type || !output_type->memref_.has_value()) return;
+
+    const ir::MemRef* out_memref = output_type->memref_->get();
+    post_fillpad_memrefs_.insert(out_memref);
+
+    auto it = memref_tile_types_.find(out_memref);
+    if (it == memref_tile_types_.end()) return;
+
+    auto existing = it->second;
+    if (!existing->tile_view_.has_value() || existing->tile_view_->valid_shape.empty()) return;
+
+    ir::TileView merged_view = existing->tile_view_.value();
+    merged_view.valid_shape.clear();
+    it->second = std::make_shared<TileType>(existing->shape_, existing->dtype_, existing->memref_,
+                                            merged_view, existing->memory_space_);
+  }
+
  private:
   std::vector<MemRefPtr> memrefs_;
   std::set<const ir::MemRef*> seen_ptrs_;
   std::map<const ir::MemRef*, std::shared_ptr<const TileType>> memref_tile_types_;
   std::set<uint64_t> iter_arg_ids_;
+  std::set<const ir::MemRef*> post_fillpad_memrefs_;
 
   void AddMemRefIfUnique(const MemRefPtr& memref, const std::shared_ptr<const TileType>& tile_type) {
     const ir::MemRef* raw_ptr = memref.get();
@@ -1242,6 +1321,34 @@ std::string PTOCodegen::GetTileBufTypeString(const ir::MemRef* memref) const {
                                  v_row_dynamic, v_col_dynamic);
 }
 
+std::string PTOCodegen::GetTileBufTypeStringStatic(const ir::MemRef* memref) const {
+  auto tile_it = memref_to_tile_type_.find(memref);
+  INTERNAL_CHECK(tile_it != memref_to_tile_type_.end())
+      << "Internal error: missing tile type for MemRef '" << memref->name_hint_ << "'";
+  auto memory_space = tile_it->second->GetMemorySpace();
+  INTERNAL_CHECK(memory_space.has_value()) << "Internal error: tile type must have memory_space";
+
+  std::string loc = MemorySpaceToMLIR(*memory_space);
+  std::string dtype_str = "f32";
+  int64_t rows = 32;
+  int64_t cols = 32;
+  ir::TileLayout blayout = ir::TileLayout::row_major;
+  ir::TileLayout slayout = ir::TileLayout::none_box;
+  uint64_t fractal = 512;
+  ir::PadValue pad = ir::PadValue::null;
+
+  int64_t v_row = rows;
+  int64_t v_col = cols;
+  bool v_row_dynamic = false;
+  bool v_col_dynamic = false;
+  ExtractTileTypeInfo(*tile_it->second, *this, dtype_str, rows, cols, blayout, slayout, fractal, pad, v_row,
+                      v_col, v_row_dynamic, v_col_dynamic);
+
+  // Force static: use physical rows/cols for v_row/v_col, ignore dynamic flags
+  return FormatTileBufTypeString(loc, dtype_str, rows, cols, blayout, slayout, fractal, pad, rows, cols,
+                                 false, false);
+}
+
 std::string PTOCodegen::GetTileBufTypeStringFromTileType(
     const std::shared_ptr<const ir::TileType>& tile_type) const {
   INTERNAL_CHECK(tile_type) << "Internal error: tile_type must not be null";
@@ -1328,6 +1435,13 @@ std::string PTOCodegen::GetExprTypeAnnotation(const ir::ExprPtr& expr) {
 std::string PTOCodegen::GetCurrentResultTileBufTypeString() const {
   if (current_result_tile_type_ && current_result_tile_type_->memref_.has_value()) {
     return GetTileBufTypeString(current_result_tile_type_->memref_.value().get());
+  }
+  return "";
+}
+
+std::string PTOCodegen::GetCurrentResultStaticTileBufTypeString() const {
+  if (current_result_tile_type_ && current_result_tile_type_->memref_.has_value()) {
+    return GetTileBufTypeStringStatic(current_result_tile_type_->memref_.value().get());
   }
   return "";
 }

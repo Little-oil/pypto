@@ -158,6 +158,15 @@ class PTOCodegen : public CodegenBase {
   std::string GetTileBufTypeString(const ir::MemRef* memref) const;
 
   /**
+   * @brief Get tile_buf type string with forced static v_row/v_col
+   *
+   * Same as GetTileBufTypeString() but always emits concrete v_row/v_col values
+   * (physical rows/cols) instead of dynamic "?". Used for pto.tload output type
+   * so PTOAS selects the static buffer tile for DMA, not the dynamic view tile.
+   */
+  std::string GetTileBufTypeStringStatic(const ir::MemRef* memref) const;
+
+  /**
    * @brief Get type annotation for an expression (for ins/outs clauses)
    */
   std::string GetExprTypeAnnotation(const ir::ExprPtr& expr);
@@ -169,6 +178,14 @@ class PTOCodegen : public CodegenBase {
    * type is consistent with the SSA value's definition.
    */
   std::string GetCurrentResultTileBufTypeString() const;
+
+  /**
+   * @brief Get static tile_buf type string for the current assignment result target
+   *
+   * Same as GetCurrentResultTileBufTypeString() but forces static v_row/v_col.
+   * Used for pto.tload so PTOAS uses the static buffer tile for DMA.
+   */
+  std::string GetCurrentResultStaticTileBufTypeString() const;
 
   /**
    * @brief Get tile_buf type string from the current result's own TileType

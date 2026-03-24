@@ -135,8 +135,8 @@ class SoftmaxPrepareTestCase(PTOTestCase):
     def define_tensors(self) -> list[TensorSpec]:
         return [
             TensorSpec(
-                "sij", [self.num_heads, self.block_size], DataType.FP32, init_value=1.0
-            ),  # attention scores input: [num_heads, block_size]
+                "sij", [self.num_heads, self.block_size], DataType.FP32, init_value=torch.randn
+            ),  # attention scores input: random data for realistic testing
             TensorSpec(
                 "scale_config", [1], DataType.FP32, init_value=self.scale
             ),  # single-element FP32 tensor storing the scale factor
@@ -147,14 +147,14 @@ class SoftmaxPrepareTestCase(PTOTestCase):
                 init_value=torch.tensor([self.valid_len], dtype=torch.int64),
             ),  # valid column count for unaligned support
             TensorSpec(
-                "pij", [self.num_heads, self.block_size], DataType.BF16, is_output=True
-            ),  # exp(sij_scaled - mij) output: [num_heads, block_size]
+                "pij", [self.num_heads, self.block_size], DataType.BF16, init_value=999.0, is_output=True
+            ),  # init with non-zero to detect incomplete writes
             TensorSpec(
-                "mij", [self.num_heads, 1], DataType.FP32, is_output=True
-            ),  # row-max output: [num_heads, 1]
+                "mij", [self.num_heads, 1], DataType.FP32, init_value=999.0, is_output=True
+            ),  # init with non-zero to detect incomplete writes
             TensorSpec(
-                "lij", [self.num_heads, 1], DataType.FP32, is_output=True
-            ),  # row-sum of pij output: [num_heads, 1]
+                "lij", [self.num_heads, 1], DataType.FP32, init_value=999.0, is_output=True
+            ),  # init with non-zero to detect incomplete writes
         ]
 
     def get_program(self) -> Any:
@@ -683,6 +683,7 @@ class TestPagedAttentionKernels:
             f"Online update PTOAS test failed (is_first={is_first}, is_last={is_last}): {result.error}"
         )
 
+    # @pytest.mark.skip("Skip full paged attention PTOAS - testing individual kernels first")
     @pytest.mark.parametrize(
         "batch,num_heads,head_dim,block_size,context_len,max_model_len",
         [

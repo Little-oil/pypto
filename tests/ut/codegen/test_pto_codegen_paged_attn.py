@@ -318,6 +318,53 @@ def test_unaligned_tile_ops_codegen():
                 or "PadValue" in mlir_code
             ), f"softmax_prepare MLIR should contain fillpad/padding related ops:\n{mlir_code}"
 
+            # Verify sij_padded alloc_tile has STATIC v_col and pad=3 (min).
+            # TFILLPAD reads the padding boundary from the INPUT tile's v_col,
+            # NOT the output's.  After fillpad all positions are valid (real data
+            # or pad value), so the output must keep static v_col so downstream
+            # compute ops (TMULS, TROWMAX, …) process the full tile width.
+            padded_alloc_lines = [
+                line for line in mlir_code.split("\n") if "sij_padded" in line and "alloc_tile" in line
+            ]
+            assert padded_alloc_lines, f"softmax_prepare MLIR should have sij_padded alloc_tile:\n{mlir_code}"
+            padded_line = padded_alloc_lines[0]
+            assert "v_col=?" not in padded_line, (
+                f"sij_padded alloc_tile should have STATIC v_col (not v_col=?) "
+                f"so downstream ops process all columns, got:\n{padded_line}"
+            )
+            assert "pad=3" in padded_line, (
+                f"sij_padded alloc_tile should have pad=3 (min padding), got:\n{padded_line}"
+            )
+
+            # Verify sij_tile alloc_tile has dynamic v_col (PTOAS needs it for TFILLPAD boundary)
+            sij_tile_alloc_lines = [
+                line for line in mlir_code.split("\n") if "sij_tile" in line and "alloc_tile" in line
+            ]
+            if sij_tile_alloc_lines:
+                assert "v_col=?" in sij_tile_alloc_lines[0], (
+                    f"sij_tile alloc_tile should have dynamic v_col (v_col=?) "
+                    f"so PTOAS creates both static and dynamic view tiles, "
+                    f"got:\n{sij_tile_alloc_lines[0]}"
+                )
+
+            # Verify tload outs uses a STATIC tile buffer (not the dynamic sij_tile).
+            # TLOAD with dynamic v_col causes DMA row stride mismatch, so we load
+            # into a static temp tile and then tmov to the dynamic tile.
+            tload_lines = [line for line in mlir_code.split("\n") if "pto.tload" in line]
+            assert tload_lines, f"softmax_prepare MLIR should contain pto.tload:\n{mlir_code}"
+            for tload_line in tload_lines:
+                assert "v_col=?" not in tload_line, (
+                    f"pto.tload outs type must use STATIC v_col (not v_col=?) "
+                    f"so PTOAS uses the static buffer tile for DMA, got:\n{tload_line}"
+                )
+
+            # Verify tmov copies from static tload buffer to dynamic tile
+            tmov_lines = [line for line in mlir_code.split("\n") if "pto.tmov" in line]
+            assert tmov_lines, (
+                f"softmax_prepare MLIR should contain pto.tmov "
+                f"(copies tload result to dynamic tile):\n{mlir_code}"
+            )
+
 
 if __name__ == "__main__":
     pytest.main([__file__])
