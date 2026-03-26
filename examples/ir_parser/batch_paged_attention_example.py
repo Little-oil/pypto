@@ -184,13 +184,12 @@ def BuildBatchPagedAttentionProgram(
                     [b * q_tile, 0],
                     [q_tile, block_size],
                     target_memory=pl.MemorySpace.Vec,
+                    valid_shapes=[q_tile, valid_len],
                 )
 
-                # Keep the allocated tile static and narrow only the logical valid columns.
-                sij_dyn = pl.tile.slice(s_tile, [q_tile, block_size], [0, 0], valid_shape=[q_tile, valid_len])
-                s_tile = pl.tile.fillpad(sij_dyn)
+                s_padded = pl.tile.fillpad(s_tile, pad_value=pl.PadValue.min)
 
-                scaled = pl.mul(s_tile, scale_value)
+                scaled = pl.mul(s_padded, scale_value)
                 tmp_tile = pl.create_tile(
                     [q_tile, block_size],
                     dtype=pl.FP32,
