@@ -18,7 +18,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 EN = ROOT / "docs" / "en"
 ZH = ROOT / "docs" / "zh-cn"
-ZH_ONLY_ALLOWLIST = frozenset({"dev/ptoas-op-addition-plan.md"})
+ZH_ONLY_ALLOWLIST = frozenset(
+    {
+        "dev/ptoas-op-addition-plan.md",
+        "dev/ptoas-op-status.md",
+    }
+)
 
 
 def rel_mds(base: Path) -> set[str]:

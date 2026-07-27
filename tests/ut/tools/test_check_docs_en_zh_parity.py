@@ -27,22 +27,35 @@ def _load_docs_parity() -> ModuleType:
 docs_parity = _load_docs_parity()
 
 
-def test_allowlisted_addition_plan_may_be_zh_only():
-    en = {"dev/ptoas-op-status.md"}
-    zh = {"dev/ptoas-op-status.md", "dev/ptoas-op-addition-plan.md"}
+def test_allowlisted_ptoas_docs_may_be_zh_only():
+    en = {"dev/paired.md"}
+    zh = {
+        "dev/paired.md",
+        "dev/ptoas-op-addition-plan.md",
+        "dev/ptoas-op-status.md",
+    }
 
     assert docs_parity._find_unpaired_paths(en, zh) == ([], [])
 
 
 def test_other_zh_only_path_is_reported():
-    en = {"dev/ptoas-op-status.md"}
-    zh = {"dev/ptoas-op-status.md", "dev/unexpected.md"}
+    en = {"dev/paired.md"}
+    zh = {
+        "dev/paired.md",
+        "dev/ptoas-op-addition-plan.md",
+        "dev/ptoas-op-status.md",
+        "dev/unexpected.md",
+    }
 
     assert docs_parity._find_unpaired_paths(en, zh) == ([], ["dev/unexpected.md"])
 
 
 def test_en_only_path_is_reported_even_with_allowlisted_zh_path():
-    en = {"dev/ptoas-op-status.md", "dev/missing-translation.md"}
-    zh = {"dev/ptoas-op-status.md", "dev/ptoas-op-addition-plan.md"}
+    en = {"dev/paired.md", "dev/missing-translation.md"}
+    zh = {
+        "dev/paired.md",
+        "dev/ptoas-op-addition-plan.md",
+        "dev/ptoas-op-status.md",
+    }
 
     assert docs_parity._find_unpaired_paths(en, zh) == (["dev/missing-translation.md"], [])
