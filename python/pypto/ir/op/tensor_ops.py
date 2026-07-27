@@ -599,7 +599,13 @@ def subs(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tensor.subs", [lhs, rhs_expr], {}, actual_span)
 
 
-def div(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
+def div(
+    lhs: Expr,
+    rhs: int | float | Expr,
+    span: Span | None = None,
+    *,
+    high_precision: bool = False,
+) -> Call:
     """Element-wise division of tensor and tensor or scalar.
 
     Automatically selects between tensor.div (tensor / tensor) and
@@ -609,6 +615,8 @@ def div(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor or scalar (int/float/Expr)
         span: Optional source span for debugging (auto-captured if not provided)
+        high_precision: Whether to select PTOAS's high-precision division mode.
+            Only available when ``rhs`` has TensorType.
 
     Returns:
         Call expression for element-wise division
@@ -618,9 +626,11 @@ def div(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
 
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
+        if high_precision:
+            raise ValueError("tensor.div(high_precision=True) requires a Tensor rhs")
         return _ir_core.create_op_call("tensor.divs", [lhs, rhs_expr], {}, actual_span)
-    else:
-        return _ir_core.create_op_call("tensor.div", [lhs, rhs_expr], {}, actual_span)
+    kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
+    return _ir_core.create_op_call("tensor.div", [lhs, rhs_expr], kwargs, actual_span)
 
 
 def divs(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
@@ -1312,18 +1322,20 @@ def exp(input: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tensor.exp", [input], {}, actual_span)
 
 
-def log(input: Expr, span: Span | None = None) -> Call:
+def log(input: Expr, span: Span | None = None, *, high_precision: bool = False) -> Call:
     """Element-wise natural logarithm operation.
 
     Args:
         input: Input tensor
         span: Optional source span for debugging (auto-captured if not provided)
+        high_precision: Whether to select PTOAS's high-precision logarithm mode
 
     Returns:
         Call expression for element-wise natural logarithm
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tensor.log", [input], {}, actual_span)
+    kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
+    return _ir_core.create_op_call("tensor.log", [input], kwargs, actual_span)
 
 
 def sin(input: Expr, span: Span | None = None) -> Call:

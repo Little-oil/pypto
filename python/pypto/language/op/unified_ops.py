@@ -233,20 +233,36 @@ def mul(lhs, rhs):
 
 
 @overload
-def div(lhs: Tensor, rhs: Tensor | int | float | Scalar) -> Tensor: ...
+def div(
+    lhs: Tensor,
+    rhs: Tensor | int | float | Scalar | _ir_core.Expr,
+    high_precision: bool = False,
+) -> Tensor: ...
 @overload
-def div(lhs: Tile, rhs: Tile | int | float | Scalar) -> Tile: ...
+def div(
+    lhs: Tile,
+    rhs: Tile | int | float | Scalar | _ir_core.Expr,
+    high_precision: bool = False,
+) -> Tile: ...
 @overload
-def div(lhs: Scalar, rhs: Scalar | int | float) -> Scalar: ...
-def div(lhs, rhs):
+def div(
+    lhs: Scalar,
+    rhs: Scalar | int | float,
+    high_precision: bool = False,
+) -> Scalar: ...
+def div(lhs, rhs, high_precision: bool = False):
     """Element-wise division, dispatched by input type."""
     if isinstance(lhs, Tensor) and isinstance(rhs, (Tensor, int, float, Scalar, _ir_core.Expr)):
-        return _tensor.div(lhs, rhs)
+        return _tensor.div(lhs, rhs, high_precision=high_precision)
     if isinstance(lhs, Tile) and isinstance(rhs, Tile):
-        return _tile.div(lhs, rhs)
+        return _tile.div(lhs, rhs, high_precision=high_precision)
     if isinstance(lhs, Tile) and isinstance(rhs, (int, float, Scalar, _ir_core.Expr)):
+        if high_precision:
+            raise ValueError("pl.div: high_precision requires a Tile rhs")
         return _tile.divs(lhs, rhs)
     if _is_scalar_like(lhs) and _is_scalar_like(rhs):
+        if high_precision:
+            raise ValueError("pl.div: high_precision is only supported for Tensor or Tile division")
         return Scalar(expr=_to_scalar_expr(lhs) / _to_scalar_expr(rhs))
     _raise_type_dispatch_error("div", lhs, rhs)
 
@@ -388,12 +404,12 @@ def exp(input: T) -> T:
     raise TypeError(f"pl.exp: expected Tensor or Tile, got {type(input).__name__}")
 
 
-def log(input: T) -> T:
+def log(input: T, high_precision: bool = False) -> T:
     """Element-wise natural logarithm, dispatched by input type."""
     if isinstance(input, Tensor):
-        return _tensor.log(input)
+        return _tensor.log(input, high_precision=high_precision)
     if isinstance(input, Tile):
-        return _tile.log(input)
+        return _tile.log(input, high_precision=high_precision)
     raise TypeError(f"pl.log: expected Tensor or Tile, got {type(input).__name__}")
 
 
@@ -484,12 +500,18 @@ def row_expand(lhs: T, rhs: T) -> T:
     _raise_type_dispatch_error("row_expand", lhs, rhs)
 
 
-def row_expand_add(lhs: T, rhs: T) -> T:
-    """Row-wise broadcast addition, dispatched by input type."""
+@overload
+def row_expand_add(lhs: Tensor, rhs: Tensor) -> Tensor: ...
+@overload
+def row_expand_add(lhs: Tile, rhs: Tile, tmp: Tile | None = None) -> Tile: ...
+def row_expand_add(lhs, rhs, tmp: Tile | None = None):
+    """Row-wise broadcast addition; ``tmp`` is available only for Tile inputs."""
     if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        if tmp is not None:
+            raise ValueError("pl.row_expand_add: tmp is only supported for Tile inputs")
         return _tensor.row_expand_add(lhs, rhs)
     if isinstance(lhs, Tile) and isinstance(rhs, Tile):
-        return _tile.row_expand_add(lhs, rhs)
+        return _tile.row_expand_add(lhs, rhs, tmp)
     _raise_type_dispatch_error("row_expand_add", lhs, rhs)
 
 

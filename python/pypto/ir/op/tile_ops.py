@@ -777,21 +777,36 @@ def add(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     return _create_tile_binary_call("tile.add", "tile.adds", lhs, rhs, actual_span)
 
 
-def div(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
+def div(
+    lhs: Expr,
+    rhs: int | float | Expr,
+    span: Span | None = None,
+    *,
+    high_precision: bool = False,
+) -> Call:
     """Element-wise division of tile and tile or scalar.
 
-    Supports broadcasting for two tiles. Scalar rhs canonicalizes to tile.divs.
+    Tile-tile division requires identical physical and valid shapes. Scalar rhs
+    canonicalizes to tile.divs, which does not expose the tdiv precision mode.
 
     Args:
         lhs: Left-hand side tile (TileType)
         rhs: Right-hand side tile or scalar
         span: Optional source span for debugging (auto-captured if not provided)
+        high_precision: Whether to select PTOAS's high-precision division mode.
+            Only available when ``rhs`` has TileType.
 
     Returns:
         Call expression for element-wise division
     """
     actual_span = _get_span_or_capture(span)
-    return _create_tile_binary_call("tile.div", "tile.divs", lhs, rhs, actual_span)
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
+    if isinstance(rhs_expr.type, ScalarType):
+        if high_precision:
+            raise ValueError("tile.div(high_precision=True) requires a Tile rhs")
+        return _ir_core.create_op_call("tile.divs", [lhs, rhs_expr], {}, actual_span)
+    kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
+    return _ir_core.create_op_call("tile.div", [lhs, rhs_expr], kwargs, actual_span)
 
 
 def sub(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
@@ -1550,18 +1565,20 @@ def cast(
     return _ir_core.create_op_call("tile.cast", [tile], kwargs, actual_span)
 
 
-def log(tile: Expr, span: Span | None = None) -> Call:
+def log(tile: Expr, span: Span | None = None, *, high_precision: bool = False) -> Call:
     """Element-wise natural logarithm of a tile.
 
     Args:
         tile: Input tile (TileType)
         span: Optional source span for debugging (auto-captured if not provided)
+        high_precision: Whether to select PTOAS's high-precision logarithm mode
 
     Returns:
         Call expression for element-wise natural logarithm
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.log", [tile], {}, actual_span)
+    kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
+    return _ir_core.create_op_call("tile.log", [tile], kwargs, actual_span)
 
 
 def abs(tile: Expr, span: Span | None = None) -> Call:
@@ -1832,22 +1849,31 @@ def row_expand_mul(tile: Expr, row_vec: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tile.row_expand_mul", [tile, row_vec], {}, actual_span)
 
 
-def row_expand_add(tile: Expr, row_vec: Expr, span: Span | None = None) -> Call:
+def row_expand_add(
+    tile: Expr,
+    row_vec: Expr,
+    span: Span | None = None,
+    *,
+    tmp: Expr | None = None,
+) -> Call:
     """Row-wise broadcast addition.
 
-    Adds a row vector to each row of the tile.
-    tile[i, :] + row_vec[i, 0] for all i.
+    A non-row-major ``[M, 1]`` carrier broadcasts one scalar per row. A
+    row-major carrier holds one 32-byte lane block per row and repeats that
+    block across the destination columns.
 
     Args:
         tile: Input tile (TileType [M, N])
-        row_vec: Row vector (TileType [M, 1])
+        row_vec: DN row scalar carrier or row-major packed 32-byte carrier
         span: Optional source span for debugging (auto-captured if not provided)
+        tmp: Optional PTOAS scratch tile
 
     Returns:
         Call expression for row-wise broadcast addition
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.row_expand_add", [tile, row_vec], {}, actual_span)
+    args = [tile, row_vec] if tmp is None else [tile, row_vec, tmp]
+    return _ir_core.create_op_call("tile.row_expand_add", args, {}, actual_span)
 
 
 def row_expand_max(tile: Expr, row_vec: Expr, span: Span | None = None) -> Call:

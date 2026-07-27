@@ -221,16 +221,90 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
 // ============================================================================
 
 void OpConversionRegistry::RegisterElementwiseBinaryOps() {
-  auto MakeBroadcastBinaryConv = [](const std::string& tile_op,
-                                    const std::string& row_expand_op) -> ConversionFunc {
-    return [tile_op, row_expand_op](const std::vector<ExprPtr>& args,
-                                    const std::vector<std::pair<std::string, std::any>>& kwargs,
-                                    const Span& span) -> ConversionResult {
+  auto MakeBroadcastBinaryConv = [](const std::string& tile_op, const std::string& row_expand_op,
+                                    bool enforce_tdiv_contract = false) -> ConversionFunc {
+    return [tile_op, row_expand_op, enforce_tdiv_contract](
+               const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
+               const Span& span) -> ConversionResult {
       auto& op_reg = OpRegistry::GetInstance();
-      auto [wider, narrower] = DetectRowBroadcast(args);
-      if (wider >= 0) {
-        return ConversionResult{op_reg.Create(row_expand_op, {args[wider], args[narrower]}, span)};
+      std::vector<ExprPtr> converted_args = args;
+      std::vector<StmtPtr> prologue;
+      std::optional<DataType> promoted_dtype;
+      if (enforce_tdiv_contract) {
+        INTERNAL_CHECK_SPAN(args.size() == 2, span)
+            << "tensor.div conversion expects exactly 2 tile operands, got " << args.size();
+        auto lhs_type = As<TileType>(args[0]->GetType());
+        auto rhs_type = As<TileType>(args[1]->GetType());
+        INTERNAL_CHECK_SPAN(lhs_type && rhs_type, span)
+            << "tensor.div conversion requires TileType operands after memory promotion";
+
+        promoted_dtype = PromoteDataTypes(lhs_type->dtype_, rhs_type->dtype_);
+        INTERNAL_CHECK_SPAN(promoted_dtype, span)
+            << "tensor.div conversion cannot promote " << lhs_type->dtype_.ToString() << " and "
+            << rhs_type->dtype_.ToString();
+
+        const std::vector<std::shared_ptr<const TileType>> arg_types = {lhs_type, rhs_type};
+        for (size_t i = 0; i < converted_args.size(); ++i) {
+          if (arg_types[i]->dtype_ == *promoted_dtype) continue;
+          std::vector<std::pair<std::string, std::any>> cast_kwargs = {
+              {"target_type", *promoted_dtype},
+              {"mode", 2},  // round
+          };
+          auto cast_call = op_reg.Create("tile.cast", {converted_args[i]}, cast_kwargs, span);
+          const std::string name = i == 0 ? "div_lhs_cast" : "div_rhs_cast";
+          auto cast_var = std::make_shared<Var>(name, cast_call->GetType(), span);
+          prologue.push_back(std::make_shared<AssignStmt>(cast_var, cast_call, span));
+          converted_args[i] = cast_var;
+        }
       }
+
+      auto [wider, narrower] = DetectRowBroadcast(converted_args);
+      if (wider >= 0) {
+        if (enforce_tdiv_contract) {
+          INTERNAL_CHECK_SPAN(wider == 0, span)
+              << "tensor.div cannot lower a row-vector lhs broadcast: pto.trowexpanddiv implements only "
+                 "matrix / row-vector";
+          INTERNAL_CHECK_SPAN(!GetKwargOr<bool>(kwargs, "high_precision", false), span)
+              << "tensor.div(high_precision=True) does not support row broadcasting: "
+                 "the PTO high-precision row-expand division form requires an explicit tmp tile";
+          INTERNAL_CHECK_SPAN(*promoted_dtype == DataType::FP16 || *promoted_dtype == DataType::FP32, span)
+              << "tensor.div row broadcasting supports only FP16 or FP32 because the executable "
+                 "pto.trowexpanddiv templates are floating-point only";
+
+          auto main_type = As<TileType>(converted_args[wider]->GetType());
+          auto row_type = As<TileType>(converted_args[narrower]->GetType());
+          INTERNAL_CHECK_SPAN(main_type && row_type, span)
+              << "tensor.div row broadcasting requires TileType operands after memory promotion";
+          const auto main_valid_shape = GetValidShape(main_type);
+          const auto row_valid_shape = GetValidShape(row_type);
+          INTERNAL_CHECK_SPAN(main_valid_shape.size() >= 2 && row_valid_shape.size() >= 2, span)
+              << "tensor.div row broadcasting requires rank-2 valid regions";
+          CHECK_SPAN(
+              ProveValidExtentLessEqual(main_valid_shape[main_valid_shape.size() - 2],
+                                        row_valid_shape[row_valid_shape.size() - 2]) == ProofResult::kTrue,
+              span)
+              << "tensor.div row broadcasting requires the divisor valid rows to cover the dividend, but "
+                 "got dividend valid_shape "
+              << FormatShape(main_valid_shape) << " and divisor valid_shape " << FormatShape(row_valid_shape);
+          const auto one = std::make_shared<ConstInt>(1, DataType::INDEX, span);
+          CHECK_SPAN(
+              ProveValidExtentEqual(row_valid_shape[row_valid_shape.size() - 1], one) == ProofResult::kTrue,
+              span)
+              << "tensor.div row broadcasting requires the divisor's first column to be valid, but got "
+                 "valid_shape "
+              << FormatShape(row_valid_shape);
+        }
+        auto row_expand_call =
+            op_reg.Create(row_expand_op, {converted_args[wider], converted_args[narrower]}, span);
+        return ConversionResult{std::move(prologue), row_expand_call};
+      }
+
+      if (enforce_tdiv_contract) {
+        auto div_call = kwargs.empty() ? op_reg.Create(tile_op, converted_args, span)
+                                       : op_reg.Create(tile_op, converted_args, kwargs, span);
+        return ConversionResult{std::move(prologue), div_call};
+      }
+
       if (kwargs.empty()) {
         return ConversionResult{op_reg.Create(tile_op, args, span)};
       }
@@ -241,7 +315,7 @@ void OpConversionRegistry::RegisterElementwiseBinaryOps() {
   RegisterCustom("tensor.add", MakeBroadcastBinaryConv("tile.add", "tile.row_expand_add"));
   RegisterCustom("tensor.sub", MakeBroadcastBinaryConv("tile.sub", "tile.row_expand_sub"));
   RegisterCustom("tensor.mul", MakeBroadcastBinaryConv("tile.mul", "tile.row_expand_mul"));
-  RegisterCustom("tensor.div", MakeBroadcastBinaryConv("tile.div", "tile.row_expand_div"));
+  RegisterCustom("tensor.div", MakeBroadcastBinaryConv("tile.div", "tile.row_expand_div", true));
   // tensor.maximum/minimum dispatch by rhs type:
   //   tensor rhs → tile.maximum/minimum
   //   scalar rhs → tile.maximums/minimums

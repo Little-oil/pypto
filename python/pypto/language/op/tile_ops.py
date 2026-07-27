@@ -894,17 +894,23 @@ def mul(lhs: Tile, rhs: Tile | int | float | Scalar | Expr) -> Tile:
     return Tile(expr=call_expr)
 
 
-def div(lhs: Tile, rhs: Tile | int | float | Scalar | Expr) -> Tile:
+def div(
+    lhs: Tile,
+    rhs: Tile | int | float | Scalar | Expr,
+    high_precision: bool = False,
+) -> Tile:
     """Element-wise division of tile and tile or scalar.
 
     Args:
         lhs: Left-hand side tile
         rhs: Right-hand side tile or scalar
+        high_precision: Whether to select PTOAS's high-precision division mode.
+            Only available when ``rhs`` is a Tile.
 
     Returns:
         Tile wrapping the div operation
     """
-    call_expr = _ir_ops.div(lhs.unwrap(), _unwrap_rhs(rhs))
+    call_expr = _ir_ops.div(lhs.unwrap(), _unwrap_rhs(rhs), high_precision=high_precision)
     return Tile(expr=call_expr)
 
 
@@ -1058,16 +1064,17 @@ def recip(tile: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
-def log(tile: Tile) -> Tile:
+def log(tile: Tile, high_precision: bool = False) -> Tile:
     """Element-wise natural logarithm.
 
     Args:
         tile: Input tile
+        high_precision: Whether to select PTOAS's high-precision logarithm mode
 
     Returns:
         Tile wrapping the log operation
     """
-    call_expr = _ir_ops.log(tile.unwrap())
+    call_expr = _ir_ops.log(tile.unwrap(), high_precision=high_precision)
     return Tile(expr=call_expr)
 
 
@@ -1482,17 +1489,19 @@ def row_expand_mul(tile: Tile, row_vec: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
-def row_expand_add(tile: Tile, row_vec: Tile) -> Tile:
-    """Row-wise broadcast addition.
+def row_expand_add(tile: Tile, row_vec: Tile, tmp: Tile | None = None) -> Tile:
+    """Row-wise scalar or packed-block expansion addition.
 
     Args:
         tile: Input tile [M, N]
-        row_vec: Row vector [M, 1]
+        row_vec: DN ``[M, 1]`` scalar carrier or row-major packed 32-byte carrier
+        tmp: Optional PTOAS scratch tile
 
     Returns:
         Tile wrapping the row_expand_add operation
     """
-    call_expr = _ir_ops.row_expand_add(tile.unwrap(), row_vec.unwrap())
+    tmp_expr = None if tmp is None else tmp.unwrap()
+    call_expr = _ir_ops.row_expand_add(tile.unwrap(), row_vec.unwrap(), tmp=tmp_expr)
     return Tile(expr=call_expr)
 
 

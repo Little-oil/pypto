@@ -59,7 +59,6 @@ static bool RequiresRowMajorLayout(std::string_view op_name) {
       // Tile x Tile binary ops
       "tile.add",
       "tile.and",
-      "tile.div",
       "tile.fmod",
       "tile.maximum",
       "tile.minimum",
@@ -77,13 +76,13 @@ static bool RequiresRowMajorLayout(std::string_view op_name) {
       // Unary ops
       "tile.abs",
       "tile.exp",
-      "tile.log",
       "tile.sqrt",
       "tile.recip",
       "tile.not",
       "tile.relu",
       // Tile x Scalar ops
       "tile.adds",
+      "tile.subs",
       "tile.muls",
       "tile.divs",
       "tile.fmods",
@@ -218,6 +217,26 @@ static std::string MakeModalCodegenPTO(const std::string& pto_op_name, size_t ar
   return "";
 }
 
+// Emit the default PTO form without an explicit precision attribute, or append
+// the exact PTOAS enum attribute after outs(...) for high-precision mode.
+// Unlike cmp/cvt attributes, the tdiv/tlog assembly formats place their
+// attr-dict after the complete ins()/outs() clause.
+static std::string MakePrecisionCodegenPTO(const std::string& pto_op_name, size_t arity,
+                                           const char* attr_kind, const CallPtr& op,
+                                           codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  CheckArity(op, pto_op_name, arity);
+  const bool high_precision = op->GetKwarg<bool>("high_precision", false);
+  std::string code = pto_op_name + " " + GenerateInsOutsClause(op, codegen);
+  if (high_precision) {
+    code += " {precisionType = #pto<";
+    code += attr_kind;
+    code += " high_precision>}";
+  }
+  codegen.Emit(code);
+  return "";
+}
+
 // Helper function for full op
 static std::string MakeFullCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                       codegen::CodegenBase& codegen_base) {
@@ -343,7 +362,6 @@ static const SimpleOpEntry kSimpleOps[] = {
     {"tile.add",             "pto.tadd",             2},
     {"tile.sub",             "pto.tsub",             2},
     {"tile.mul",             "pto.tmul",             2},
-    {"tile.div",             "pto.tdiv",             2},
     {"tile.rem",             "pto.trem",             3},  // src0, src1, tmp
     // Tile x Tile partial-combine operations
     {"tile.part_add",        "pto.tpartadd",         2},
@@ -364,7 +382,6 @@ static const SimpleOpEntry kSimpleOps[] = {
     // Unary operations
     {"tile.abs",             "pto.tabs",             1},
     {"tile.exp",             "pto.texp",             1},
-    {"tile.log",             "pto.tlog",             1},
     {"tile.sqrt",            "pto.tsqrt",            1},
     // tile.rsqrt is registered with a custom codegen handler below (supports 1 or 2 args).
     {"tile.recip",           "pto.trecip",           1},
@@ -413,7 +430,6 @@ static const SimpleOpEntry kSimpleOps[] = {
     {"tile.col_expand_max",  "pto.tcolexpandmax",    2},
     {"tile.col_expand_min",  "pto.tcolexpandmin",    2},
     {"tile.col_expand_expdif", "pto.tcolexpandexpdif", 2},
-    {"tile.row_expand_add",  "pto.trowexpandadd",    2},
     {"tile.row_expand_div",  "pto.trowexpanddiv",    2},
     {"tile.row_expand_mul",  "pto.trowexpandmul",    2},
     {"tile.row_expand_sub",  "pto.trowexpandsub",    2},
@@ -480,6 +496,34 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     if (exclude_ops.count(op_name) > 0) return;
     backend.RegisterOp(op_name).f_codegen(std::move(fn));
   };
+
+  auto register_precision_op = [&](const char* op_name, const char* pto_op_name, size_t arity,
+                                   const char* attr_kind) {
+    if (exclude_ops.count(op_name) > 0) return;
+    auto reg_entry = backend.RegisterOp(op_name);
+    reg_entry.f_codegen([pto_op = std::string(pto_op_name), arity, attr_kind = std::string(attr_kind)](
+                            const CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakePrecisionCodegenPTO(pto_op, arity, attr_kind.c_str(), op, codegen);
+    });
+    for (size_t i = 0; i < arity; ++i) {
+      reg_entry.set_input_layout(i, ir::TileLayout::row_major);
+    }
+    reg_entry.set_output_layout(ir::TileLayout::row_major);
+  };
+  register_precision_op("tile.div", "pto.tdiv", 2, "div_precision");
+  register_precision_op("tile.log", "pto.tlog", 1, "log_precision");
+
+  // tile.row_expand_add follows the PTOAS overloads with and without tmp.
+  // Its row-sensitive layout contract is validated by the IR op: the generic
+  // backend layout repair may reshape [M, 1] to [1, M], which changes semantics.
+  if (exclude_ops.count("tile.row_expand_add") == 0) {
+    auto reg_entry = backend.RegisterOp("tile.row_expand_add");
+    reg_entry.f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+      const size_t arity = op->args_.size();
+      CHECK(arity == 2 || arity == 3) << "tile.row_expand_add requires 2 or 3 arguments, but got " << arity;
+      return MakeNaryCodegenPTO("pto.trowexpandadd", arity, op, codegen);
+    });
+  }
 
   // tile.move → pto.tmov with no-op elision.
   // When MemoryReuse inserts a tile.move between two MemRefs that end up at the

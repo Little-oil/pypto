@@ -644,28 +644,37 @@ def test_tensor_exp():
     assert len(result_type.shape) == 2
 
 
-def test_tensor_log():
-    """Test tensor.log operation preserves float dtype and shape."""
+@pytest.mark.parametrize(
+    "dtype,high_precision",
+    [
+        pytest.param(DataType.FP16, False, id="f16-default"),
+        pytest.param(DataType.FP32, True, id="f32-high-precision"),
+    ],
+)
+def test_tensor_log_contract_and_precision(dtype, high_precision):
+    """tensor.log preserves float shape/dtype and its optional precision request."""
     span = ir.Span.unknown()
 
     dim64 = ir.ConstInt(64, DataType.INT32, span)
     dim128 = ir.ConstInt(128, DataType.INT32, span)
-    tensor_type = ir.TensorType([dim64, dim128], DataType.FP16)
+    tensor_type = ir.TensorType([dim64, dim128], dtype)
     tensor_var = ir.Var("t", tensor_type, span)
 
-    call = ir.op.tensor.log(tensor_var)
+    call = ir.op.tensor.log(tensor_var, high_precision=high_precision)
 
     assert isinstance(call, ir.Call)
     assert call.op.name == "tensor.log"
-
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
-    assert result_type.dtype == DataType.FP16
+    assert result_type.dtype == dtype
     assert len(result_type.shape) == 2
+    expected_kwargs = {"high_precision": True} if high_precision else {}
+    assert dict(call.kwargs) == expected_kwargs
 
 
-def test_tensor_log_int_promotes_to_fp32():
-    """tensor.log on integer input promotes the result dtype to FP32."""
+@pytest.mark.parametrize("high_precision", [False, True])
+def test_tensor_log_rejects_integer_contract(high_precision):
+    """PTOAS does not define either logarithm precision mode for integer tensors."""
     span = ir.Span.unknown()
 
     dim64 = ir.ConstInt(64, DataType.INT32, span)
@@ -673,10 +682,8 @@ def test_tensor_log_int_promotes_to_fp32():
     tensor_type = ir.TensorType([dim64, dim128], DataType.INT32)
     tensor_var = ir.Var("t", tensor_type, span)
 
-    call = ir.op.tensor.log(tensor_var)
-    result_type = call.type
-    assert isinstance(result_type, ir.TensorType)
-    assert result_type.dtype == DataType.FP32
+    with pytest.raises(ValueError, match=r"requires an FP16 or FP32"):
+        ir.op.tensor.log(tensor_var, high_precision=high_precision)
 
 
 # =============================================================================
@@ -1379,21 +1386,116 @@ def test_tensor_sub():
     assert call.op.name == "tensor.sub"
 
 
-def test_tensor_div():
-    """Test tensor.div operation."""
+def test_tensor_div_precision_kwarg_and_scalar_dispatch():
+    """Only tensor-tensor division carries the tdiv precision attribute."""
     span = ir.Span.unknown()
+    tensor_type = ir.TensorType([8], DataType.FP32)
+    lhs = ir.Var("lhs", tensor_type, span)
+    rhs = ir.Var("rhs", tensor_type, span)
 
-    # Create two tensors
-    dim8 = ir.ConstInt(8, DataType.INT32, span)
-    tensor_type = ir.TensorType([dim8], DataType.FP32)
-    var_a = ir.Var("a", tensor_type, span)
-    var_b = ir.Var("b", tensor_type, span)
+    default_call = ir.op.tensor.div(lhs, rhs)
+    high_precision_call = ir.op.tensor.div(lhs, rhs, high_precision=True)
+    scalar_call = ir.op.tensor.div(lhs, 2.0)
 
-    # Divide
-    call = ir.op.tensor.div(var_a, var_b)
+    assert dict(default_call.kwargs) == {}
+    assert dict(high_precision_call.kwargs) == {"high_precision": True}
+    assert scalar_call.op.name == "tensor.divs"
+    assert dict(scalar_call.kwargs) == {}
+    with pytest.raises(ValueError, match=r"requires a Tensor rhs"):
+        ir.op.tensor.div(lhs, 2.0, high_precision=True)
+
+
+def test_tensor_div_rejects_integer_high_precision_template_gap():
+    """Do not expose the integer path that the PTOAS high-precision template cannot implement."""
+    span = ir.Span.unknown()
+    lhs = ir.Var("lhs", ir.TensorType([8], DataType.INT32), span)
+    rhs = ir.Var("rhs", ir.TensorType([8], DataType.INT32), span)
+
+    with pytest.raises(ValueError, match=r"high_precision only for FP16 or FP32"):
+        ir.op.tensor.div(lhs, rhs, high_precision=True)
+
+
+@pytest.mark.parametrize("dtype", [DataType.INT16, DataType.INT32, DataType.FP16, DataType.FP32])
+def test_tensor_div_accepts_ptoas_dtype_union(dtype):
+    """tensor.div accepts the union that can lower to pto.tdiv."""
+    span = ir.Span.unknown()
+    lhs = ir.Var("lhs", ir.TensorType([8, 16], dtype), span)
+    rhs = ir.Var("rhs", ir.TensorType([8, 16], dtype), span)
+
+    call = tensor.div(lhs, rhs)
 
     assert isinstance(call, ir.Call)
     assert call.op.name == "tensor.div"
+    assert isinstance(call.type, ir.TensorType)
+    assert call.type.dtype == dtype
+
+
+def test_tensor_div_rejects_unsupported_dtype():
+    """INT8 cannot lower to the current pto.tdiv contract."""
+    span = ir.Span.unknown()
+    lhs = ir.Var("lhs", ir.TensorType([8, 16], DataType.INT8), span)
+    rhs = ir.Var("rhs", ir.TensorType([8, 16], DataType.INT8), span)
+
+    with pytest.raises(ValueError, match=r"INT16, INT32, FP16, FP32"):
+        tensor.div(lhs, rhs)
+
+
+def test_tensor_precision_apis_keep_positional_span_compatibility():
+    """The legacy positional span slots remain ahead of high_precision."""
+    span = ir.Span("tensor_precision_compat.py", 9, 4, 9, 23)
+    lhs = ir.Var("lhs", ir.TensorType([8, 16], DataType.FP32), span)
+    rhs = ir.Var("rhs", ir.TensorType([8, 16], DataType.FP32), span)
+
+    calls = (
+        tensor.div(lhs, rhs, span),
+        tensor.log(lhs, span),
+    )
+
+    assert all(call.span.filename == "tensor_precision_compat.py" for call in calls)
+    assert all(call.span.begin_line == 9 for call in calls)
+    assert all(dict(call.kwargs) == {} for call in calls)
+
+
+def test_tensor_subs_mixed_scalar_dtype_preserves_lhs_dtype():
+    """The tsubs scalar dtype does not retype the tensor result."""
+    span = ir.Span.unknown()
+    lhs = ir.Var("lhs", ir.TensorType([8, 16], DataType.INT16), span)
+    scalar = ir.ConstFloat(2.5, DataType.FP32, span)
+
+    calls = (
+        tensor.subs(lhs, scalar),
+        tensor.subs(lhs, 2.5),
+    )
+
+    for call in calls:
+        assert isinstance(call.type, ir.TensorType)
+        assert call.type.dtype == DataType.INT16
+        scalar_type = call.args[1].type
+        assert isinstance(scalar_type, ir.ScalarType)
+        assert scalar_type.dtype == DataType.FP32
+
+
+def test_tensor_subs_rejects_unsupported_tensor_dtype():
+    """INT64 is outside the current pto.tsubs tensor dtype union."""
+    span = ir.Span.unknown()
+    lhs = ir.Var("lhs", ir.TensorType([8, 16], DataType.INT64), span)
+
+    with pytest.raises(ValueError, match=r"INT8, INT16, INT32, FP16, FP32, BF16"):
+        tensor.subs(lhs, 1)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [DataType.UINT32, DataType.BOOL, DataType.INDEX, DataType.INT64, DataType.FP8E4M3FN],
+)
+def test_tensor_subs_rejects_unsupported_scalar_dtype(dtype):
+    """Only scalar dtypes exercised by the executable PTOAS paths are exposed."""
+    span = ir.Span.unknown()
+    lhs = ir.Var("lhs", ir.TensorType([8, 16], DataType.INT16), span)
+    scalar = ir.Var("scalar", ir.ScalarType(dtype), span)
+
+    with pytest.raises(ValueError, match=r"requires scalar dtype in"):
+        ir.create_op_call("tensor.subs", [lhs, scalar], span)
 
 
 @pytest.mark.parametrize("op_name", ["part_add", "part_mul", "part_max", "part_min"])
@@ -2845,12 +2947,13 @@ class TestTensorScalarMemoryOps:
 # =============================================================================
 
 
-def test_tensor_row_min():
-    """Test tensor.row_min reduction."""
+@pytest.mark.parametrize("dtype", [DataType.INT16, DataType.INT32, DataType.FP16, DataType.FP32])
+def test_tensor_row_min(dtype):
+    """tensor.row_min accepts every dtype in the PTO TROWMIN contract."""
     span = ir.Span.unknown()
     dim64 = ir.ConstInt(64, DataType.INT32, span)
     dim128 = ir.ConstInt(128, DataType.INT32, span)
-    tensor_type = ir.TensorType([dim64, dim128], DataType.FP16)
+    tensor_type = ir.TensorType([dim64, dim128], dtype)
     tensor_var = ir.Var("t", tensor_type, span)
 
     call = ir.op.tensor.row_min(tensor_var)
@@ -2859,8 +2962,18 @@ def test_tensor_row_min():
     assert call.op.name == "tensor.row_min"
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
-    assert result_type.dtype == DataType.FP16
+    assert result_type.dtype == dtype
     assert len(result_type.shape) == 2
+
+
+@pytest.mark.parametrize("dtype", [DataType.INT8, DataType.BF16])
+def test_tensor_row_min_rejects_unsupported_dtype(dtype):
+    """tensor.row_min rejects dtypes that cannot lower to PTO TROWMIN."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([64, 128], dtype), span)
+
+    with pytest.raises(ValueError, match=r"requires input dtype in \{INT16, INT32, FP16, FP32\}"):
+        ir.op.tensor.row_min(tensor_var)
 
 
 # =============================================================================
@@ -2894,30 +3007,8 @@ def test_tensor_row_expand():
 # =============================================================================
 
 
-def test_tensor_row_expand_add():
-    """Test tensor.row_expand_add operation."""
-    span = ir.Span.unknown()
-    dim64 = ir.ConstInt(64, DataType.INT32, span)
-    dim128 = ir.ConstInt(128, DataType.INT32, span)
-    dim1 = ir.ConstInt(1, DataType.INT32, span)
-
-    tensor_type = ir.TensorType([dim64, dim128], DataType.FP16)
-    row_type = ir.TensorType([dim64, dim1], DataType.FP16)
-    tensor_var = ir.Var("t", tensor_type, span)
-    row_var = ir.Var("rv", row_type, span)
-
-    call = ir.op.tensor.row_expand_add(tensor_var, row_var)
-
-    assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.row_expand_add"
-    result_type = call.type
-    assert isinstance(result_type, ir.TensorType)
-    assert result_type.dtype == DataType.FP16
-    assert len(result_type.shape) == 2
-
-
-def test_tensor_row_expand_add_dtype_promotion():
-    """Test tensor.row_expand_add promotes data types."""
+def test_tensor_row_expand_add_rejects_mixed_dtypes():
+    """PTOAS requires src0, src1, and dst to have one exact dtype."""
     span = ir.Span.unknown()
     dim64 = ir.ConstInt(64, DataType.INT32, span)
     dim128 = ir.ConstInt(128, DataType.INT32, span)
@@ -2928,11 +3019,37 @@ def test_tensor_row_expand_add_dtype_promotion():
     tensor_var = ir.Var("t", tensor_type, span)
     row_var = ir.Var("rv", row_type, span)
 
-    call = ir.op.tensor.row_expand_add(tensor_var, row_var)
+    with pytest.raises(ValueError, match=r"src0 and src1 to have the same dtype"):
+        ir.op.tensor.row_expand_add(tensor_var, row_var)
 
-    result_type = call.type
-    assert isinstance(result_type, ir.TensorType)
-    assert result_type.dtype == DataType.FP32
+
+@pytest.mark.parametrize(
+    "dtype",
+    [DataType.INT8, DataType.INT16, DataType.INT32, DataType.FP16, DataType.FP32],
+)
+def test_tensor_row_expand_add_accepts_ptoas_dtype_union(dtype):
+    """The tensor contract exposes the union of supported PTOAS architectures."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([64, 128], dtype), span)
+    row_var = ir.Var("rv", ir.TensorType([64, 1], dtype), span)
+
+    call = tensor.row_expand_add(tensor_var, row_var)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.row_expand_add"
+    assert isinstance(call.type, ir.TensorType)
+    assert call.type.dtype == dtype
+    assert [dim.value for dim in call.type.shape if isinstance(dim, ir.ConstInt)] == [64, 128]
+
+
+def test_tensor_row_expand_add_rejects_unsupported_dtype():
+    """BF16 is outside the current pto.trowexpandadd dtype union."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([64, 128], DataType.BF16), span)
+    row_var = ir.Var("rv", ir.TensorType([64, 1], DataType.BF16), span)
+
+    with pytest.raises(ValueError, match=r"INT8, INT16, INT32, FP16, FP32"):
+        tensor.row_expand_add(tensor_var, row_var)
 
 
 def test_tensor_row_expand_add_wrong_type():

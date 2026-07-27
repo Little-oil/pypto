@@ -757,7 +757,11 @@ def subs(lhs: Tensor, rhs: int | float | Expr | Scalar) -> Tensor:
     return Tensor(expr=call_expr)
 
 
-def div(lhs: Tensor, rhs: int | float | Tensor | Scalar | Expr) -> Tensor:
+def div(
+    lhs: Tensor,
+    rhs: int | float | Tensor | Scalar | Expr,
+    high_precision: bool = False,
+) -> Tensor:
     """Element-wise division of tensor and tensor or scalar.
 
     Automatically selects between tensor.div (tensor / tensor) and
@@ -766,12 +770,14 @@ def div(lhs: Tensor, rhs: int | float | Tensor | Scalar | Expr) -> Tensor:
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor or scalar (int/float/Tensor/Scalar)
+        high_precision: Whether to select PTOAS's high-precision division mode.
+            Only available when ``rhs`` is a Tensor.
 
     Returns:
         Tensor wrapping the div operation
     """
     lhs_expr = lhs.unwrap()
-    call_expr = _ir_ops.div(lhs_expr, _unwrap_rhs(rhs))
+    call_expr = _ir_ops.div(lhs_expr, _unwrap_rhs(rhs), high_precision=high_precision)
     return Tensor(expr=call_expr)
 
 
@@ -1421,17 +1427,18 @@ def exp(input: Tensor) -> Tensor:
     return Tensor(expr=call_expr)
 
 
-def log(input: Tensor) -> Tensor:
+def log(input: Tensor, high_precision: bool = False) -> Tensor:
     """Element-wise natural logarithm operation.
 
     Args:
         input: Input tensor
+        high_precision: Whether to select PTOAS's high-precision logarithm mode
 
     Returns:
         Tensor wrapping the log operation
     """
     input_expr = input.unwrap()
-    call_expr = _ir_ops.log(input_expr)
+    call_expr = _ir_ops.log(input_expr, high_precision=high_precision)
     return Tensor(expr=call_expr)
 
 

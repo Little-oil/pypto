@@ -119,14 +119,10 @@ TypePtr DeduceTensorLogType(const std::vector<ExprPtr>& args,
       << "tensor.log requires first argument to be a TensorType or DistributedTensorType, but got "
       << args[0]->GetType()->TypeName();
 
-  // log always produces floating-point output (e.g., log(1) = 0.0).
-  // Promote integer inputs to FP32; preserve existing float dtype.
-  DataType out_dtype = tensor_type->dtype_;
-  if (!out_dtype.IsFloat()) {
-    out_dtype = DataType::FP32;
-  }
+  CHECK(tensor_type->dtype_ == DataType::FP16 || tensor_type->dtype_ == DataType::FP32)
+      << "tensor.log requires an FP16 or FP32 tensor operand, but got " << tensor_type->dtype_.ToString();
 
-  return DeduceTensorUnaryResultType(tensor_type, out_dtype);
+  return DeduceTensorUnaryResultType(tensor_type, tensor_type->dtype_);
 }
 
 TypePtr DeduceTensorSqrtType(const std::vector<ExprPtr>& args,
@@ -277,6 +273,7 @@ REGISTER_OP("tensor.log")
     .set_op_category("TensorOp")
     .set_description("Element-wise natural logarithm operation")
     .add_argument("input", "Input tensor (TensorType)")
+    .set_attr<bool>("high_precision")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTensorLogType(args, kwargs);

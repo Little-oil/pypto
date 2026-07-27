@@ -37,11 +37,21 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
 namespace pypto {
 namespace ir {
+
+namespace {
+
+bool IsPtoRowMinDtype(const DataType& dtype) {
+  return dtype == DataType::INT16 || dtype == DataType::INT32 || dtype == DataType::FP16 ||
+         dtype == DataType::FP32;
+}
+
+}  // namespace
 
 // Type deduction for row reduction operations (reduces along last axis with keepdim=True).
 // `out_dtype` overrides the output element type — used by argmax/argmin, whose index output
@@ -216,7 +226,18 @@ REGISTER_OP("tile.row_min")
     .not_inplace_safe()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-      return DeduceTileRowReductionType(args, kwargs, "tile.row_min");
+      auto result_type = DeduceTileRowReductionType(args, kwargs, "tile.row_min");
+      auto input_type = As<TileType>(args[0]->GetType());
+      CHECK_SPAN(IsPtoRowMinDtype(input_type->dtype_), args[0]->span_)
+          << "The operator tile.row_min requires input dtype in {INT16, INT32, FP16, FP32}, but got "
+          << input_type->dtype_.ToString();
+      const TileView input_view = tile_view_semantics::GetEffectiveTileView(*input_type);
+      CHECK_SPAN(input_view.blayout == TileLayout::row_major && input_view.slayout == TileLayout::none_box,
+                 args[0]->span_)
+          << "The operator tile.row_min requires an ND input layout (blayout=row_major, "
+             "slayout=none_box), but got blayout="
+          << TileLayoutToString(input_view.blayout) << ", slayout=" << TileLayoutToString(input_view.slayout);
+      return result_type;
     });
 
 REGISTER_OP("tile.row_prod")

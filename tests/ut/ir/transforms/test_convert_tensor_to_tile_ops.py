@@ -14,7 +14,7 @@ from collections.abc import Callable
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
-from pypto import DataType, backend, ir, passes
+from pypto import DataType, InternalError, backend, ir, passes
 from pypto.backend import BackendType
 from pypto.ir import IRBuilder
 from pypto.ir.op import tensor as tensor_ops
@@ -904,6 +904,288 @@ class TestConvertTensorToTileOps:
         )
         expected = _make_expected(
             in_specs=in_specs, out_shape=[64], out_dtype=DataType.FP32, body=expected_body
+        )
+        _assert_convert_equal(before, expected)
+
+    @pytest.mark.parametrize(
+        ("op_name", "in_specs", "body", "tile_op_name"),
+        [
+            (
+                "div",
+                [("x", [64], DataType.FP32), ("y", [64], DataType.FP32)],
+                lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1], high_precision=True)),
+                "tile.div",
+            ),
+            (
+                "log",
+                [("x", [64], DataType.FP32)],
+                lambda ib, ins: ib.let("z", tensor_ops.log(ins[0], high_precision=True)),
+                "tile.log",
+            ),
+        ],
+    )
+    def test_precision_kwargs_survive_tensor_to_tile_conversion(self, op_name, in_specs, body, tile_op_name):
+        """Non-broadcast tdiv and tlog conversions preserve high_precision."""
+        before = _make_before(
+            in_specs=in_specs,
+            out_shape=[64],
+            out_dtype=DataType.FP32,
+            body=body,
+        )
+
+        after = passes.convert_tensor_to_tile_ops()(before)
+        kernel = _require_function(after, "main_incore_0")
+        converted = _find_first_call_to(kernel, tile_op_name)
+        assert converted is not None, f"{op_name} did not lower to {tile_op_name}"
+        assert dict(converted.kwargs) == {"high_precision": True}
+
+    def test_high_precision_div_rejects_row_broadcast_conversion(self):
+        """Do not silently drop precision when tensor.div selects row-expand lowering."""
+        before = _make_before(
+            in_specs=[
+                ("x", [32, 64], DataType.FP32),
+                ("row", [32, 1], DataType.FP32),
+            ],
+            out_shape=[32, 64],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1], high_precision=True)),
+        )
+
+        with pytest.raises(InternalError, match=r"does not support row broadcasting"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_div_equal_shape_mixed_dtype_inserts_explicit_cast(self):
+        """Exact-shape tensor.div casts operands to one PTOAS tdiv dtype before lowering."""
+        before = _make_before(
+            in_specs=[
+                ("lhs", [8, 16], DataType.INT16),
+                ("rhs", [8, 16], DataType.FP32),
+            ],
+            out_shape=[8, 16],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1])),
+        )
+
+        after = passes.convert_tensor_to_tile_ops()(before)
+        kernel = _require_function(after, "main_incore_0")
+        div = _find_first_call_to(kernel, "tile.div")
+        assert div is not None
+        assert isinstance(div.type, ir.TileType)
+        assert div.type.dtype == DataType.FP32
+        for arg in div.args:
+            assert isinstance(arg.type, ir.TileType)
+            assert arg.type.dtype == DataType.FP32
+
+    def test_div_default_row_broadcast_routes_to_row_expand_div(self):
+        """The supported [M, N] / [M, 1] tensor broadcast never reaches exact tile.div."""
+        before = _make_before(
+            in_specs=[
+                ("lhs", [32, 64], DataType.FP32),
+                ("row", [32, 1], DataType.FP32),
+            ],
+            out_shape=[32, 64],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1])),
+        )
+
+        after = passes.convert_tensor_to_tile_ops()(before)
+        kernel = _require_function(after, "main_incore_0")
+        assert _find_first_call_to(kernel, "tile.div") is None
+        assert _find_first_call_to(kernel, "tile.row_expand_div") is not None
+
+    def test_div_row_broadcast_requires_divisor_valid_rows_to_cover_dividend(self):
+        """The row-expand template reads one divisor scalar for every valid output row."""
+        span = ir.Span.unknown()
+        lhs_type = ir.TensorType(
+            [8, 16],
+            DataType.FP32,
+            None,
+            ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[7, 16]),
+        )
+        rhs_type = ir.TensorType(
+            [8, 1],
+            DataType.FP32,
+            None,
+            ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[6, 1]),
+        )
+        ib = IRBuilder()
+        with ib.function("kernel", type=ir.FunctionType.InCore) as f:
+            lhs = f.param("lhs", lhs_type)
+            rhs = f.param("rhs", rhs_type)
+            result = ib.let("result", tensor_ops.div(lhs, rhs))
+            f.return_type(result.type)
+            ib.return_stmt(result)
+        before = ir.Program([f.get_result()], "ShortDivisorValidRows", span)
+
+        with pytest.raises(ValueError, match=r"divisor valid rows to cover the dividend"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_div_row_broadcast_dynamic_valid_rows_must_be_provably_covered(self):
+        """A shared runtime extent is safe, while unrelated extents need a runtime guard."""
+        span = ir.Span.unknown()
+        shared_rows = ir.Var("shared_rows", ir.ScalarType(DataType.INDEX), span)
+        unrelated_rows = ir.Var("unrelated_rows", ir.ScalarType(DataType.INDEX), span)
+
+        def make_program(rhs_rows: ir.Expr, name: str) -> ir.Program:
+            lhs_type = ir.TensorType(
+                [8, 16],
+                DataType.FP32,
+                None,
+                ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[shared_rows, 16]),
+            )
+            rhs_type = ir.TensorType(
+                [8, 1],
+                DataType.FP32,
+                None,
+                ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[rhs_rows, 1]),
+            )
+            ib = IRBuilder()
+            with ib.function("kernel", type=ir.FunctionType.InCore) as f:
+                lhs = f.param("lhs", lhs_type)
+                rhs = f.param("rhs", rhs_type)
+                result = ib.let("result", tensor_ops.div(lhs, rhs))
+                f.return_type(result.type)
+                ib.return_stmt(result)
+            return ir.Program([f.get_result()], name, span)
+
+        converted = passes.convert_tensor_to_tile_ops()(make_program(shared_rows, "SharedDivValidRows"))
+        kernel = _require_function(converted, "kernel")
+        assert _find_first_call_to(kernel, "tile.row_expand_div") is not None
+
+        with pytest.raises(ValueError, match=r"divisor valid rows to cover the dividend"):
+            passes.convert_tensor_to_tile_ops()(make_program(unrelated_rows, "UnknownDivValidRows"))
+
+    def test_div_mixed_float_row_broadcast_inserts_explicit_cast(self):
+        """Row-expand division receives one exact floating dtype after tensor promotion."""
+        before = _make_before(
+            in_specs=[
+                ("lhs", [32, 64], DataType.FP16),
+                ("row", [32, 1], DataType.FP32),
+            ],
+            out_shape=[32, 64],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1])),
+        )
+
+        after = passes.convert_tensor_to_tile_ops()(before)
+        kernel = _require_function(after, "main_incore_0")
+        div = _find_first_call_to(kernel, "tile.row_expand_div")
+        assert div is not None
+        for arg in div.args:
+            assert isinstance(arg.type, ir.TileType)
+            assert arg.type.dtype == DataType.FP32
+
+    def test_div_rejects_integer_row_broadcast_conversion(self):
+        """Verifier-only integer trowexpanddiv has no executable PTOAS template."""
+        before = _make_before(
+            in_specs=[
+                ("lhs", [32, 64], DataType.INT16),
+                ("row", [32, 1], DataType.INT16),
+            ],
+            out_shape=[32, 64],
+            out_dtype=DataType.INT16,
+            body=lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1])),
+        )
+
+        with pytest.raises(InternalError, match=r"row broadcasting supports only FP16 or FP32"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_div_rejects_row_vector_lhs_broadcast_conversion(self):
+        """pto.trowexpanddiv cannot represent row-vector / matrix operand order."""
+        before = _make_before(
+            in_specs=[
+                ("row", [32, 1], DataType.FP32),
+                ("rhs", [32, 64], DataType.FP32),
+            ],
+            out_shape=[32, 64],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1])),
+        )
+
+        with pytest.raises(InternalError, match=r"row-vector lhs broadcast"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_div_rejects_non_row_broadcast_conversion(self):
+        """PTOAS tdiv cannot implement a general broadcast such as [1, N] / [M, N]."""
+        before = _make_before(
+            in_specs=[
+                ("lhs", [1, 64], DataType.FP32),
+                ("rhs", [32, 64], DataType.FP32),
+            ],
+            out_shape=[32, 64],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1])),
+        )
+
+        with pytest.raises(ValueError, match=r"requires src0, src1, and dst to have the same physical shape"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_div_rejects_mismatched_valid_shapes_conversion(self):
+        """Equal physical shapes with different source valid regions cannot lower to tdiv."""
+        span = ir.Span.unknown()
+        lhs_type = ir.TensorType(
+            [8, 16],
+            DataType.FP32,
+            None,
+            ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[7, 16]),
+        )
+        rhs_type = ir.TensorType(
+            [8, 16],
+            DataType.FP32,
+            None,
+            ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[8, 16]),
+        )
+        ib = IRBuilder()
+        with ib.function("kernel", type=ir.FunctionType.InCore) as f:
+            lhs = f.param("lhs", lhs_type)
+            rhs = f.param("rhs", rhs_type)
+            result = ib.let("result", tensor_ops.div(lhs, rhs))
+            f.return_type(result.type)
+            ib.return_stmt(result)
+        before = ir.Program([f.get_result()], "MismatchedDivValidShapes", span)
+
+        with pytest.raises(ValueError, match=r"requires src0, src1, and dst to have the same valid_shape"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_subs_mixed_dtype_conversion_preserves_lhs_dtype(self):
+        """An explicit FP32 scalar stays FP32 while the i16 tsubs result stays i16."""
+        before = _make_before(
+            in_specs=[("lhs", [8, 16], DataType.INT16)],
+            extra_specs=[("scalar", ir.ScalarType(DataType.FP32))],
+            out_shape=[8, 16],
+            out_dtype=DataType.INT16,
+            body=lambda ib, ins, extras: ib.let("z", tensor_ops.subs(ins[0], extras[0])),
+        )
+
+        after = passes.convert_tensor_to_tile_ops()(before)
+        kernel = _require_function(after, "main_incore_0")
+        converted = _find_first_call_to(kernel, "tile.subs")
+        assert converted is not None
+        assert isinstance(converted.args[0].type, ir.TileType)
+        assert converted.args[0].type.dtype == DataType.INT16
+        assert isinstance(converted.args[1].type, ir.ScalarType)
+        assert converted.args[1].type.dtype == DataType.FP32
+        assert isinstance(converted.type, ir.TileType)
+        assert converted.type.dtype == DataType.INT16
+
+    def test_row_min_conversion_injects_padded_tmp(self):
+        """tensor.row_min lowers to an ND tile.row_min with a safe padded scratch tile."""
+
+        def expected_body(ib, tiles):
+            tmp = ib.let("tmp_tile", tile_ops.create([32, 128], DataType.FP32))
+            return ib.let("y_tile", tile_ops.row_min(tiles[0], tmp))
+
+        before = _make_before(
+            in_specs=[("x", [32, 64], DataType.FP32)],
+            out_shape=[32, 1],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("y", tensor_ops.row_min(ins[0])),
+        )
+        expected = _make_expected(
+            in_specs=[("x", [32, 64], DataType.FP32)],
+            out_shape=[32, 1],
+            out_dtype=DataType.FP32,
+            body=expected_body,
         )
         _assert_convert_equal(before, expected)
 

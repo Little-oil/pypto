@@ -117,6 +117,110 @@ class TestTileElementwiseOps:
         ir_str = str(Program)
         assert "tile.div" in ir_str
 
+    def test_tile_div_precision_kwarg_and_scalar_dispatch(self):
+        """Only tile-tile division carries the tdiv precision attribute."""
+        span = ir.Span.unknown()
+        tile_type = ir.TileType([8, 8], DataType.FP32)
+        lhs = ir.Var("lhs", tile_type, span)
+        rhs = ir.Var("rhs", tile_type, span)
+
+        default_call = tile.div(lhs, rhs)
+        high_precision_call = tile.div(lhs, rhs, high_precision=True)
+        scalar_call = tile.div(lhs, 2.0)
+
+        assert dict(default_call.kwargs) == {}
+        assert dict(high_precision_call.kwargs) == {"high_precision": True}
+        assert scalar_call.op.name == "tile.divs"
+        assert dict(scalar_call.kwargs) == {}
+        with pytest.raises(ValueError, match=r"requires a Tile rhs"):
+            tile.div(lhs, 2.0, high_precision=True)
+
+    def test_tile_div_rejects_integer_high_precision_template_gap(self):
+        """Do not expose the integer path that the PTOAS high-precision template cannot implement."""
+        span = ir.Span.unknown()
+        lhs = ir.Var("lhs", ir.TileType([8, 8], DataType.INT32), span)
+        rhs = ir.Var("rhs", ir.TileType([8, 8], DataType.INT32), span)
+
+        with pytest.raises(ValueError, match=r"high_precision only for FP16 or FP32"):
+            tile.div(lhs, rhs, high_precision=True)
+
+    @pytest.mark.parametrize("dtype", [DataType.INT16, DataType.INT32, DataType.FP16, DataType.FP32])
+    def test_tile_div_accepts_ptoas_dtype_union(self, dtype):
+        """tile.div accepts the union of the current A2/A3 and A5 contracts."""
+        span = ir.Span.unknown()
+        lhs = ir.Var("lhs", ir.TileType([8, 16], dtype), span)
+        rhs = ir.Var("rhs", ir.TileType([8, 16], dtype), span)
+
+        call = tile.div(lhs, rhs)
+
+        assert _tile_result_dtype(call) == dtype
+
+    def test_tile_div_rejects_mixed_dtypes(self):
+        """PTOAS tdiv requires src0, src1, and dst to use one exact dtype."""
+        span = ir.Span.unknown()
+        lhs = ir.Var("lhs", ir.TileType([8, 16], DataType.FP16), span)
+        rhs = ir.Var("rhs", ir.TileType([8, 16], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match=r"same dtype"):
+            tile.div(lhs, rhs)
+
+    def test_tile_div_rejects_different_physical_shapes_with_matching_valid_shape(self):
+        """PTO-ISA TDIV templates require one common physical tile type."""
+        span = ir.Span.unknown()
+        view = ir.TileView(
+            valid_shape=[7, 12],
+            blayout=ir.TileLayout.row_major,
+            slayout=ir.TileLayout.none_box,
+        )
+        lhs = ir.Var("lhs", ir.TileType([8, 16], DataType.FP32, tile_view=view), span)
+        rhs = ir.Var("rhs", ir.TileType([10, 20], DataType.FP32, tile_view=view), span)
+
+        with pytest.raises(ValueError, match=r"same physical shape"):
+            tile.div(lhs, rhs)
+
+    def test_tile_div_rejects_mismatched_valid_shapes(self):
+        """Equal physical buffers are insufficient when valid extents differ."""
+        span = ir.Span.unknown()
+        lhs_view = ir.TileView(
+            valid_shape=[7, 16],
+            blayout=ir.TileLayout.row_major,
+            slayout=ir.TileLayout.none_box,
+        )
+        rhs_view = ir.TileView(
+            valid_shape=[8, 16],
+            blayout=ir.TileLayout.row_major,
+            slayout=ir.TileLayout.none_box,
+        )
+        lhs = ir.Var("lhs", ir.TileType([8, 16], DataType.FP32, tile_view=lhs_view), span)
+        rhs = ir.Var("rhs", ir.TileType([8, 16], DataType.FP32, tile_view=rhs_view), span)
+
+        with pytest.raises(ValueError, match=r"same valid_shape"):
+            tile.div(lhs, rhs)
+
+    def test_tile_div_rejects_unsupported_dtype(self):
+        """INT8 is not in the current pto.tdiv dtype union."""
+        span = ir.Span.unknown()
+        lhs = ir.Var("lhs", ir.TileType([8, 16], DataType.INT8), span)
+        rhs = ir.Var("rhs", ir.TileType([8, 16], DataType.INT8), span)
+
+        with pytest.raises(ValueError, match=r"INT16, INT32, FP16, FP32"):
+            tile.div(lhs, rhs)
+
+    def test_tile_precision_apis_keep_positional_span_compatibility(self):
+        """The pre-existing third/second positional argument remains ``span``."""
+        span = ir.Span("tile_precision_compat.py", 7, 3, 7, 21)
+        lhs = ir.Var("lhs", ir.TileType([8, 16], DataType.FP32), span)
+        rhs = ir.Var("rhs", ir.TileType([8, 16], DataType.FP32), span)
+
+        calls = (
+            tile.div(lhs, rhs, span),
+            tile.log(lhs, span),
+        )
+
+        assert all(call.span.filename == "tile_precision_compat.py" for call in calls)
+        assert all(call.span.begin_line == 7 for call in calls)
+        assert all(dict(call.kwargs) == {} for call in calls)
+
     def test_tile_muls(self):
         """Test tile.muls operator - multiply all elements of a tile by scalar."""
 
@@ -233,6 +337,28 @@ class TestTileUnaryOps:
 
         ir_str = str(Program)
         assert "tile.log" in ir_str
+
+    @pytest.mark.parametrize("high_precision", [False, True])
+    def test_tile_log_rejects_integer_contract(self, high_precision):
+        """PTOAS does not define either logarithm precision mode for integer tiles."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([8, 8], DataType.INT32), span)
+
+        with pytest.raises(ValueError, match=r"requires an FP16 or FP32"):
+            tile.log(src, high_precision=high_precision)
+
+    @pytest.mark.parametrize("dtype", [DataType.FP16, DataType.FP32])
+    @pytest.mark.parametrize("high_precision", [False, True])
+    def test_tile_log_accepts_supported_dtypes(self, dtype, high_precision):
+        """Both precision modes preserve each PTOAS-supported float dtype."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([8, 8], dtype), span)
+
+        call = tile.log(src, high_precision=high_precision)
+        assert isinstance(call.type, ir.TileType)
+        assert call.type.dtype == dtype
+        expected_kwargs = {"high_precision": True} if high_precision else {}
+        assert dict(call.kwargs) == expected_kwargs
 
     def test_tile_abs(self):
         """Test tile.abs operator - absolute value of all elements."""
@@ -592,7 +718,7 @@ class TestTileReductionOps:
         assert optimized_program is not None
         assert "tile.row_sum" in str(optimized_program)
 
-    @pytest.mark.parametrize("op", [tile.row_max, tile.row_sum])
+    @pytest.mark.parametrize("op", [tile.row_max, tile.row_sum, tile.row_min])
     @pytest.mark.parametrize("tmp_shape", [[8, 1], [8, 64], [8, 256]])
     def test_tile_row_reduction_rejects_undersized_tmp(self, op, tmp_shape):
         """Row reductions reject scratch storage that cannot hold the input tile."""
@@ -603,7 +729,7 @@ class TestTileReductionOps:
         with pytest.raises(ValueError, match="requires tmp_tile shape to be at least the input shape"):
             op(input_tile, tmp_tile)
 
-    @pytest.mark.parametrize("op", [tile.row_max, tile.row_sum])
+    @pytest.mark.parametrize("op", [tile.row_max, tile.row_sum, tile.row_min])
     @pytest.mark.parametrize("tmp_shape", [[8, 512], [8, 640]])
     def test_tile_row_reduction_accepts_sufficient_tmp(self, op, tmp_shape):
         """Row reductions accept exact-size and padded scratch storage."""
@@ -619,7 +745,9 @@ class TestTileReductionOps:
         assert isinstance(call.type.shape[1], ir.ConstInt)
         assert [call.type.shape[0].value, call.type.shape[1].value] == [8, 1]
 
-    @pytest.mark.parametrize("op", [tile.row_max, tile.row_sum, tile.row_argmax, tile.row_argmin])
+    @pytest.mark.parametrize(
+        "op", [tile.row_max, tile.row_sum, tile.row_min, tile.row_argmax, tile.row_argmin]
+    )
     def test_tile_row_reduction_rejects_mismatched_tmp_dtype(self, op):
         """Row reductions require scratch storage with the input element type."""
         span = ir.Span.unknown()
@@ -651,6 +779,70 @@ class TestTileReductionOps:
 
         assert isinstance(call.type, ir.TileType)
         assert call.type.dtype == DataType.INT32
+
+    @pytest.mark.parametrize("dtype", [DataType.INT16, DataType.INT32, DataType.FP16, DataType.FP32])
+    def test_tile_row_min_accepts_exact_pto_contract(self, dtype):
+        """tile.row_min accepts every PTO dtype and produces a DN column vector."""
+        span = ir.Span.unknown()
+        input_tile = ir.Var("input_tile", ir.TileType([8, 32], dtype), span)
+        tmp_tile = ir.Var("tmp_tile", ir.TileType([8, 32], dtype), span)
+
+        call = tile.row_min(input_tile, tmp_tile)
+
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.dtype == dtype
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [8, 1]
+        result_view = result_type.get_effective_tile_view()
+        assert result_view.blayout == ir.TileLayout.col_major
+        assert result_view.slayout == ir.TileLayout.none_box
+
+    @pytest.mark.parametrize("dtype", [DataType.INT8, DataType.BF16])
+    def test_tile_row_min_rejects_unsupported_dtype(self, dtype):
+        """tile.row_min rejects dtypes outside the PTO TROWMIN contract."""
+        span = ir.Span.unknown()
+        input_tile = ir.Var("input_tile", ir.TileType([8, 32], dtype), span)
+        tmp_tile = ir.Var("tmp_tile", ir.TileType([8, 32], dtype), span)
+
+        with pytest.raises(ValueError, match=r"requires input dtype in \{INT16, INT32, FP16, FP32\}"):
+            tile.row_min(input_tile, tmp_tile)
+
+    @pytest.mark.parametrize(
+        ("blayout", "slayout"),
+        [
+            pytest.param(ir.TileLayout.col_major, ir.TileLayout.none_box, id="col-major-flat"),
+            pytest.param(ir.TileLayout.row_major, ir.TileLayout.col_major, id="row-major-boxed"),
+        ],
+    )
+    def test_tile_row_min_rejects_non_nd_input_layout(self, blayout, slayout):
+        """tile.row_min requires an effective row-major, non-boxed source view."""
+        span = ir.Span.unknown()
+        input_view = ir.TileView(blayout=blayout, slayout=slayout)
+        input_tile = ir.Var(
+            "input_tile",
+            ir.TileType([8, 32], DataType.FP32, tile_view=input_view),
+            span,
+        )
+        tmp_tile = ir.Var("tmp_tile", ir.TileType([8, 32], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match=r"requires an ND input layout"):
+            tile.row_min(input_tile, tmp_tile)
+
+    def test_tile_row_min_does_not_constrain_tmp_layout(self):
+        """TROWMIN tmp keeps the existing same-dtype/rank/size safety subset only."""
+        span = ir.Span.unknown()
+        input_tile = ir.Var("input_tile", ir.TileType([8, 32], DataType.FP32), span)
+        boxed_tmp_view = ir.TileView(blayout=ir.TileLayout.col_major, slayout=ir.TileLayout.row_major)
+        tmp_tile = ir.Var(
+            "tmp_tile",
+            ir.TileType([8, 64], DataType.FP32, tile_view=boxed_tmp_view),
+            span,
+        )
+
+        call = tile.row_min(input_tile, tmp_tile)
+
+        assert isinstance(call.type, ir.TileType)
+        assert call.type.get_effective_tile_view().blayout == ir.TileLayout.col_major
 
     def test_tile_row_min(self):
         """Test tile.row_min operation."""
@@ -1187,6 +1379,202 @@ class TestTileBroadcastOps:
 
         ir_str = str(Program)
         assert "tile.row_expand_add" in ir_str
+
+    def test_tile_row_expand_add_accepts_row_major_packed_vector(self):
+        """The packed vector may have larger physical extents than its valid region."""
+        span = ir.Span.unknown()
+        main = ir.Var("main", ir.TileType([8, 32], DataType.FP32), span)
+        packed_view = ir.TileView(
+            valid_shape=[8, 8],
+            blayout=ir.TileLayout.row_major,
+            slayout=ir.TileLayout.none_box,
+        )
+        packed_row = ir.Var(
+            "packed_row",
+            ir.TileType([10, 16], DataType.FP32, tile_view=packed_view),
+            span,
+        )
+
+        call = tile.row_expand_add(main, packed_row)
+        assert call.op.name == "tile.row_expand_add"
+        assert len(call.args) == 2
+
+    def test_tile_row_expand_add_rejects_invalid_packed_valid_width_and_tmp_type(self):
+        """Packed valid rows must be 32 bytes and tmp must be a TileType."""
+        span = ir.Span.unknown()
+        main = ir.Var("main", ir.TileType([8, 32], DataType.FP32), span)
+        bad_view = ir.TileView(
+            valid_shape=[8, 7],
+            blayout=ir.TileLayout.row_major,
+            slayout=ir.TileLayout.none_box,
+        )
+        bad_row = ir.Var(
+            "bad_row",
+            ir.TileType([8, 16], DataType.FP32, tile_view=bad_view),
+            span,
+        )
+
+        with pytest.raises(ValueError, match=r"last dimension to be 8"):
+            tile.row_expand_add(main, bad_row)
+
+        row = ir.Var("row", ir.TileType([8, 1], DataType.FP32), span)
+        bad_tmp = ir.ConstFloat(0.0, DataType.FP32, span)
+        with pytest.raises(ValueError, match=r"tmp to be a TileType"):
+            tile.row_expand_add(main, row, tmp=bad_tmp)
+
+    def test_tile_row_expand_add_rejects_mixed_dtypes(self):
+        """PTOAS requires src0, src1, and dst to have one exact dtype."""
+        span = ir.Span.unknown()
+        main = ir.Var("main", ir.TileType([8, 32], DataType.FP32), span)
+        row = ir.Var("row", ir.TileType([8, 1], DataType.FP16), span)
+
+        with pytest.raises(ValueError, match=r"src0 and src1 to have the same dtype"):
+            tile.row_expand_add(main, row)
+
+    def test_tile_row_expand_add_rejects_valid_row_mismatch(self):
+        """Physical rows matching is insufficient when valid row extents differ."""
+        span = ir.Span.unknown()
+        main_view = ir.TileView(
+            valid_shape=[6, 32],
+            blayout=ir.TileLayout.row_major,
+            slayout=ir.TileLayout.none_box,
+        )
+        row_view = ir.TileView(
+            valid_shape=[5, 1],
+            blayout=ir.TileLayout.col_major,
+            slayout=ir.TileLayout.none_box,
+        )
+        main = ir.Var(
+            "main",
+            ir.TileType([8, 32], DataType.FP32, tile_view=main_view),
+            span,
+        )
+        row = ir.Var(
+            "row",
+            ir.TileType([8, 1], DataType.FP32, tile_view=row_view),
+            span,
+        )
+
+        with pytest.raises(ValueError, match=r"src1 valid row extent to match src0/dst"):
+            tile.row_expand_add(main, row)
+
+    def test_tile_row_expand_add_requires_provable_dynamic_carrier_extents(self):
+        """Shared dynamic rows are valid; unrelated rows or widths are unsafe."""
+        span = ir.Span.unknown()
+        valid_rows = ir.Var("valid_rows", ir.ScalarType(DataType.INDEX), span)
+        other_rows = ir.Var("other_rows", ir.ScalarType(DataType.INDEX), span)
+        carrier_cols = ir.Var("carrier_cols", ir.ScalarType(DataType.INDEX), span)
+        main_view = ir.TileView(
+            valid_shape=[valid_rows, 32],
+            blayout=ir.TileLayout.row_major,
+            slayout=ir.TileLayout.none_box,
+        )
+        main = ir.Var("main", ir.TileType([8, 32], DataType.FP32, tile_view=main_view), span)
+
+        matching_row_view = ir.TileView(
+            valid_shape=[valid_rows, 1],
+            blayout=ir.TileLayout.col_major,
+            slayout=ir.TileLayout.none_box,
+        )
+        matching_row = ir.Var(
+            "matching_row",
+            ir.TileType([8, 1], DataType.FP32, tile_view=matching_row_view),
+            span,
+        )
+        assert tile.row_expand_add(main, matching_row).op.name == "tile.row_expand_add"
+
+        unrelated_row_view = ir.TileView(
+            valid_shape=[other_rows, 1],
+            blayout=ir.TileLayout.col_major,
+            slayout=ir.TileLayout.none_box,
+        )
+        unrelated_row = ir.Var(
+            "unrelated_row",
+            ir.TileType([8, 1], DataType.FP32, tile_view=unrelated_row_view),
+            span,
+        )
+        with pytest.raises(ValueError, match=r"src1 valid row extent to match src0/dst"):
+            tile.row_expand_add(main, unrelated_row)
+
+        dynamic_width_view = ir.TileView(
+            valid_shape=[valid_rows, carrier_cols],
+            blayout=ir.TileLayout.row_major,
+            slayout=ir.TileLayout.none_box,
+        )
+        dynamic_width_row = ir.Var(
+            "dynamic_width_row",
+            ir.TileType([8, 8], DataType.FP32, tile_view=dynamic_width_view),
+            span,
+        )
+        with pytest.raises(ValueError, match=r"valid last dimension to be 8"):
+            tile.row_expand_add(main, dynamic_width_row)
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [DataType.INT8, DataType.INT16, DataType.INT32, DataType.FP16, DataType.FP32],
+    )
+    def test_tile_row_expand_add_accepts_ptoas_dtype_union(self, dtype):
+        """The tile contract exposes the union of supported PTOAS architectures."""
+        span = ir.Span.unknown()
+        main = ir.Var("main", ir.TileType([8, 32], dtype), span)
+        row = ir.Var("row", ir.TileType([8, 1], dtype), span)
+
+        call = tile.row_expand_add(main, row)
+
+        assert _tile_result_dtype(call) == dtype
+
+    def test_tile_row_expand_add_rejects_non_row_major_src0(self):
+        """PTOAS requires src0 and dst to use row-major block layout."""
+        span = ir.Span.unknown()
+        main_view = ir.TileView(
+            valid_shape=[8, 32],
+            blayout=ir.TileLayout.col_major,
+            slayout=ir.TileLayout.none_box,
+        )
+        main = ir.Var("main", ir.TileType([8, 32], DataType.FP32, tile_view=main_view), span)
+        row = ir.Var("row", ir.TileType([8, 1], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match=r"src0 effective blayout to be row_major"):
+            tile.row_expand_add(main, row)
+
+    def test_tile_row_expand_add_rejects_non_row_major_valid_col_mismatch(self):
+        """A DN [M, 1] carrier must also have valid_shape[1] equal to one."""
+        span = ir.Span.unknown()
+        row_view = ir.TileView(
+            valid_shape=[8, 0],
+            blayout=ir.TileLayout.col_major,
+            slayout=ir.TileLayout.none_box,
+        )
+        main = ir.Var("main", ir.TileType([8, 32], DataType.FP32), span)
+        row = ir.Var("row", ir.TileType([8, 1], DataType.FP32, tile_view=row_view), span)
+
+        with pytest.raises(ValueError, match=r"valid last dimension to be 1"):
+            tile.row_expand_add(main, row)
+
+    def test_tile_row_expand_add_rejects_unsupported_dtype(self):
+        """BF16 is outside the current pto.trowexpandadd dtype union."""
+        span = ir.Span.unknown()
+        main = ir.Var("main", ir.TileType([8, 32], DataType.BF16), span)
+        row = ir.Var("row", ir.TileType([8, 1], DataType.BF16), span)
+
+        with pytest.raises(ValueError, match=r"INT8, INT16, INT32, FP16, FP32"):
+            tile.row_expand_add(main, row)
+
+    def test_tile_row_expand_add_keeps_positional_span_and_keyword_tmp(self):
+        """The third positional slot stays span; tmp is keyword-only."""
+        span = ir.Span("row_expand_add_compat.py", 11, 2, 11, 18)
+        main = ir.Var("main", ir.TileType([8, 32], DataType.FP32), span)
+        row = ir.Var("row", ir.TileType([8, 1], DataType.FP32), span)
+        tmp = ir.Var("tmp", ir.TileType([8, 32], DataType.FP32), span)
+
+        without_tmp = tile.row_expand_add(main, row, span)
+        with_tmp = tile.row_expand_add(main, row, span, tmp=tmp)
+
+        assert without_tmp.span.filename == "row_expand_add_compat.py"
+        assert with_tmp.span.filename == "row_expand_add_compat.py"
+        assert len(without_tmp.args) == 2
+        assert len(with_tmp.args) == 3
+        assert with_tmp.args[2] is tmp
 
     def test_tile_row_expand_sub(self):
         """Test tile.row_expand_sub operator - subtract row vector from each tile row."""
@@ -3346,6 +3734,41 @@ class TestTileScalarOperandDtype:
         assert rhs.dtype == DataType.FP32
         # The tile op still deduces its result at the tile dtype.
         assert _tile_result_dtype(call) == DataType.INT32
+
+    def test_subs_mixed_scalar_dtype_preserves_tile_dtype(self):
+        """tsubs accepts a wider scalar without retyping its tile result."""
+        span = ir.Span.unknown()
+        lhs = self._int_tile(DataType.INT16)
+        scalar = ir.ConstFloat(2.5, DataType.FP32, span)
+
+        explicit_call = tile.subs(lhs, scalar)
+        literal_call = tile.subs(lhs, 2.5)
+
+        assert explicit_call.args[1] is scalar
+        assert _operand_dtype(explicit_call.args[1]) == DataType.FP32
+        assert _operand_dtype(literal_call.args[1]) == DataType.FP32
+        assert _tile_result_dtype(explicit_call) == DataType.INT16
+        assert _tile_result_dtype(literal_call) == DataType.INT16
+
+    def test_subs_rejects_unsupported_tile_dtype(self):
+        """INT64 is outside the current pto.tsubs tile dtype union."""
+        lhs = self._int_tile(DataType.INT64)
+
+        with pytest.raises(ValueError, match=r"INT8, INT16, INT32, FP16, FP32, BF16"):
+            tile.subs(lhs, 1)
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [DataType.UINT32, DataType.BOOL, DataType.INDEX, DataType.INT64, DataType.FP8E4M3FN],
+    )
+    def test_subs_rejects_unsupported_scalar_dtype(self, dtype):
+        """Only scalar dtypes exercised by the executable PTOAS paths are exposed."""
+        span = ir.Span.unknown()
+        lhs = self._int_tile(DataType.INT16)
+        scalar = ir.Var("scalar", ir.ScalarType(dtype), span)
+
+        with pytest.raises(ValueError, match=r"requires scalar dtype in"):
+            ir.create_op_call("tile.subs", [lhs, scalar], span)
 
     def test_float_literal_on_float_tile_adopts_tile_dtype(self):
         """A float literal on a low-precision float tile adopts the tile dtype.

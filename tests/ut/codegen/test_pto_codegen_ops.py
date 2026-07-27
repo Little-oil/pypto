@@ -622,6 +622,122 @@ class TestRsqrtHighPrecisionCodegen:
         )
 
 
+class TestB01PrecisionAndRowExpandAddCodegen:
+    """Exact PTOAS forms added for the first op batch."""
+
+    def _generate_mlir(self, program_cls) -> str:
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
+        funcs = list(optimized.functions.values())
+        assert funcs, "Program has no functions"
+        single = ir.Program([funcs[0]], funcs[0].name, optimized.span)
+        return codegen.PTOCodegen().generate(single)
+
+    @staticmethod
+    def _op_line(mlir: str, op_name: str) -> str:
+        line = next((line for line in mlir.splitlines() if op_name in line), "")
+        assert line, f"{op_name} not found in MLIR:\n{mlir}"
+        return line
+
+    @staticmethod
+    def _ins_operand_count(line: str) -> int:
+        ins_start = line.find("ins(")
+        ins_end = line.find(")", ins_start)
+        assert ins_start != -1 and ins_end != -1, f"ins(...) clause not found in: {line}"
+        operands = line[ins_start + len("ins(") : ins_end].split(":", 1)[0]
+        return operands.count(",") + 1
+
+    def test_tdiv_default_omits_and_high_precision_appends_exact_attr(self):
+        @pl.program
+        class DefaultProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 16], pl.FP32],
+                rhs: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(lhs, [0, 0], [16, 16])
+                rhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(rhs, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.div(lhs_tile, rhs_tile)
+                return pl.store(result, [0, 0], out)
+
+        @pl.program
+        class HighPrecisionProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 16], pl.FP32],
+                rhs: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(lhs, [0, 0], [16, 16])
+                rhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(rhs, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.div(lhs_tile, rhs_tile, high_precision=True)
+                return pl.store(result, [0, 0], out)
+
+        default_line = self._op_line(self._generate_mlir(DefaultProg), "pto.tdiv")
+        high_precision_line = self._op_line(self._generate_mlir(HighPrecisionProg), "pto.tdiv")
+        assert "precisionType" not in default_line
+        assert high_precision_line.endswith("{precisionType = #pto<div_precision high_precision>}")
+        assert ") outs(" in high_precision_line
+        assert high_precision_line.index("outs(") < high_precision_line.index("precisionType")
+
+    def test_tlog_emits_exact_high_precision_attr(self):
+        @pl.program
+        class LogProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                result: pl.Tensor[[16, 16], pl.FP32] = pl.log(src, high_precision=True)
+                return result
+
+        log_line = self._op_line(self._generate_mlir(LogProg), "pto.tlog")
+        assert log_line.endswith("{precisionType = #pto<log_precision high_precision>}")
+
+    def test_trowexpandadd_emits_two_and_three_operand_forms(self):
+        @pl.program
+        class WithoutTmpProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                row: pl.Tensor[[16, 1], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                row_tile: pl.Tile[[16, 1], pl.FP32] = pl.load(row, [0, 0], [16, 1])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.row_expand_add(src_tile, row_tile)
+                return pl.store(result, [0, 0], out)
+
+        @pl.program
+        class WithTmpProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                row: pl.Tensor[[16, 1], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                row_tile: pl.Tile[[16, 1], pl.FP32] = pl.load(row, [0, 0], [16, 1])
+                tmp: pl.Tile[[16, 16], pl.FP32] = pl.tile.create(
+                    [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.row_expand_add(src_tile, row_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        two_operand_line = self._op_line(self._generate_mlir(WithoutTmpProg), "pto.trowexpandadd")
+        three_operand_line = self._op_line(self._generate_mlir(WithTmpProg), "pto.trowexpandadd")
+        assert self._ins_operand_count(two_operand_line) == 2
+        assert self._ins_operand_count(three_operand_line) == 3
+
+
 class TestTileReadWriteOffsetCodegen:
     """Tests verifying tile.read/write multi-dimensional indices generate correct flat offsets."""
 
