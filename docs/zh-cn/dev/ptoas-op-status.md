@@ -6,8 +6,8 @@
 `PTOOps.td` 仍保留的 source-only 兼容/tile 接口 15 个，共 204 个。列状态按
 **PyPTO 当前源码**核实（最后更新 2026-07-27）。后续每加或修改一个 op，只更新本表对应行。
 
-本表不包含 `PTOOps.td` 中 32 个仅供 lowering/compiler plumbing 使用的内部 op，也不列
-VPTO、VMI、SIMT 等其他 dialect。
+本表包含公共/兼容接口中 PyPTO 级别为 `internal` 的 op；另有 `PTOOps.td` 中 32 个仅供
+lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO、VMI、SIMT 等其他 dialect。
 
 ## 完成判定原则
 
@@ -261,4 +261,4 @@ VPTO、VMI、SIMT 等其他 dialect。
 
 **统计**：共 204 个 PTOAS 公共/兼容 op；pypto tile 前端 113 个，tensor 前端 75 个；
 同名 ST 覆盖 110 个（普通 ST 106，distributed ST 4）；无同名 ST 62 个
-（普通 52，distributed 10）；另有 32 个 op 不适合独立 ST。
+（普通 52，distributed 10）；这 204 个中另有 32 个 op 不适合独立 ST。

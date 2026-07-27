@@ -163,6 +163,10 @@ class TensorSubsCase(PTOTestCase):
         n: int = 64,
     ):
         super().__init__(_run_config(dtype), platform=platform)
+        if dtype == DataType.BF16 and scalar != 1.5:
+            raise ValueError(
+                "TensorSubsCase BF16 requires scalar=1.5 because pl.const() requires a numeric literal"
+            )
         self.m = m
         self.n = n
         self.dtype = dtype
@@ -198,6 +202,7 @@ class TensorSubsCase(PTOTestCase):
                     out: pl.Out[pl.Tensor[[m, n], pl.BF16]],
                 ) -> pl.Tensor[[m, n], pl.BF16]:
                     with pl.at(level=pl.Level.CORE_GROUP):
+                        # The parser requires a source literal; __init__ guards the matching oracle value.
                         result: pl.Tensor[[m, n], pl.BF16] = pl.tensor.subs(src, pl.const(1.5, pl.BF16))
                         out = pl.assemble(out, result, [0, 0])
                     return out

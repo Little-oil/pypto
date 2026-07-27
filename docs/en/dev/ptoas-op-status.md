@@ -8,8 +8,9 @@ plus 15 source-only compatibility/tile interfaces still present in `PTOOps.td`, 
 total of 204. Column statuses were checked against the **current PyPTO source** (last
 updated 2026-07-27). When an op is added or changed, update only its corresponding row.
 
-This table excludes the 32 internal ops in `PTOOps.td` that are used only for
-lowering/compiler plumbing. It also excludes other dialects such as VPTO, VMI, and SIMT.
+The matrix includes public/compatibility interfaces even when their PyPTO level is
+`internal`. Separately, it excludes 32 additional `PTOOps.td` ops that exist only
+for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 
 ## Completion Criteria
 
@@ -274,4 +275,4 @@ lowering/compiler plumbing. It also excludes other dialects such as VPTO, VMI, a
 
 **Stats**: 204 public/compatibility PTOAS ops; 113 have a pypto tile frontend and 75 have a tensor frontend;
 110 have same-name ST coverage (106 regular STs and 4 distributed STs); 62 lack same-name ST coverage
-(52 regular and 10 distributed); another 32 ops are not suitable for standalone STs.
+(52 regular and 10 distributed); within these 204, another 32 ops are not suitable for standalone STs.
