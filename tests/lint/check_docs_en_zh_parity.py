@@ -8,8 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Fail if docs/en and docs/zh-cn markdown path sets diverge.
 
-English docs are ground truth; zh-CN must mirror the same relative file tree.
-This check does not compare file contents or translation freshness.
+English docs are ground truth except for explicitly allowlisted zh-CN-only
+paths. This check does not compare file contents or translation freshness.
 """
 
 import sys
@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 EN = ROOT / "docs" / "en"
 ZH = ROOT / "docs" / "zh-cn"
+ZH_ONLY_ALLOWLIST = frozenset({"dev/ptoas-op-addition-plan.md"})
 
 
 def rel_mds(base: Path) -> set[str]:
@@ -27,9 +28,13 @@ def rel_mds(base: Path) -> set[str]:
     return {p.relative_to(base).as_posix() for p in base.rglob("*.md")}
 
 
+def _find_unpaired_paths(en: set[str], zh: set[str]) -> tuple[list[str], list[str]]:
+    return sorted(en - zh), sorted((zh - en) - ZH_ONLY_ALLOWLIST)
+
+
 def main() -> int:
     en, zh = rel_mds(EN), rel_mds(ZH)
-    only_en, only_zh = sorted(en - zh), sorted(zh - en)
+    only_en, only_zh = _find_unpaired_paths(en, zh)
     if not only_en and not only_zh:
         print(f"OK: {len(en)} paired markdown paths under docs/en ↔ docs/zh-cn")
         return 0
