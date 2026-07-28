@@ -709,16 +709,29 @@ def _parse_l3_stats(invocations: Any, stats: BenchmarkStats, *, rounds: int, war
     for invs in by_pid.values():
         invs.sort(key=lambda i: i.inv)
 
-    # Keep only chip-child ranks. A real rank emits a ``device_wall`` span; the
-    # L3 host-orch parent process emits its own ``run_prepared`` root without any
-    # chip ``device_wall``, so its pid must not be grouped as a rank — otherwise
-    # it adds a fake zero-device rank that corrupts ``per_rank`` / rank counts and
+    # Keep only actual dispatch invocation groups. The capture must begin before
+    # ``prepare()`` so forked chip workers inherit its fd, but prepare-time setup
+    # can emit unrelated groups such as ``simpler_prewarm.build``. Those groups
+    # lack the canonical run root and would add one invocation per rank, making a
+    # deterministic ``warmup + rounds`` stream look non-divisible. Do not filter
+    # on ``device_wall`` per invocation: retaining a real run with a missing
+    # device marker preserves its round alignment and exposes a zero metric.
+    names = _span_names()
+    host_name = names["host"]
+    device_name = names["device"]
+    by_pid = {
+        pid: [inv for inv in invs if inv.by_name().get(host_name) is not None] for pid, invs in by_pid.items()
+    }
+
+    # A real chip-child rank emits at least one ``device_wall`` span; the L3
+    # host-orch parent process emits its own run root without any chip
+    # ``device_wall``, so its pid must not be grouped as a rank — otherwise it
+    # adds a fake zero-device rank that corrupts ``per_rank`` / rank counts and
     # pollutes the ``host_wall`` / ``union`` windows with the parent orch span.
-    device_name = _span_names()["device"]
     by_pid = {
         pid: invs
         for pid, invs in by_pid.items()
-        if any(inv.by_name().get(device_name) is not None for inv in invs)
+        if invs and any(inv.by_name().get(device_name) is not None for inv in invs)
     }
     if not by_pid:
         return stats

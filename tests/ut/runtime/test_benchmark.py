@@ -274,6 +274,28 @@ def test_parse_l3_two_ranks_per_round_max(span_root):
     assert stats.host_wall_us == [200.0, 300.0]
 
 
+def test_parse_l3_ignores_prepare_time_prewarm_groups(span_root):
+    """Setup-only prewarm groups do not break per-rank round segmentation."""
+    lines: list[str] = []
+    for pid, measured_us in ((100, [10.0, 30.0]), (101, [20.0, 5.0])):
+        # ``prepare()`` runs before benchmark dispatches while stderr is already
+        # captured. Simpler's arena prewarm emits this non-dispatch STRACE group
+        # with no canonical run root or device-wall span.
+        lines.append(_strace_line(0, "simpler_prewarm.build", 800_000, pid=pid, hid="0"))
+        lines += _launch_lines(1, span_root, host_us=99, device_us=99, pid=pid)  # warmup
+        lines += _launch_lines(2, span_root, host_us=100, device_us=measured_us[0], pid=pid)
+        lines += _launch_lines(3, span_root, host_us=300, device_us=measured_us[1], pid=pid)
+
+    stats = _parse_stats_from_strace("\n".join(lines), rounds=2, warmup=1, distributed=True)
+
+    assert stats.fallback_flattened is False
+    assert stats.per_rank("device") == {100: [10.0, 30.0], 101: [20.0, 5.0]}
+    assert len(stats.invocations) == 4
+    roots = [inv.root() for inv in stats.invocations]
+    assert all(root is not None for root in roots)
+    assert {root.name for root in roots if root is not None} == {span_root}
+
+
 def test_parse_l3_recovers_interleaved_records_on_one_line(span_root):
     """Two ``[STRACE]`` records mashed onto one physical line are both recovered.
 
@@ -641,6 +663,41 @@ def test_benchmark_l3_capture_wraps_prepare(span_root):
     # Prepare-time markers were captured and aggregated (per-round max across ranks).
     assert stats.device_wall_us == [20.0]
     assert set(stats.per_rank("device")) == {100, 101}
+
+
+def test_benchmark_l3_ignores_prepare_setup_groups(span_root):
+    """Setup-only groups captured around ``prepare()`` are not dispatches."""
+
+    class _CompiledEmittingPrewarmAtPrepare(_FakeDistributedCompiled):
+        def prepare(self, config: Any = None) -> _FakeDistributedWorker:
+            for pid in (100, 101):
+                line = _strace_line(0, "simpler_prewarm.build", 800_000, pid=pid, hid="0")
+                os.write(2, (line + "\n").encode())
+            return self._rt
+
+    rt = _FakeDistributedWorker()
+
+    def emit_dispatch(*_args: Any, **_kwargs: Any) -> None:
+        for pid, dev_us in ((100, 10.0), (101, 20.0)):
+            for line in _launch_lines(1, span_root, host_us=5.0, device_us=dev_us, pid=pid):
+                os.write(2, (line + "\n").encode())
+
+    rt.handle.side_effect = emit_dispatch
+    with (
+        patch.object(dcp_mod, "DistributedCompiledProgram", _FakeDistributedCompiled),
+        patch("pypto.runtime.bench.configure_log"),
+        patch("pypto.runtime.bench.current_level", return_value=20),
+    ):
+        stats = benchmark(
+            _CompiledEmittingPrewarmAtPrepare(rt),
+            [MagicMock(name="arg")],
+            rounds=1,
+            warmup=0,
+        )
+
+    assert stats.device_wall_us == [20.0]
+    assert set(stats.per_rank("device")) == {100, 101}
+    assert all(len(dispatches) == 1 for dispatches in stats.rounds_dispatches[0].values())
 
 
 def test_benchmark_raises_when_no_markers_captured():
