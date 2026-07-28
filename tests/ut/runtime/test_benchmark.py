@@ -296,6 +296,20 @@ def test_parse_l3_ignores_prepare_time_prewarm_groups(span_root):
     assert {root.name for root in roots if root is not None} == {span_root}
 
 
+def test_parse_l3_keeps_dispatch_missing_one_device_marker(span_root):
+    """A real dispatch with no device span remains aligned and reports zero."""
+    lines = [_strace_line(0, span_root, 100_000, depth=0, pid=100)]
+    lines += _launch_lines(1, span_root, host_us=300, device_us=30, pid=100)
+    lines += _launch_lines(0, span_root, host_us=200, device_us=20, pid=101)
+    lines += _launch_lines(1, span_root, host_us=50, device_us=5, pid=101)
+
+    stats = _parse_stats_from_strace("\n".join(lines), rounds=2, warmup=0, distributed=True)
+
+    assert stats.fallback_flattened is False
+    assert stats.per_rank("device") == {100: [0.0, 30.0], 101: [20.0, 5.0]}
+    assert len(stats.rounds_dispatches[0][100]) == 1
+
+
 def test_parse_l3_recovers_interleaved_records_on_one_line(span_root):
     """Two ``[STRACE]`` records mashed onto one physical line are both recovered.
 

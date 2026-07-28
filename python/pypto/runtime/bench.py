@@ -678,6 +678,11 @@ def _inv_span_us(inv: Any, name: str) -> float:
     return span.dur / 1000.0 if span is not None else 0.0
 
 
+def _is_dispatch_invocation(inv: Any, host_name: str) -> bool:
+    """Whether *inv* contains the canonical dispatch host span at depth 0."""
+    return any(span.depth == 0 and span.name == host_name for span in inv.spans)
+
+
 def _parse_l3_stats(invocations: Any, stats: BenchmarkStats, *, rounds: int, warmup: int) -> BenchmarkStats:
     """Aggregate L3 (distributed) ``[STRACE]`` markers into per-round stats.
 
@@ -703,25 +708,22 @@ def _parse_l3_stats(invocations: Any, stats: BenchmarkStats, *, rounds: int, war
     dispatch shape where per-round alignment cannot be trusted.
     """
     launches = warmup + rounds
-    by_pid: dict[int, list[Any]] = defaultdict(list)
-    for inv in invocations:
-        by_pid[inv.pid].append(inv)
-    for invs in by_pid.values():
-        invs.sort(key=lambda i: i.inv)
 
-    # Keep only actual dispatch invocation groups. The capture must begin before
-    # ``prepare()`` so forked chip workers inherit its fd, but prepare-time setup
-    # can emit unrelated groups such as ``simpler_prewarm.build``. Those groups
-    # lack the canonical run root and would add one invocation per rank, making a
-    # deterministic ``warmup + rounds`` stream look non-divisible. Do not filter
-    # on ``device_wall`` per invocation: retaining a real run with a missing
-    # device marker preserves its round alignment and exposes a zero metric.
+    # The capture must begin before ``prepare()`` so forked chip workers inherit
+    # its fd, but prepare-time setup can emit unrelated invocation groups such as
+    # ``simpler_prewarm.build``. Only a depth-0 canonical run root identifies an
+    # actual dispatch. Do not filter on ``device_wall`` per invocation: retaining
+    # a real run with a missing device marker preserves its round alignment and
+    # exposes a zero metric.
     names = _span_names()
     host_name = names["host"]
     device_name = names["device"]
-    by_pid = {
-        pid: [inv for inv in invs if inv.by_name().get(host_name) is not None] for pid, invs in by_pid.items()
-    }
+    by_pid: dict[int, list[Any]] = defaultdict(list)
+    for inv in invocations:
+        if _is_dispatch_invocation(inv, host_name):
+            by_pid[inv.pid].append(inv)
+    for invs in by_pid.values():
+        invs.sort(key=lambda i: i.inv)
 
     # A real chip-child rank emits at least one ``device_wall`` span; the L3
     # host-orch parent process emits its own run root without any chip
