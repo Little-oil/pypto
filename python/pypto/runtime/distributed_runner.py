@@ -1920,9 +1920,9 @@ class DistributedWorker(Worker):
         can use different ring sizes. Its runtime DFX fields are also applied per
         dispatch. On onboard L3, ``enable_l2_swimlane`` executes the workload
         twice on the same prepared worker: first with dep-gen only, then with
-        swimlane and dep-gen disabled. Mutable host/resident arguments are not
-        restored between those profiling passes and can therefore be updated
-        twice. ``None`` reuses the program's baseline.
+        swimlane enabled and dep-gen disabled. Mutable host/resident arguments
+        are not restored between those profiling passes and can therefore be
+        updated twice. ``None`` reuses the program's baseline.
         """
         if self._multi_program:
             raise TypeError(

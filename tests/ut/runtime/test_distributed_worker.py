@@ -222,7 +222,6 @@ class TestPreparedSwimlaneTwoPass:
         run_config = RunConfig(
             platform="a2a3",
             enable_l2_swimlane=1,  # pyright: ignore[reportArgumentType]
-            enable_dep_gen=True,
             enable_pmu=3,
             enable_scope_stats=True,
             enable_dump_args=2,
