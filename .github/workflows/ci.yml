@@ -643,7 +643,10 @@ jobs:
           unset-ring: 'true'
 
       - name: Test distributed system tests
-        timeout-minutes: 15
+        # The step clock includes both task-submit queueing and the device run.
+        # Keep enough headroom for a typical ~10-minute suite after waiting for
+        # a two-card slot; --max-time below still caps device execution at 15m.
+        timeout-minutes: 30
         # Mechanism B (multi-card): borrow 2 NPUs via `task-submit --device auto
         # --device-num 2` for the whole pytest run; $TASK_DEVICE is the lent set
         # (comma-separated), passed to --device. The job no longer pins an
