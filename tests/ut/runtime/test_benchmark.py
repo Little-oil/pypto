@@ -27,7 +27,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pypto.ir import distributed_compiled_program as dcp_mod
 from pypto.runtime import RunConfig
-from pypto.runtime.bench import BenchmarkStats, _parse_stats_from_strace, benchmark
+from pypto.runtime.bench import (
+    _L3_SWIMLANE_GRAPH_BEGIN,
+    _L3_SWIMLANE_GRAPH_END,
+    _L3_SWIMLANE_TIMING_BEGIN,
+    _L3_SWIMLANE_TIMING_END,
+    BenchmarkStats,
+    _parse_stats_from_strace,
+    benchmark,
+)
 
 
 @pytest.fixture
@@ -272,6 +280,60 @@ def test_parse_l3_two_ranks_per_round_max(span_root):
     # Per-round max across ranks: round0 = max(10,20)=20; round1 = max(30,5)=30.
     assert stats.device_wall_us == [20.0, 30.0]
     assert stats.host_wall_us == [200.0, 300.0]
+
+
+def test_parse_l3_two_pass_swimlane_keeps_clean_timing_half(span_root):
+    """Prepared swimlane benchmark excludes every dep-gen graph pass."""
+    lines: list[str] = []
+    timings = {100: [99.0, 10.0, 30.0], 101: [99.0, 20.0, 5.0]}
+    invs = {100: 0, 101: 0}
+    for launch in range(3):  # one warmup + two measured launches
+        lines.append(_L3_SWIMLANE_GRAPH_BEGIN)
+        for pid in timings:
+            # Deliberately give the graph pass two dispatches and timing one.
+            # Boundary sentinels, rather than an unsafe "keep the latter half"
+            # count heuristic, must decide what survives.
+            lines += _launch_lines(invs[pid], span_root, host_us=900, device_us=900, pid=pid)
+            invs[pid] += 1
+            lines += _launch_lines(invs[pid], span_root, host_us=901, device_us=901, pid=pid)
+            invs[pid] += 1
+        lines.append(_L3_SWIMLANE_GRAPH_END)
+        timing_lines: list[str] = []
+        for pid, timing_us in timings.items():
+            clean_us = timing_us[launch]
+            timing_lines += _launch_lines(
+                invs[pid],
+                span_root,
+                host_us=clean_us * 10,
+                device_us=clean_us,
+                pid=pid,
+            )
+            invs[pid] += 1
+        # Model shared-fd writes that concatenate a pass sentinel and STRACE
+        # record onto one physical line; substring boundary extraction must
+        # still retain every clean record.
+        lines.append(_L3_SWIMLANE_TIMING_BEGIN + timing_lines[0])
+        lines.extend(timing_lines[1:-1])
+        lines.append(timing_lines[-1] + _L3_SWIMLANE_TIMING_END)
+
+    stats = _parse_stats_from_strace("\n".join(lines), rounds=2, warmup=1, distributed=True)
+
+    assert stats.fallback_flattened is False
+    assert stats.per_rank("device") == {100: [10.0, 30.0], 101: [20.0, 5.0]}
+    assert stats.device_wall_us == [20.0, 30.0]
+    assert all(inv.device_wall_us < 900 for inv in stats.invocations)
+
+
+def test_parse_l3_incomplete_timing_region_returns_no_contaminated_samples(span_root):
+    """An incomplete capture must not silently mix graph and timing passes."""
+    lines = [_L3_SWIMLANE_TIMING_BEGIN]
+    lines += _launch_lines(0, span_root, host_us=900, device_us=900, pid=100)
+
+    stats = _parse_stats_from_strace("\n".join(lines), rounds=1, warmup=0, distributed=True)
+
+    assert stats.fallback_flattened is True
+    assert stats.device_wall_us == []
+    assert stats.host_wall_us == []
 
 
 def test_parse_l3_ignores_prepare_time_prewarm_groups(span_root):

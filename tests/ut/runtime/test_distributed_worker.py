@@ -34,6 +34,12 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import ParamDirection
 from pypto.runtime import DeviceTensor
+from pypto.runtime.bench import (
+    _L3_SWIMLANE_GRAPH_BEGIN,
+    _L3_SWIMLANE_GRAPH_END,
+    _L3_SWIMLANE_TIMING_BEGIN,
+    _L3_SWIMLANE_TIMING_END,
+)
 from pypto.runtime.distributed_runner import (
     DistributedWorker,
     _assemble_chip_callables,
@@ -187,6 +193,160 @@ class TestPerTaskRingSizing:
         # rt.run(...) honors the same per-dispatch ring sizing as rt(...).
         assert m["make_call_config"].call_count == 2
         assert m["make_call_config"].call_args.args[1] is rc
+        rt.close()
+
+
+class TestPreparedSwimlaneTwoPass:
+    """Prepared onboard L3 captures deps, then measures without dep_gen."""
+
+    _CALL_CONFIG_ARG = 5
+
+    def test_onboard_reuses_worker_for_graph_then_clean_timing(self, patched_setup, tmp_path, capsys):
+        m = patched_setup
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        compiled.platform = "a2a3"
+        compiled.output_dir = tmp_path
+        rt = DistributedWorker(compiled)
+
+        # Ignore the baseline config constructed during prepare(); this test
+        # observes the two configs built for the caller-visible dispatch.
+        m["make_call_config"].reset_mock()
+        deps_call_config = MagicMock(name="DepsCallConfig")
+        timing_call_config = MagicMock(name="TimingCallConfig")
+        m["make_call_config"].side_effect = [deps_call_config, timing_call_config]
+        events: list[str] = []
+        m["dispatch"].side_effect = lambda *args: events.append(
+            "deps" if args[self._CALL_CONFIG_ARG] is deps_call_config else "timing"
+        )
+
+        run_config = RunConfig(
+            platform="a2a3",
+            enable_l2_swimlane=1,  # pyright: ignore[reportArgumentType]
+            enable_dep_gen=True,
+            enable_pmu=3,
+            enable_scope_stats=True,
+            enable_dump_args=2,
+        )
+        with (
+            patch(
+                "pypto.runtime.distributed_runner._clear_dfx_dispatch_dirs",
+                side_effect=lambda _path: events.append("clear"),
+            ) as clear,
+            patch(
+                "pypto.runtime.distributed_runner._collect_l3_swimlane",
+                side_effect=lambda _output, _platform: events.append("collect"),
+            ) as collect,
+        ):
+            rt(DeviceTensor(0x1000, (16, 16), torch.float32), config=run_config)
+
+        assert events == ["clear", "deps", "timing", "collect"]
+        assert m["dispatch"].call_count == 2
+        assert all(call.args[0] is m["worker"] for call in m["dispatch"].call_args_list)
+        assert m["construct"].call_count == 1
+        assert m["worker"].init.call_count == 1
+        clear.assert_called_once_with(tmp_path / "dfx_outputs")
+        collect.assert_called_once_with(tmp_path, "a2a3")
+
+        assert m["make_call_config"].call_count == 2
+        deps_build, timing_build = m["make_call_config"].call_args_list
+        deps_config = deps_build.args[1]
+        assert deps_config.enable_l2_swimlane is False
+        assert deps_config.enable_dep_gen is True
+        assert deps_config.enable_pmu == 0
+        assert deps_config.enable_scope_stats is False
+        assert deps_config.enable_dump_args == 0
+
+        timing_config = timing_build.args[1]
+        assert timing_config.enable_l2_swimlane == 1
+        assert timing_config.enable_dep_gen is False
+        assert timing_config.enable_pmu == 3
+        assert timing_config.enable_scope_stats is True
+        assert timing_config.enable_dump_args == 2
+        assert timing_build.kwargs["co_enable_swimlane_dep_gen"] is False
+        captured = capsys.readouterr()
+        assert [line for line in captured.err.splitlines() if "l3_swimlane_pass=" in line] == [
+            _L3_SWIMLANE_GRAPH_BEGIN,
+            _L3_SWIMLANE_GRAPH_END,
+            _L3_SWIMLANE_TIMING_BEGIN,
+            _L3_SWIMLANE_TIMING_END,
+        ]
+        rt.close()
+
+    def test_simulator_keeps_single_pass(self, patched_setup, tmp_path):
+        m = patched_setup
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        compiled.output_dir = tmp_path
+        rt = DistributedWorker(compiled)
+
+        m["make_call_config"].reset_mock()
+        call_config = MagicMock(name="SimCallConfig")
+        m["make_call_config"].return_value = call_config
+        run_config = RunConfig(
+            platform="a2a3sim",
+            enable_l2_swimlane=1,  # pyright: ignore[reportArgumentType]
+        )
+        with patch("pypto.runtime.distributed_runner._collect_l3_swimlane") as collect:
+            rt(DeviceTensor(0x1000, (16, 16), torch.float32), config=run_config)
+
+        m["dispatch"].assert_called_once()
+        assert m["dispatch"].call_args.args[self._CALL_CONFIG_ARG] is call_config
+        m["make_call_config"].assert_called_once_with(
+            compiled._distributed_config,
+            run_config,
+            dfx_base=tmp_path / "dfx_outputs",
+        )
+        collect.assert_called_once_with(tmp_path, "a2a3sim")
+        rt.close()
+
+    def test_dep_gen_without_swimlane_keeps_single_pass(self, patched_setup, tmp_path):
+        m = patched_setup
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        compiled.platform = "a2a3"
+        compiled.output_dir = tmp_path
+        rt = DistributedWorker(compiled)
+
+        m["make_call_config"].reset_mock()
+        run_config = RunConfig(platform="a2a3", enable_dep_gen=True)
+        with patch("pypto.runtime.distributed_runner._collect_l3_swimlane") as collect:
+            rt(DeviceTensor(0x1000, (16, 16), torch.float32), config=run_config)
+
+        m["dispatch"].assert_called_once()
+        m["make_call_config"].assert_called_once_with(
+            compiled._distributed_config,
+            run_config,
+            dfx_base=tmp_path / "dfx_outputs",
+        )
+        collect.assert_not_called()
+        rt.close()
+
+    def test_persistent_route_waits_for_graph_then_timing_requests(self, patched_setup, tmp_path):
+        m = patched_setup
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        compiled.platform = "a2a3"
+        compiled.output_dir = tmp_path
+        rt = DistributedWorker(compiled)
+
+        # Exercise _dispatch_prepared's persistent branch without starting a
+        # background thread: each call into _dispatch_persistent is the
+        # synchronous request/fence used by the real dispatcher.
+        rt._persistent = True
+        m["make_call_config"].reset_mock()
+        deps_call_config = MagicMock(name="DepsCallConfig")
+        timing_call_config = MagicMock(name="TimingCallConfig")
+        m["make_call_config"].side_effect = [deps_call_config, timing_call_config]
+        with (
+            patch.object(rt, "_dispatch_persistent") as dispatch_persistent,
+            patch("pypto.runtime.distributed_runner._collect_l3_swimlane"),
+        ):
+            rt(
+                DeviceTensor(0x1000, (16, 16), torch.float32),
+                config=RunConfig(platform="a2a3", enable_l2_swimlane=True),
+            )
+
+        assert [call.args[2] for call in dispatch_persistent.call_args_list] == [
+            deps_call_config,
+            timing_call_config,
+        ]
         rt.close()
 
 
@@ -1738,6 +1898,29 @@ class TestMakeCallConfigDepGenType:
         run_config = RunConfig(enable_dump_args=1, enable_l2_swimlane=0)  # pyright: ignore[reportArgumentType]
         cfg = _make_call_config(DistributedConfig(), run_config, dfx_base=tmp_path / "dfx")
         assert cfg.enable_dep_gen is False
+
+    def test_clean_timing_suppresses_implicit_dep_gen(self, tmp_path, fake_simpler_task_interface):
+        run_config = RunConfig(enable_l2_swimlane=1)  # pyright: ignore[reportArgumentType]
+        cfg = _make_call_config(
+            DistributedConfig(),
+            run_config,
+            dfx_base=tmp_path / "dfx",
+            co_enable_swimlane_dep_gen=False,
+        )
+        assert cfg.enable_dep_gen is False
+
+    def test_explicit_dep_gen_still_wins_when_co_enable_is_off(self, tmp_path, fake_simpler_task_interface):
+        run_config = RunConfig(
+            enable_l2_swimlane=1,  # pyright: ignore[reportArgumentType]
+            enable_dep_gen=True,
+        )
+        cfg = _make_call_config(
+            DistributedConfig(),
+            run_config,
+            dfx_base=tmp_path / "dfx",
+            co_enable_swimlane_dep_gen=False,
+        )
+        assert cfg.enable_dep_gen is True
 
 
 class _PersistentDomainHandle:

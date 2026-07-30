@@ -447,9 +447,11 @@ def _make_call_config(
     / ``enable_scope_stats`` / ``enable_l2_swimlane``) are likewise read from
     *run_config* and written to the shared ``config`` the host_orch chip dispatch
     forwards to every ``orch.submit_next_level``; their artifacts land under
-    *dfx_base* (``<output_dir>/dfx_outputs``). ``enable_l2_swimlane`` co-enables
-    dep_gen so the converter can resolve task arrows / kernel names (see the
-    inline note on the single-pass timing trade-off vs the L2 two-pass).
+    *dfx_base* (``<output_dir>/dfx_outputs``). By default,
+    ``enable_l2_swimlane`` co-enables dep_gen so a single dispatch still has the
+    task graph needed by the converter. Onboard L3 callers use a two-pass
+    graph/timing protocol and set *co_enable_swimlane_dep_gen* false while
+    building the clean timing pass.
 
     Args:
         dc: The program's distributed configuration (baseline).
@@ -458,6 +460,9 @@ def _make_call_config(
         dfx_base: Directory under which DFX artifacts are written
             (``<output_dir>/dfx_outputs``). Required whenever *run_config*
             enables a DFX flag; created if missing.
+        co_enable_swimlane_dep_gen: Whether swimlane implicitly enables
+            dep_gen. The onboard graph pass and simulator single-pass use the
+            default; the onboard clean timing pass disables it.
 
     Returns:
         A fresh simpler ``CallConfig``.
@@ -484,12 +489,11 @@ def _make_call_config(
             call_config.enable_dump_args = dfx.enable_dump_args
             call_config.enable_pmu = dfx.enable_pmu
             # Swimlane needs ``deps.json`` so the converter can resolve task
-            # arrows / kernel names. The one-shot path runs a clean two-pass
-            # (pass 1 dep_gen → deps.json, pass 2 swimlane → clean records) and
-            # sets ``co_enable_swimlane_dep_gen=False`` on the timing pass so
-            # dep_gen does not perturb it. Everywhere else (the timing-pass-less
-            # single-pass: prepared worker, or sim where conversion is skipped)
-            # co-enable dep_gen so swimlane still has a graph in one dispatch.
+            # arrows / kernel names. Onboard one-shot and prepared paths run a
+            # clean two-pass (pass 1 dep_gen → deps.json, pass 2 swimlane → clean
+            # records) and set ``co_enable_swimlane_dep_gen=False`` on the timing
+            # pass so dep_gen does not perturb it. Simulator and direct
+            # single-pass builders keep the default co-enable behavior.
             # ``enable_l2_swimlane`` is an int (0/1/2), so the ``or``/``and`` chain
             # can yield an int; the ``CallConfig.enable_dep_gen`` pybind setter
             # only accepts ``bool``. Wrap in ``bool(...)`` to avoid a TypeError.
@@ -504,6 +508,60 @@ def _make_call_config(
             # overwrite each other — even when one card runs multiple dispatches.
             call_config.output_prefix = str(dfx_base)
     return call_config
+
+
+def _run_l3_swimlane_two_pass(
+    dc: DistributedConfig,
+    config: RunConfig,
+    dfx_base: Path,
+    run_pass: Callable[[Any], None],
+) -> None:
+    """Capture the L3 task graph, then run a dep-gen-free timing pass.
+
+    ``run_pass`` owns the execution lifecycle: the one-shot path creates a
+    fresh Worker for each call, while a prepared ``DistributedWorker`` reuses
+    its existing Worker and issues a new ``Worker.run()`` fence. Both paths
+    reset their per-card dispatch counters, so matching graph/timing dispatches
+    land in the same ``rank{r}/d{k}`` directory.
+
+    Both calls execute the program. As with the existing one-shot L3 protocol,
+    mutable arguments are not snapshotted or restored between passes.
+    """
+    import dataclasses  # noqa: PLC0415
+
+    from .bench import (  # noqa: PLC0415
+        _L3_SWIMLANE_GRAPH_BEGIN,
+        _L3_SWIMLANE_GRAPH_END,
+        _L3_SWIMLANE_TIMING_BEGIN,
+        _L3_SWIMLANE_TIMING_END,
+    )
+
+    print(
+        "[swimlane] L3 swimlane enabled -> running the dispatch twice "
+        "(dep_gen perturbs timing, so the graph and the timing are captured separately):"
+    )
+    print("[swimlane] run 1/2: capturing the per-dispatch task graph (deps.json); its timing is discarded.")
+    deps_cfg = dataclasses.replace(
+        config,
+        enable_l2_swimlane=False,
+        enable_dep_gen=True,
+        enable_pmu=0,
+        enable_scope_stats=False,
+        enable_dump_args=0,
+    )
+    print(_L3_SWIMLANE_GRAPH_BEGIN, file=sys.stderr, flush=True)
+    run_pass(_make_call_config(dc, deps_cfg, dfx_base=dfx_base))
+    print(_L3_SWIMLANE_GRAPH_END, file=sys.stderr, flush=True)
+
+    print("[swimlane] run 2/2: measuring clean per-task timing (these are the reported numbers).")
+    # ``benchmark`` and pypto-lib's resident benchmark capture fd 2 around the
+    # prepared worker. Bracketing the blocking timing run lets their shared
+    # parser retain its child-process STRACE records while discarding graph-pass
+    # records, even when each pass has a data-dependent dispatch count.
+    print(_L3_SWIMLANE_TIMING_BEGIN, file=sys.stderr, flush=True)
+    timing_cfg = dataclasses.replace(config, enable_dep_gen=False)
+    run_pass(_make_call_config(dc, timing_cfg, dfx_base=dfx_base, co_enable_swimlane_dep_gen=False))
+    print(_L3_SWIMLANE_TIMING_END, file=sys.stderr, flush=True)
 
 
 # A dispatch's DFX artifacts live at ``<dfx_base>/<rank label>/d{k}``. The
@@ -743,10 +801,11 @@ def _write_dispatch_name_map(disp_dir: Path, chip_dir: Path, cache: dict[str, di
 def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
     """Convert each dispatch's swimlane records into a ``merged_swimlane_*.json``.
 
-    The runtime writes ``rank{r}/d{k}/l2_swimlane_records.json`` +
-    ``rank{r}/d{k}/deps.json`` per dispatch (``_submit_chip`` namespaced the dir
-    by card *and* the card's k-th dispatch; dep_gen is co-enabled with
-    swimlane). Globbing ``rank*`` — rather than iterating a rank count — picks up
+    The runtime writes ``rank{r}/d{k}/deps.json`` in the graph pass and
+    ``rank{r}/d{k}/l2_swimlane_records.json`` in the clean timing pass
+    (``_submit_chip`` namespaces the directory by card *and* the card's k-th
+    dispatch, and both passes reset that counter). Globbing ``rank*`` — rather
+    than iterating a rank count — picks up
     whichever cards actually ran, so a comm-less / single-card L3 program (which never
     creates ``rank{0..n}``) still has its records converted. This best-effort
     post-pass runs the offline ``swimlane_converter`` once per dispatch dir. Each
@@ -1033,28 +1092,7 @@ def execute_distributed(
         # Two-pass for clean timing, mirroring the L2 swimlane workflow: dep_gen
         # collection perturbs timing, so the per-dispatch task graph and the kept
         # timing come from separate dispatches.
-        import dataclasses  # noqa: PLC0415
-
-        print(
-            "[swimlane] L3 swimlane enabled -> running the dispatch twice "
-            "(dep_gen perturbs timing, so the graph and the timing are captured separately):"
-        )
-        print(
-            "[swimlane] run 1/2: capturing the per-dispatch task graph (deps.json); its timing is discarded."
-        )
-        deps_cfg = dataclasses.replace(
-            config,
-            enable_l2_swimlane=False,
-            enable_dep_gen=True,
-            enable_pmu=0,
-            enable_scope_stats=False,
-            enable_dump_args=0,
-        )
-        _run_once(_make_call_config(dc, deps_cfg, dfx_base=dfx_base))
-
-        print("[swimlane] run 2/2: measuring clean per-task timing (these are the reported numbers).")
-        timing_cfg = dataclasses.replace(config, enable_dep_gen=False)
-        _run_once(_make_call_config(dc, timing_cfg, dfx_base=dfx_base, co_enable_swimlane_dep_gen=False))
+        _run_l3_swimlane_two_pass(dc, config, dfx_base, _run_once)
     else:
         _run_once(_make_call_config(dc, config, dfx_base=dfx_base))
 
@@ -1854,7 +1892,7 @@ class DistributedWorker(Worker):
     # ------------------------------------------------------------------
 
     def __call__(self, *args: Any, config: RunConfig | None = None) -> None:
-        """Dispatch one run on the primary compiled program, reusing all setup.
+        """Dispatch the primary compiled program, reusing all setup.
 
         Pass one argument per program parameter (in-place). Each argument is
         either:
@@ -1879,7 +1917,12 @@ class DistributedWorker(Worker):
         ``ring_dep_pool``, each a scalar or a per-ring list of 4 ints) size this
         dispatch's runtime ring buffers without
         touching the prepared program's shared config, so consecutive dispatches
-        can use different ring sizes. ``None`` reuses the program's baseline.
+        can use different ring sizes. Its runtime DFX fields are also applied per
+        dispatch. On onboard L3, ``enable_l2_swimlane`` executes the workload
+        twice on the same prepared worker: first with dep-gen only, then with
+        swimlane and dep-gen disabled. Mutable host/resident arguments are not
+        restored between those profiling passes and can therefore be updated
+        twice. ``None`` reuses the program's baseline.
         """
         if self._multi_program:
             raise TypeError(
@@ -1894,11 +1937,13 @@ class DistributedWorker(Worker):
         """Dispatch *compiled* on the shared Worker via its per-program state.
 
         ``config`` is an optional per-dispatch :class:`RunConfig` whose per-task
-        ring-sizing overrides size this dispatch's runtime ring buffers. When
-        given, a fresh ``CallConfig`` is built for this dispatch only (from the
-        program's ``aicpu_thread_num`` baseline plus the ring
-        overrides), leaving the prepared, shared ``call_config`` untouched. When
-        ``None``, the prepared baseline is reused with zero extra allocation.
+        ring sizing and runtime DFX fields apply to this dispatch. When given, a
+        fresh ``CallConfig`` is built from the program's ``aicpu_thread_num``
+        baseline, leaving the prepared shared config untouched. ``None`` reuses
+        that baseline with zero extra allocation. Onboard L3 swimlane capture
+        runs a dep-gen graph pass followed by a dep-gen-disabled timing pass on
+        the same prepared Worker; mutable arguments are not restored between
+        the two executions.
         """
         self._require_open("run")
         from pypto.ir.compiled_program import (  # noqa: PLC0415
@@ -1917,9 +1962,13 @@ class DistributedWorker(Worker):
         # CallConfig for this call only (the prepared, shared one is never
         # mutated). With no RunConfig the prepared baseline is reused as-is.
         call_config = state["call_config"]
+        dfx_base: Path | None = None
+        two_pass_swimlane = False
         if config is not None:
             dfx_base = compiled.output_dir / "dfx_outputs"
-            call_config = _make_call_config(compiled._distributed_config, config, dfx_base=dfx_base)
+            two_pass_swimlane = bool(config.enable_l2_swimlane) and not compiled.platform.endswith("sim")
+            if not two_pass_swimlane:
+                call_config = _make_call_config(compiled._distributed_config, config, dfx_base=dfx_base)
             # This worker reuses one output_dir across dispatches, so stale
             # ``rank*/d{k}`` dirs from an earlier, larger run must be cleared
             # before this run rewrites ``d0, d1, ...`` (see _clear_dfx_dispatch_dirs).
@@ -1961,16 +2010,19 @@ class DistributedWorker(Worker):
                 )
             tensors[info.name] = arg
 
-        self._dispatch_prepared(state, tensors, call_config)
+        if two_pass_swimlane:
+            assert config is not None
+            assert dfx_base is not None
+            _run_l3_swimlane_two_pass(
+                compiled._distributed_config,
+                config,
+                dfx_base,
+                lambda pass_config: self._dispatch_prepared(state, tensors, pass_config),
+            )
+        else:
+            self._dispatch_prepared(state, tensors, call_config)
 
         # Offline post-pass (reads the per-dispatch records on disk; no worker needed).
-        # Note: unlike the one-shot ``execute_distributed`` path, the prepared
-        # worker reuses its forked chip children across dispatches, so it cannot
-        # re-fork between a deps pass and a timing pass without tripping the
-        # per-child ``halHostRegister`` cap (rc 8). It therefore runs swimlane
-        # single-pass (dep_gen co-enabled), so the on-disk records include
-        # dep_gen collection overhead. Use ``execute_distributed`` (one-shot) for
-        # clean two-pass swimlane timing.
         if config is not None and config.enable_l2_swimlane:
             _collect_l3_swimlane(compiled.output_dir, compiled.platform)
 
@@ -2035,11 +2087,12 @@ class DistributedWorker(Worker):
         ``ValueError``.
 
         ``config`` is an optional per-dispatch :class:`RunConfig`; its per-task
-        ring-sizing overrides size this dispatch's runtime ring buffers without
-        touching the prepared program's shared config. In a multi-program worker
-        each program can therefore be dispatched with its own ring sizes (e.g.
-        a larger ``ring_task_window`` for prefill than for decode). ``None``
-        reuses the program's baseline.
+        ring sizing and runtime DFX fields apply without touching the prepared
+        program's shared config. In a multi-program worker each program can
+        therefore use its own ring sizes and diagnostics. On onboard L3,
+        ``enable_l2_swimlane`` executes a dep-gen graph pass followed by a
+        dep-gen-disabled timing pass; mutable arguments are not restored between
+        them. ``None`` reuses the program's baseline.
         """
         return self._run_compiled(compiled, *args, config=config)
 

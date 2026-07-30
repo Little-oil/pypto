@@ -90,8 +90,9 @@ with compiled.prepare(prefill_cfg) as rt:              # 一次性 setup + 预�
 compiled(a, b, c, config=RunConfig(platform="a2a3", ring_heap=8 * 1024 * 1024))
 ```
 
-在 L3 派发路径上，仅消费 `RunConfig` 的 `ring_*` 字段；编译期字段与 DFX 字段会被
-忽略（它们在编译 / prepare 时设置，而非按派发设置）。
+L3 派发路径会消费 `RunConfig` 的 `ring_*` 字段和运行时 DFX 字段。DFX 产物按
+`<output_dir>/dfx_outputs/rank{r}/d{k}/` 隔离；详见
+[Runtime DFX](03-runtime-dfx.md)。其他编译期字段会被忽略。
 
 只设置你想覆盖的字段即可；其余字段保持未设置，并按上述优先级回退。
 

@@ -63,6 +63,17 @@ __all__ = ["BenchmarkStats", "TraceInvocation", "TraceSpan", "benchmark"]
 # ``Invocation`` types are mirrored into the pypto-owned ``TraceSpan`` /
 # ``TraceInvocation`` below so ``benchmark`` callers get the full per-launch
 # span tree without importing simpler types (see ``_parse_stats_from_strace``).
+#
+# Prepared onboard L3 swimlane executes each caller-visible launch twice. The
+# parent brackets the clean pass with these sentinels so the parser can discard
+# the dep-gen graph pass instead of reporting contaminated benchmark numbers.
+# Keep the values stable: pypto-lib's resident benchmark calls the same private
+# parser.
+_L3_SWIMLANE_PASS_PREFIX = "[pypto] l3_swimlane_pass="
+_L3_SWIMLANE_GRAPH_BEGIN = f"{_L3_SWIMLANE_PASS_PREFIX}graph event=begin"
+_L3_SWIMLANE_GRAPH_END = f"{_L3_SWIMLANE_PASS_PREFIX}graph event=end"
+_L3_SWIMLANE_TIMING_BEGIN = f"{_L3_SWIMLANE_PASS_PREFIX}timing event=begin"
+_L3_SWIMLANE_TIMING_END = f"{_L3_SWIMLANE_PASS_PREFIX}timing event=end"
 
 
 @dataclass
@@ -776,6 +787,37 @@ def _parse_l3_stats(invocations: Any, stats: BenchmarkStats, *, rounds: int, war
     return stats
 
 
+def _extract_l3_swimlane_timing(log_text: str) -> tuple[str, int | None]:
+    """Return only complete clean-pass regions from a two-pass L3 capture.
+
+    The sentinels are emitted by the parent around the blocking timing
+    ``Worker.run()`` call, so all child-process STRACE records between them
+    belong to the dep-gen-disabled pass. Substring splitting is deliberate:
+    concurrent processes can concatenate otherwise complete records onto one
+    physical line.
+
+    Returns ``(log_text, None)`` when no two-pass sentinel is present, otherwise
+    returns the filtered text and number of complete timing regions. Malformed
+    or incomplete sentinels return ``("", -1)`` so callers report no sample
+    instead of silently including graph-pass timing.
+    """
+    parts = log_text.split(_L3_SWIMLANE_TIMING_BEGIN)
+    if len(parts) == 1:
+        if _L3_SWIMLANE_PASS_PREFIX in log_text:
+            return "", -1
+        return log_text, None
+    if _L3_SWIMLANE_TIMING_END in parts[0]:
+        return "", -1
+
+    timing_regions: list[str] = []
+    for part in parts[1:]:
+        timing, end, outside = part.partition(_L3_SWIMLANE_TIMING_END)
+        if not end or _L3_SWIMLANE_TIMING_END in outside:
+            return "", -1
+        timing_regions.append(timing)
+    return "\n".join(timing_regions), len(timing_regions)
+
+
 def _parse_stats_from_strace(
     log_text: str, *, rounds: int, warmup: int, distributed: bool = False
 ) -> BenchmarkStats:
@@ -793,8 +835,10 @@ def _parse_stats_from_strace(
     (``<root>.runner_run.device_wall``) span durations (µs). The ``<root>`` span
     name is resolved per :func:`_span_names` (``run_prepared`` / ``simpler_run``).
 
-    L3 (``distributed=True``): delegates to :func:`_parse_l3_stats`, which folds
-    the per-rank chip-child markers into per-round aggregates (see that function).
+    L3 (``distributed=True``): prepared swimlane pass sentinels first restrict
+    the input to complete dep-gen-disabled timing regions, when present; then
+    :func:`_parse_l3_stats` folds the per-rank chip-child markers into per-round
+    aggregates (see that function).
     """
     # ``simpler`` is an optional runtime-provided package: present on devices
     # where the runtime is installed, absent on the lint / unit-test host. The
@@ -806,8 +850,15 @@ def _parse_stats_from_strace(
         parse_spans,
     )
 
+    timing_blocks: int | None = None
+    if distributed:
+        log_text, timing_blocks = _extract_l3_swimlane_timing(log_text)
+
     names = _span_names()
     stats = BenchmarkStats(rounds=rounds, warmup=warmup)
+    if timing_blocks is not None and timing_blocks != warmup + rounds:
+        stats.fallback_flattened = True
+        return stats
     # L3 forks one chip worker per rank, all sharing the capture fd; their
     # concurrent writes can interleave two complete ``[STRACE]`` records onto one
     # physical line. simpler's ``parse_spans`` reads at most one record per line

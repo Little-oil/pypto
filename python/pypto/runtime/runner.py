@@ -105,12 +105,15 @@ class RunConfig:
             platforms, ``swimlane_converter`` then produces
             ``merged_swimlane_*.json`` alongside it. Because the converter joins
             the timing against a task graph that only ``deps.json`` carries,
-            enabling this on an onboard platform runs the kernel **twice**: a
-            first dep_gen pass to capture ``deps.json`` (run in a subprocess so
-            its device/SVM state is fully reclaimed before the timing pass — a
-            failed capture is logged, not fatal), then a clean in-process
-            swimlane pass (dep_gen off, since dep_gen collection perturbs the
-            timing). Simulator platforms (``*sim``) stay single-pass
+            enabling this on an onboard platform runs the workload **twice**: a
+            first dep_gen pass captures ``deps.json``, then a clean swimlane pass
+            runs with dep_gen off because collection perturbs timing. L2 runs
+            the graph pass in a subprocess so its device/SVM state is fully
+            reclaimed before the timing pass (a failed capture is logged, not
+            fatal). L3 one-shot uses separate Worker lifecycles; a prepared L3
+            worker uses two ``Worker.run()`` fences and keeps resident handles
+            alive. Both L3 passes execute the program without restoring mutable
+            arguments between them. Simulator platforms (``*sim``) stay single-pass
             and only emit ``l2_swimlane_records.json`` — the merged swimlane file
             is intentionally skipped because the simulator does not yet ship the
             task metadata the converter needs. Mirrors runtime's

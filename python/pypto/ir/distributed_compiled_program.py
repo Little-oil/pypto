@@ -308,8 +308,10 @@ class DistributedCompiledProgram:
         ``enable_dep_gen`` / ``enable_scope_stats`` / ``enable_l2_swimlane``) are
         written per dispatch under ``<output_dir>/dfx_outputs/rank{r}/d{k}/``
         (``d{k}`` is the card's k-th dispatch, so multiple dispatches to one card
-        keep separate artifacts; swimlane co-enables dep_gen and emits
-        ``merged_swimlane_*.json`` per dispatch, onboard only). Other compile-side
+        keep separate artifacts). Onboard swimlane runs a dep-gen-only graph
+        pass followed by a dep-gen-disabled timing pass and emits
+        ``merged_swimlane_*.json`` per dispatch. Both passes execute the program
+        and do not restore mutable arguments between them. Other compile-side
         fields are not consumed on the dispatch path.
         """
         from pypto.runtime.distributed_runner import execute_distributed  # noqa: PLC0415

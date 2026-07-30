@@ -58,7 +58,7 @@ comm-less 的（没有 `device=`）则按被分配到的芯片——这类 dispa
 program 的名字，既静默又看似合理。若某次 dispatch 的 program 无法解析，
 转换时使用匿名标签，而不是猜一个名字。
 
-## L2 泳道会把 kernel 跑两遍（onboard）
+## 泳道会把 workload 跑两遍（onboard）
 
 泳道转换器需要把每个 task 的耗时和一张**只有 `deps.json` 才携带的任务图**做
 join——device 热路径不再记录 per-task fanout，因此没有 dep_gen 抓取时，泳道会退化
@@ -66,7 +66,7 @@ join——device 热路径不再记录 per-task fanout，因此没有 dep_gen �
 耗时。所以这两份抓取来自两次独立运行（这正是 Simpler 文档描述的“抓一次图、计多次
 时”工作流）。
 
-于是在 **onboard** 平台上开启 `enable_l2_swimlane` 会透明地把 kernel 跑两遍：
+于是在 **onboard L2** 平台上开启 `enable_l2_swimlane` 会透明地把 kernel 跑两遍：
 
 1. **抓图趟** —— 仅开 dep_gen，产出 `deps.json`，在**独立子进程**里运行
    （`python -m pypto.runtime._dep_gen_capture`）。这是必须的、不只是为了整洁：
@@ -83,7 +83,14 @@ join——device 热路径不再记录 per-task fanout，因此没有 dep_gen �
 产出了 `deps.json`），只是让本次运行额外打印 `deps_viewer` 的渲染提示。仿真平台
 （`*sim`）保持单趟——那里本来就会跳过泳道转换。
 
-子进程用两种方式重建编排实参：被 pytest harness 驱动时从 `golden.py` 重新生成
+分布式 L3 使用相同的抓图/计时拆分，但不经过 L2 抓图子进程。one-shot
+路径为每趟创建新的 Worker 生命周期；prepared `DistributedWorker` 保留
+resident handle 和已 fork 的层级，但进入两个独立的 `Worker.run()` fence：
+先仅开 dep-gen，再开泳道并强制关闭 dep-gen。两趟都会重置每张卡的 dispatch
+计数，因此图和计时产物会合并到相同的 `rank{r}/d{k}` 目录。两趟都会实际
+执行程序，且不会在中间恢复可写参数，这与现有 one-shot L3 replay 语义一致。
+
+L2 子进程用两种方式重建编排实参：被 pytest harness 驱动时从 `golden.py` 重新生成
 （确定性输入 → 图忠实），被编译产物 API（`execute_compiled`）驱动时从记录下来的
 规格重建。任务图可能由张量**值**（而不只是 scalar）路由，例如 paged-attention 的
 `block_tables` / `seq_lens`，所以规格会尽量保留真实数据：host `torch.Tensor`
@@ -427,9 +434,9 @@ prog(a, b, c)
 重建 chip callables；`platform` 与 `distributed_config` 默认取编译时
 记录的值，可覆盖以在不同目标 / 设备集上重放。
 
-**限制**：DFX 标志（`--pmu`、`--swimlane`、`--dump-args` 等）**尚未
-透传到 L3 派发路径**——目前仅对单芯片重放生效。L3 的「改完再跑」循环
-本身（改 `.pto`/cpp 后的正确性复检）是完整支持的。
+L3 replay 会把 `RunConfig` 中的运行时 DFX 字段透传到每个芯片派发，产物写入
+`dfx_outputs/rank{r}/d{k}/`；onboard 泳道使用上文的抓图/计时两趟协议。
+因此「改完再跑」既支持正确性复检，也支持 L3 运行时诊断。
 
 ## 相关文档
 

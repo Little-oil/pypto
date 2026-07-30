@@ -65,7 +65,7 @@ program's tasks with another's names, silently and plausibly. A dispatch
 whose program cannot be resolved is converted with anonymous labels
 instead of guessed ones.
 
-## L2 swimlane runs the kernel twice (onboard)
+## Swimlane runs the workload twice (onboard)
 
 The swimlane converter joins per-task timing against a task graph that **only
 `deps.json` carries** — the device hot path no longer records per-task fanout,
@@ -74,8 +74,8 @@ dependency arrows. But dep_gen collection has high overhead that perturbs the
 very timing the swimlane measures. The two captures therefore come from separate
 runs (Simpler's documented "capture the graph once, time many times" workflow).
 
-So enabling `enable_l2_swimlane` on an **onboard** platform runs the kernel
-twice, transparently:
+For **onboard L2**, enabling `enable_l2_swimlane` runs the kernel twice,
+transparently:
 
 1. **Graph pass** — dep_gen only, producing `deps.json`. Runs in a **separate
    subprocess** (`python -m pypto.runtime._dep_gen_capture`). This is required,
@@ -96,7 +96,16 @@ explicitly changes nothing about the passes (the graph pass already produced
 hint. Simulator platforms (`*sim`) stay single-pass — swimlane conversion is
 skipped there regardless.
 
-The subprocess rebuilds the orchestration arguments two ways: from `golden.py`
+Distributed L3 uses the same graph/timing split without the L2 capture
+subprocess. The one-shot path creates a fresh Worker lifecycle for each pass.
+A prepared `DistributedWorker` keeps its resident handles and forked hierarchy,
+but enters two separate `Worker.run()` fences: dep-gen-only first, then
+swimlane with dep_gen forced off. Per-card dispatch counters restart for both
+passes, so graph and timing artefacts join in the same `rank{r}/d{k}` directory.
+Both passes execute the program; mutable arguments are not restored between
+them, matching the existing one-shot L3 replay semantics.
+
+The L2 subprocess rebuilds the orchestration arguments two ways: from `golden.py`
 when driven by the pytest harness (deterministic inputs → faithful graph), or
 from a recorded spec when driven by the compiled-program API
 (`execute_compiled`). The task graph can be routed by tensor *values*, not just
@@ -468,10 +477,11 @@ by walking `next_levels/`; `platform` and `distributed_config` default to the
 values recorded at compile time and can be overridden to replay on a different
 target / device set.
 
-**Limitation:** DFX flags (`--pmu`, `--swimlane`, `--dump-args`, …) are **not
-yet plumbed through the L3 dispatch path** — they apply to single-chip replay
-only. The L3 edit-and-rerun loop itself (correctness re-check after a `.pto`/cpp
-edit) is fully supported.
+L3 replay forwards runtime DFX fields from `RunConfig` through each chip
+dispatch. Artifacts are written under
+`dfx_outputs/rank{r}/d{k}/`; onboard swimlane uses the graph/timing two-pass
+protocol described above. The edit-and-rerun loop therefore supports both
+correctness re-checks and L3 runtime diagnostics.
 
 ## Related
 
