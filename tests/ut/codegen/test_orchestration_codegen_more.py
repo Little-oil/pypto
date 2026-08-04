@@ -155,9 +155,9 @@ class TestOrchestrationMore:
         assert "uint32_t chunk_offsets[2] = {static_cast<uint32_t>((i * 16)), 0};" in code
         assert "Tensor chunk = ext_data.view(chunk_shapes, chunk_offsets);" in code
 
-        # tensor.read now goes through get_tensor_data<T>() (producer-sync
-        # via TensorMap) instead of a raw orch_args.tensor().data_as<void>()
-        # deref. See #1487.
+        # tensor.read now goes through get_tensor_data<T>() so the runtime owns
+        # access validation/synchronization, instead of bypassing it with a raw
+        # orch_args.tensor().data_as<void>() dereference. See #1487.
         assert "uint32_t indices_n_blocks[1] = {0};" in code
         assert "int64_t n_blocks = get_tensor_data<int64_t>(ext_config, 1, indices_n_blocks);" in code
 

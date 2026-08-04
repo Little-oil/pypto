@@ -160,10 +160,10 @@ REGISTER_ORCHESTRATION_OP(tensor_read, ("tensor.read")) {
   // tensor.read(tensor, indices_tuple) -> scalar value
   //
   // Emit a call to the runtime's get_tensor_data<T>(tensor, ndims, indices).
-  // The runtime spin-waits on the producer task in TensorMap (for
-  // internally-allocated tensors) before reading, and reads immediately for
-  // external tensors with no producer entry. Using the API uniformly avoids
-  // both the missing producer-sync bug and the type-unsafe raw deref via
+  // The runtime owns the access policy: host-build-graph reads the registered
+  // host staging view of an external tensor and rejects task-produced tensors,
+  // while other runtimes may synchronize with a producer. Using the API
+  // uniformly preserves that policy and avoids the type-unsafe raw deref via
   // buffer.addr that a direct static_cast<T*>(ptr)[idx] would imply.
   CHECK(op->args_.size() == 2) << "tensor.read requires 2 arguments";
 
@@ -210,11 +210,10 @@ REGISTER_ORCHESTRATION_OP(tensor_write, ("tensor.write")) {
   // tensor.write(tensor, indices_tuple, value) -> write scalar value to tensor at indices
   //
   // Emit a call to the runtime's set_tensor_data<T>(tensor, ndims, indices, value).
-  // The runtime spin-waits on the producer task in TensorMap (and any
-  // tracked INOUT consumers) before writing, so cross-thread WAW/WAR
-  // hazards stay contained — same rationale as tensor.read using
-  // get_tensor_data<T>(). For external tensors with no TensorMap entry
-  // the write happens immediately (matches the previous raw store).
+  // The runtime owns the access policy: host-build-graph updates the registered
+  // host staging view of an external tensor and rejects task-produced tensors,
+  // while other runtimes may synchronize with producers and consumers. This is
+  // the same reason tensor.read uses get_tensor_data<T>() instead of a raw store.
   CHECK(op->args_.size() == 3) << "tensor.write requires 3 arguments";
 
   std::string input_name = codegen.TryGetVarName(op->args_[0]);

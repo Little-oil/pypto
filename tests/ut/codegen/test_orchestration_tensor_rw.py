@@ -122,8 +122,8 @@ class TestTensorReadWriteOffsetCodegen:
 
         code = _generate_orch_code(Prog)
         # Read uses get_tensor_data<T>; write goes through the symmetric
-        # set_tensor_data<T> API so the runtime can spin-wait on producers /
-        # tracked INOUT consumers before writing.
+        # set_tensor_data<T> API so the runtime owns access validation and any
+        # producer/consumer synchronization.
         assert "float val = get_tensor_data<float>(ext_t, 2, indices_val);" in code
         assert "uint32_t indices_t[2] = {1, 3};" in code
         assert "set_tensor_data<float>(ext_t, 2, indices_t, val);" in code

@@ -216,8 +216,8 @@ class TestOrchestration:
         assert "c_ci.set_initial_value(0);" in code
 
     def test_tensor_read(self):
-        """Test tensor.read emits get_tensor_data<T>() so the runtime spin-waits
-        on the producer task before reading (no raw host buffer deref)."""
+        """tensor.read delegates access policy to get_tensor_data<T>() instead
+        of dereferencing a host buffer directly."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
 
@@ -250,9 +250,9 @@ class TestOrchestration:
 
         code = _generate_orch_code(TensorReadProgram)
 
-        # tensor.read emits a typed get_tensor_data<T>() call (the runtime
-        # spin-waits on TensorMap producers before reading), and packs the
+        # tensor.read emits a typed get_tensor_data<T>() call and packs the
         # multi-dim indices into a uint32_t indices_<var>[N] = {...} array.
+        # The selected runtime then applies its own access policy.
         # ConstInt indices are emitted bare via EmitAsUint32 (no redundant cast).
         assert "uint32_t indices_val[2] = {1, 3};" in code
         assert "float val = get_tensor_data<float>(ext_t, 2, indices_val);" in code
@@ -261,12 +261,13 @@ class TestOrchestration:
         assert "host_t" not in code
         assert "buffer.addr" not in code
 
-    def test_orch_internal_tensor_read_uses_get_tensor_data(self):
+    def test_orch_internal_tensor_read_uses_runtime_api(self):
         """Regression for #1487: an orch-level read of an internally-allocated
-        tensor (produced by a device-scope task) must go through
-        ``get_tensor_data<T>()`` so the runtime spin-waits on the producer's
-        TensorMap entry. A raw ``buffer.addr`` deref returns stale/zero data
-        before the producer has finished writing.
+        tensor must go through ``get_tensor_data<T>()``. The selected runtime
+        owns the contract: one runtime may synchronize with the producer, while
+        host-build-graph rejects this access because device scheduling starts
+        only after graph construction. A raw ``buffer.addr`` deref bypasses
+        both policies and can return stale or invalid data.
         """
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
@@ -295,7 +296,8 @@ class TestOrchestration:
 
         code = _generate_orch_code(InternalReadProgram)
 
-        # The runtime API call is what gives us producer-sync; it must be present.
+        # The runtime API call preserves runtime-specific validation or
+        # synchronization; codegen must not bypass it with a raw dereference.
         assert "get_tensor_data<int32_t>(cnt" in code
         # The pre-fix raw-deref shapes must not return — including the
         # buffer.addr / reinterpret_cast path from the dead #1479 attempt.
