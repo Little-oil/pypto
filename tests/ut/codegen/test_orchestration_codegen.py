@@ -261,11 +261,11 @@ class TestOrchestration:
         assert "host_t" not in code
         assert "buffer.addr" not in code
 
-    def test_orch_internal_tensor_read_uses_runtime_api(self):
+    def test_orch_internal_tensor_read_uses_get_tensor_data(self):
         """Regression for #1487: an orch-level read of an internally-allocated
         tensor must go through ``get_tensor_data<T>()``. The selected runtime
         owns the contract: one runtime may synchronize with the producer, while
-        host-build-graph rejects this access because device scheduling starts
+        host-build-graph does not support it because device scheduling starts
         only after graph construction. A raw ``buffer.addr`` deref bypasses
         both policies and can return stale or invalid data.
         """

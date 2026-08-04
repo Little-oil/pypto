@@ -161,7 +161,7 @@ REGISTER_ORCHESTRATION_OP(tensor_read, ("tensor.read")) {
   //
   // Emit a call to the runtime's get_tensor_data<T>(tensor, ndims, indices).
   // The runtime owns the access policy: host-build-graph reads the registered
-  // host staging view of an external tensor and rejects task-produced tensors,
+  // host view of an external tensor and does not support task-produced tensors,
   // while other runtimes may synchronize with a producer. Using the API
   // uniformly preserves that policy and avoids the type-unsafe raw deref via
   // buffer.addr that a direct static_cast<T*>(ptr)[idx] would imply.
@@ -211,7 +211,7 @@ REGISTER_ORCHESTRATION_OP(tensor_write, ("tensor.write")) {
   //
   // Emit a call to the runtime's set_tensor_data<T>(tensor, ndims, indices, value).
   // The runtime owns the access policy: host-build-graph updates the registered
-  // host staging view of an external tensor and rejects task-produced tensors,
+  // host view of an external tensor and does not support task-produced tensors,
   // while other runtimes may synchronize with producers and consumers. This is
   // the same reason tensor.read uses get_tensor_data<T>() instead of a raw store.
   CHECK(op->args_.size() == 3) << "tensor.write requires 3 arguments";
