@@ -103,7 +103,7 @@ def run_with_callback() -> None:
     compiled = ir.compile(
         InspectProgram,
         platform=PLATFORM,
-        distributed_config=DistributedConfig(device_ids=[0], num_sub_workers=1, aicpu_thread_num=4),
+        distributed_config=DistributedConfig(device_ids=[0], num_sub_workers=1),
     )
 
     # Shared-memory IO, allocated BEFORE prepare() so the forked workers inherit
@@ -132,7 +132,7 @@ def show_missing_binding_error() -> None:
     compiled = ir.compile(
         InspectProgram,
         platform=PLATFORM,
-        distributed_config=DistributedConfig(device_ids=[0], num_sub_workers=1, aicpu_thread_num=4),
+        distributed_config=DistributedConfig(device_ids=[0], num_sub_workers=1),
     )
     try:
         compiled.prepare()  # no callbacks → inspect_result is unbound

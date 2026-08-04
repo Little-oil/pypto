@@ -7,7 +7,7 @@ _ROOT_DIR = Path(__file__).parent
 
 RUNTIME_CONFIG = {
     "runtime": "tensormap_and_ringbuffer",
-    "aicpu_thread_num": 4,
+    "aicpu_thread_num": 0,
 }
 
 ORCHESTRATION = {

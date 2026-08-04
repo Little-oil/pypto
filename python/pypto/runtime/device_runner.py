@@ -48,6 +48,12 @@ import torch
 
 from pypto._external_source import kernel_binary_cache_path
 
+from ._binary_cache import (
+    BinaryCacheContext,
+    binary_context_lock,
+    prepare_binary_context,
+    record_binary_context,
+)
 from .elf_parser import elf_build_id_64, extract_text_section
 from .kernel_compiler import KernelCompiler
 from .task_interface import (
@@ -170,6 +176,85 @@ def _read_runtime_pto_isa_pin() -> str | None:
         logger.warning(f"Runtime PTO-ISA pin at {pin_path} is empty; falling back to the latest remote HEAD")
         return None
     return commit
+
+
+def _clean_git_revision(repo_root: Path) -> tuple[bool, str | None]:
+    """Return ``(is_checkout, HEAD)`` when *repo_root* is a clean checkout.
+
+    ``is_checkout`` remains true for a dirty or unreadable checkout. Callers use
+    that distinction to avoid falling back to packaged revision metadata that
+    does not describe the source files which will actually be compiled.
+    """
+    if not (repo_root / ".git").exists():
+        return False, None
+    try:
+        revision_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=normal"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True, None
+
+    revision = revision_result.stdout.strip()
+    if (
+        revision_result.returncode != 0
+        or status_result.returncode != 0
+        or not revision
+        or status_result.stdout.strip()
+    ):
+        return True, None
+    return True, revision
+
+
+def _runtime_revision(compiler: KernelCompiler) -> str | None:
+    """Return the runtime source/build revision used by *compiler*."""
+    project_root = getattr(compiler, "project_root", None)
+    if project_root is not None:
+        is_checkout, revision = _clean_git_revision(Path(project_root))
+        if is_checkout:
+            return revision
+
+    # Wheels carry the runtime sources under simpler_setup/_assets without a
+    # .git directory. The runtime binding embeds the source commit at build time
+    # so the wheel still has a stable compatibility identity.
+    try:
+        task_interface = import_module("_task_interface")
+    except ImportError:
+        return None
+    revision = getattr(task_interface, "__build_commit__", "")
+    return revision.strip() if isinstance(revision, str) and revision.strip() else None
+
+
+def _current_binary_context(
+    compiler: KernelCompiler,
+    *,
+    platform: str,
+    runtime_name: str,
+    pto_isa_root: str,
+) -> BinaryCacheContext | None:
+    """Build the compatibility identity for generated binary reuse."""
+    runtime_revision = _runtime_revision(compiler)
+    _, pto_isa_revision = _clean_git_revision(Path(pto_isa_root))
+    if runtime_revision is None or pto_isa_revision is None:
+        return None
+    return BinaryCacheContext(
+        platform=platform,
+        runtime_name=runtime_name,
+        runtime_revision=runtime_revision,
+        pto_isa_revision=pto_isa_revision,
+    )
 
 
 def _clone_pto_isa(clone_path: Path, primary_url: str, fallback_url: str) -> bool:
@@ -616,6 +701,22 @@ def compile_and_assemble(
     work_dir: Path,
     platform: str,
 ) -> tuple[ChipCallable, str, dict[str, Any]]:
+    """Compile and assemble one chip artifact under a work-directory lock.
+
+    Serializing the complete cache transaction prevents concurrent callers
+    from pairing a context stamp with binaries produced for another runtime or
+    platform.
+    """
+    if not (work_dir / "kernel_config.py").exists():
+        raise _missing_kernel_config_error(work_dir)
+    with binary_context_lock(work_dir):
+        return _compile_and_assemble_locked(work_dir, platform)
+
+
+def _compile_and_assemble_locked(
+    work_dir: Path,
+    platform: str,
+) -> tuple[ChipCallable, str, dict[str, Any]]:
     """Compile kernels + orchestration from *work_dir*, assemble ``ChipCallable``.
 
     Reads ``kernel_config.py`` from *work_dir* to discover kernel sources,
@@ -638,6 +739,9 @@ def compile_and_assemble(
         FileNotFoundError: If ``kernel_config.py`` is missing. Compile-only
             artifacts include the detected ptoas configuration and recovery
             steps in the error.
+
+    Notes:
+        The caller must hold :func:`binary_context_lock` for *work_dir*.
     """
     # Load kernel_config.py
     config_path = work_dir / "kernel_config.py"
@@ -668,6 +772,39 @@ def compile_and_assemble(
 
     # Create compiler
     compiler = KernelCompiler(platform=platform)
+
+    # Generated binaries include runtime and PTO-ISA headers. A runtime bump can
+    # therefore make both cache/*.bin and source-adjacent .so/.o files ABI
+    # incompatible even though their paths did not change. Validate the whole
+    # sub-build before the first cache lookup; legacy artifacts have no stamp and
+    # are rebuilt once.
+    binary_context = _current_binary_context(
+        compiler,
+        platform=platform,
+        runtime_name=runtime_name,
+        pto_isa_root=pto_isa_root,
+    )
+    invalidated = prepare_binary_context(work_dir, binary_context)
+    if invalidated:
+        if binary_context is None:
+            logger.warning(
+                "Could not determine the current Simpler/PTO-ISA revision; invalidated %d cached "
+                "PyPTO binary file(s) under %s and will rebuild from generated C++",
+                invalidated,
+                work_dir,
+            )
+        else:
+            logger.info(
+                "Cached PyPTO binaries under %s have no matching build context for "
+                "runtime %s@%s, platform %s, PTO-ISA %s; invalidated %d file(s) and "
+                "will rebuild from generated C++",
+                work_dir,
+                runtime_name,
+                binary_context.runtime_revision[:12],
+                platform,
+                binary_context.pto_isa_revision[:12],
+                invalidated,
+            )
 
     # --- Parallel compilation ---
 
@@ -737,6 +874,11 @@ def compile_and_assemble(
     # ``func_name``, the shared AICPU entry symbol) so benchmark timing can be
     # attributed to a readable orchestration rather than an opaque hash.
     register_callable_identity(orch_so_binary, callable_display_name(orchestration))
+
+    # A stamp denotes a complete, successfully assembled binary set. Do not
+    # write it earlier: a failed kernel/orchestration compile must leave the
+    # partial cache untrusted on the next attempt.
+    record_binary_context(work_dir, binary_context)
 
     return chip_callable, runtime_name, runtime_config
 

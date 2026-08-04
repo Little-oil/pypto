@@ -584,8 +584,8 @@ output_dir/
 
 | 键 | 何时写入 | 备注 |
 | -- | -------- | ---- |
-| `runtime` | 总是 | 目前为 `"tensormap_and_ringbuffer"`——该运行时要求 4 个 AICPU 线程 (3 个调度器 + 1 个编排器位于 thread 3)。 |
-| `aicpu_thread_num` | 总是 (`4`) | 由所选运行时决定。 |
+| `runtime` | 总是 | 目前为 `"tensormap_and_ringbuffer"`。 |
+| `aicpu_thread_num` | 总是 (`0`) | `0` 选择 runtime 的架构默认值（a2a3：4；a5：5），调用方也可显式覆盖。 |
 
 ### 参数解包
 

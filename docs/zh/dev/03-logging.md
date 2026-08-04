@@ -68,27 +68,27 @@ worker 阶段的所有日志都经此输出。
 ```python
 from pypto.runtime import configure_log, log_level
 
-configure_log("v7")                # 比 INFO 细，比 DEBUG 粗
-print(log_level())                 # → 22  (Python logging 整数)
+configure_log("timing")            # 保留稳定性能标记，不打开普通 INFO 日志
+print(log_level())                 # → 25  (Python logging 整数)
 ```
 
 ### 级别
 
-runtime 日志使用比 PyPTO C++ 更细的级别表，定义在
+runtime 日志提供了 PyPTO C++ 枚举中没有的独立 timing 档位，定义在
 [runtime/simpler_setup/log_config.py](../../../runtime/simpler_setup/log_config.py)，
 `pypto.runtime.configure_log()` 直接复用其 `parse_level`：
 
 | 名称 | Python `logging` 整数 | 说明 |
 | ---- | --------------------- | ---- |
 | `debug` | 10 | 全量详细 |
-| `v0` .. `v9` | 15..24 | INFO 子档；`v5` == `info` (20) |
-| `info` | 20 | runtime 默认 |
+| `info` | 20 | 生命周期与汇总信息 |
+| `timing` | 25 | runtime 默认；`[STRACE]` 等稳定性能标记 |
 | `warn` / `warning` | 30 | |
 | `error` | 40 | |
 | `null` | 60 | 全部静音 |
 
-`v0..v9` 是与 PyPTO C++ 日志的最大差异：在 INFO 内部细分 10 档，可在
-不切到 `debug` 的前提下单独放大某些噪声较多的子系统。
+默认 `timing` 阈值会显示 timing 标记、warning 和 error，同时屏蔽普通
+INFO 与 DEBUG 日志。
 
 ### `configure_log(level, *, sync_pypto=False)`
 
@@ -102,11 +102,14 @@ runtime 日志使用比 PyPTO C++ 更细的级别表，定义在
 
 | runtime 阈值 | PyPTO `LogLevel` |
 | ------------ | ---------------- |
-| ≤14 | `DEBUG` |
-| 15..24 (`v0..v9`) | `INFO` |
-| 25..39 (`warn`) | `WARN` |
-| 40..59 (`error`) | `ERROR` |
-| ≥60 (`null`) | `NONE` |
+| ≤10 (`debug`) | `DEBUG` |
+| 11..20 (`info`) | `INFO` |
+| 21..30 (`timing` / `warn`) | `WARN` |
+| 31..40 (`error`) | `ERROR` |
+| ≥41 (`null`) | `NONE` |
+
+`timing` 映射为 `WARN`，因为 PyPTO 没有只显示 timing 的档位；如果映射为
+`INFO`，普通编译器信息也会被一并打开。
 
 可用 `pypto.runtime.log_level()`（即 `current_level()` 的别名）回读
 当前生效阈值。
@@ -118,12 +121,12 @@ bootstrap，因此可以不写 Python，仅靠 shell 环境变量驱动：
 
 | 环境变量 | 作用 |
 | -------- | ---- |
-| `PYPTO_RUNTIME_LOG` | 接受与 `configure_log(level=...)` 相同的字符串；未设置则保持 runtime 日志的 `v5` 默认 |
+| `PYPTO_RUNTIME_LOG` | 接受与 `configure_log(level=...)` 相同的字符串；未设置则保持 runtime 日志的 `timing` 默认 |
 | `PYPTO_RUNTIME_LOG_SYNC` | 设为 `=1` 时把 bootstrap 阶段 `sync_pypto` 的默认值翻成 `True`；当 `PYPTO_RUNTIME_LOG` 未设置时被忽略 |
 
 ```bash
-# runtime 详细日志，不影响 PyPTO C++ 日志
-PYPTO_RUNTIME_LOG=v7 python -m my_test
+# runtime 生命周期日志，不影响 PyPTO C++ 日志
+PYPTO_RUNTIME_LOG=info python -m my_test
 
 # 一个开关同时管两套
 PYPTO_RUNTIME_LOG=debug PYPTO_RUNTIME_LOG_SYNC=1 python -m my_test
@@ -141,11 +144,11 @@ PYPTO_RUNTIME_LOG=debug PYPTO_RUNTIME_LOG_SYNC=1 python -m my_test
 | 选项 | 默认值 | 作用 |
 | ---- | ------ | ---- |
 | `--pypto-log-level` | `ERROR` | 通过 `set_log_level(LogLevel[name])` 控制 PyPTO C++ 日志 |
-| `--runtime-log-level` | 未设置（保留 `v5`） | 通过 `configure_log(level)` 控制 PyPTO runtime 日志；**不会** 同时传 `sync_pypto=True` |
+| `--runtime-log-level` | 未设置（保留 `timing`） | 通过 `configure_log(level)` 控制 PyPTO runtime 日志；**不会** 同时传 `sync_pypto=True` |
 
 ```bash
 # 抑制编译噪声，放大 runtime 日志
-pytest tests/st/ --pypto-log-level=ERROR --runtime-log-level=v8
+pytest tests/st/ --pypto-log-level=ERROR --runtime-log-level=info
 
 # 两侧都开 debug
 pytest tests/st/ --pypto-log-level=DEBUG --runtime-log-level=debug
@@ -159,7 +162,7 @@ pytest tests/st/ --pypto-log-level=DEBUG --runtime-log-level=debug
 | 查看 Pass 级跟踪 | `set_log_level(LogLevel.DEBUG)` |
 | 在 stderr 看到性能提示 | 保持 PyPTO 默认 `INFO`（或 `PYPTO_LOG_LEVEL=info`），详见 [passes/92-diagnostics.md](passes/92-diagnostics.md) |
 | 排查执行期 hang | `configure_log("debug")` 或 `PYPTO_RUNTIME_LOG=debug` |
-| 仅放大 runtime 的某个噪声子系统 | `configure_log("v7")`（V0..V9 比 `info`/`debug` 粒度更细） |
+| 不打开 DEBUG、只显示 runtime 生命周期信息 | `configure_log("info")` 或 `PYPTO_RUNTIME_LOG=info` |
 | 一条环境变量全部静音 | `PYPTO_RUNTIME_LOG=null PYPTO_RUNTIME_LOG_SYNC=1 PYPTO_LOG_LEVEL=none` |
 
 ## 5. 常见坑

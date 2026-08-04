@@ -171,6 +171,7 @@ def test_compile_persists_distributed_meta(compiled, tmp_path):
     assert meta["platform"] == "a2a3sim"
     assert meta["backend_type"] == "Ascend910B"
     assert meta["distributed_config"]["runtime"] == "tensormap_and_ringbuffer"
+    assert meta["distributed_config"]["aicpu_thread_num"] == 0
 
 
 def test_from_dir_round_trips_param_metadata(compiled, tmp_path):

@@ -76,8 +76,8 @@ def patched_setup():
     worker = MagicMock(name="Worker(level=3)")
     worker.chip_contexts = []
     worker._live_domains = {}
-    # Device-memory ops route through the Orchestrator facade (worker._orch).
-    worker._orch.malloc.return_value = 0xDEAD0000
+    worker._building_run_resources = None
+    worker.malloc.return_value = 0xDEAD0000
 
     mod = "pypto.runtime.distributed_runner"
     chip_callables = ({"chip_orch": object()}, "rt_name", False)
@@ -492,12 +492,10 @@ class TestDeviceMemoryApi:
         assert isinstance(dev, DeviceTensor)
         assert dev.data_ptr == 0xDEAD0000
         assert dev.shape == (16, 16)
-        # worker_id first for the Orchestrator facade; nbytes = 16*16*4.
-        patched_setup["worker"]._orch.malloc.assert_called_once_with(0, 16 * 16 * 4)
-        # copy_to(worker_id, dst=ptr, src=host.data_ptr(), nbytes) — no defensive copy.
-        patched_setup["worker"]._orch.copy_to.assert_called_once_with(
-            0, 0xDEAD0000, host.data_ptr(), 16 * 16 * 4
-        )
+        # Simpler's public Worker takes payload arguments first and worker_id last.
+        patched_setup["worker"].malloc.assert_called_once_with(16 * 16 * 4, 0)
+        # No defensive host copy is made before the public Worker call.
+        patched_setup["worker"].copy_to.assert_called_once_with(0xDEAD0000, host.data_ptr(), 16 * 16 * 4, 0)
         rt.close()
 
     def test_alloc_tensor_rejects_non_shared_init(self, patched_setup):
@@ -506,33 +504,33 @@ class TestDeviceMemoryApi:
         with pytest.raises(ValueError, match="shared-memory"):
             rt.alloc_tensor((16, 16), torch.float32, init=torch.zeros(16, 16, dtype=torch.float32))
         # rolled back the malloc'd pointer.
-        patched_setup["worker"]._orch.free.assert_called_once_with(0, 0xDEAD0000)
+        patched_setup["worker"].free.assert_called_once_with(0xDEAD0000, 0)
         rt.close()
 
     def test_alloc_tensor_rolls_back_on_copy_failure(self, patched_setup):
         compiled = _fake_compiled([_param("a", [16, 16])], [])
         rt = DistributedWorker(compiled)
-        patched_setup["worker"]._orch.copy_to.side_effect = RuntimeError("boom")
+        patched_setup["worker"].copy_to.side_effect = RuntimeError("boom")
         host = torch.zeros(16, 16, dtype=torch.float32).share_memory_()
 
         with pytest.raises(RuntimeError, match="boom"):
             rt.alloc_tensor((16, 16), torch.float32, init=host)
 
         # malloc'd pointer is freed on the failure path.
-        patched_setup["worker"]._orch.free.assert_called_once_with(0, 0xDEAD0000)
+        patched_setup["worker"].free.assert_called_once_with(0xDEAD0000, 0)
         rt.close()
 
     def test_alloc_tensor_forwards_nonzero_worker_id(self, patched_setup):
         # A non-default worker_id is supported: malloc is forwarded to that
-        # worker (facade order is ``malloc(worker_id, nbytes)``) and the buffer
+        # worker (public order is ``malloc(nbytes, worker_id)``) and the buffer
         # is tracked under (worker_id, ptr) for per-worker auto-free.
         compiled = _fake_compiled([_param("a", [16, 16])], [])
         rt = DistributedWorker(compiled)
         dev = rt.alloc_tensor((16, 16), torch.float32, worker_id=1)
-        patched_setup["worker"]._orch.malloc.assert_called_once_with(1, 16 * 16 * 4)
+        patched_setup["worker"].malloc.assert_called_once_with(16 * 16 * 4, 1)
         assert (1, dev.data_ptr) in rt._owned_tensors
         rt.free_tensor(dev, worker_id=1)
-        patched_setup["worker"]._orch.free.assert_called_once_with(1, 0xDEAD0000)
+        patched_setup["worker"].free.assert_called_once_with(0xDEAD0000, 1)
         rt.close()
 
 
@@ -546,7 +544,7 @@ class TestAllocStackedTensor:
     """``alloc_stacked_tensor`` uploads each leading-dim shard to its worker once."""
 
     def test_identity_uploads_shard_per_worker(self, patched_setup):
-        patched_setup["worker"]._orch.malloc.side_effect = [0xA000, 0xB000]
+        patched_setup["worker"].malloc.side_effect = [0xA000, 0xB000]
         rt = DistributedWorker(_compiled_2cards())
         host = torch.arange(2 * 4 * 4, dtype=torch.float32).view(2, 4, 4).share_memory_()
 
@@ -555,76 +553,76 @@ class TestAllocStackedTensor:
         assert stacked.full_shape == (2, 4, 4)
         assert stacked.worker_ids == (0, 1)
         assert tuple(s.shape for s in stacked.shards) == ((4, 4), (4, 4))
-        orch = patched_setup["worker"]._orch
-        # shard 0 -> worker 0, shard 1 -> worker 1 (facade arg order worker_id first).
+        worker = patched_setup["worker"]
+        # shard 0 -> worker 0, shard 1 -> worker 1.
         nbytes = 4 * 4 * 4
-        orch.malloc.assert_any_call(0, nbytes)
-        orch.malloc.assert_any_call(1, nbytes)
-        orch.copy_to.assert_any_call(0, 0xA000, host[0].contiguous().data_ptr(), nbytes)
-        orch.copy_to.assert_any_call(1, 0xB000, host[1].contiguous().data_ptr(), nbytes)
+        worker.malloc.assert_any_call(nbytes, 0)
+        worker.malloc.assert_any_call(nbytes, 1)
+        worker.copy_to.assert_any_call(0xA000, host[0].contiguous().data_ptr(), nbytes, 0)
+        worker.copy_to.assert_any_call(0xB000, host[1].contiguous().data_ptr(), nbytes, 1)
         # Tracked per (worker_id, ptr) for auto-free.
         assert (0, 0xA000) in rt._owned_tensors
         assert (1, 0xB000) in rt._owned_tensors
         rt.close()
 
     def test_registered_inherited_storage_uploads_without_shared_memory(self, patched_setup):
-        patched_setup["worker"]._orch.malloc.side_effect = [0xA000, 0xB000]
+        patched_setup["worker"].malloc.side_effect = [0xA000, 0xB000]
         host = torch.arange(2 * 4 * 4, dtype=torch.float32).view(2, 4, 4)
         rt = DistributedWorker(_compiled_2cards(), inherited_host_tensors=[host])
 
         stacked = rt.alloc_stacked_tensor(host)
 
         assert stacked.worker_ids == (0, 1)
-        orch = patched_setup["worker"]._orch
+        worker = patched_setup["worker"]
         nbytes = 4 * 4 * 4
-        orch.copy_to.assert_any_call(0, 0xA000, host[0].data_ptr(), nbytes)
-        orch.copy_to.assert_any_call(1, 0xB000, host[1].data_ptr(), nbytes)
+        worker.copy_to.assert_any_call(0xA000, host[0].data_ptr(), nbytes, 0)
+        worker.copy_to.assert_any_call(0xB000, host[1].data_ptr(), nbytes, 1)
         rt.close()
 
     def test_permuted_worker_ids_place_shards(self, patched_setup):
-        patched_setup["worker"]._orch.malloc.side_effect = [0xA000, 0xB000]
+        patched_setup["worker"].malloc.side_effect = [0xA000, 0xB000]
         rt = DistributedWorker(_compiled_2cards())
         host = torch.zeros(2, 4, 4, dtype=torch.float32).share_memory_()
 
         stacked = rt.alloc_stacked_tensor(host, worker_ids=[1, 0])
 
         assert stacked.worker_ids == (1, 0)
-        orch = patched_setup["worker"]._orch
+        worker = patched_setup["worker"]
         nbytes = 4 * 4 * 4
         # shard 0 -> worker 1, shard 1 -> worker 0.
-        orch.malloc.assert_any_call(1, nbytes)
-        orch.malloc.assert_any_call(0, nbytes)
+        worker.malloc.assert_any_call(nbytes, 1)
+        worker.malloc.assert_any_call(nbytes, 0)
         assert (1, 0xA000) in rt._owned_tensors
         assert (0, 0xB000) in rt._owned_tensors
         rt.close()
 
     def test_free_stacked_tensor_releases_each_shard(self, patched_setup):
-        patched_setup["worker"]._orch.malloc.side_effect = [0xA000, 0xB000]
+        patched_setup["worker"].malloc.side_effect = [0xA000, 0xB000]
         rt = DistributedWorker(_compiled_2cards())
         host = torch.zeros(2, 4, 4, dtype=torch.float32).share_memory_()
         stacked = rt.alloc_stacked_tensor(host, worker_ids=[1, 0])
 
-        patched_setup["worker"]._orch.free.reset_mock()
+        patched_setup["worker"].free.reset_mock()
         rt.free_stacked_tensor(stacked)
 
-        orch = patched_setup["worker"]._orch
-        orch.free.assert_any_call(1, 0xA000)
-        orch.free.assert_any_call(0, 0xB000)
+        worker = patched_setup["worker"]
+        worker.free.assert_any_call(0xA000, 1)
+        worker.free.assert_any_call(0xB000, 0)
         assert (1, 0xA000) not in rt._owned_tensors
         assert (0, 0xB000) not in rt._owned_tensors
         rt.close()
 
     def test_close_auto_frees_stacked_shards(self, patched_setup):
-        patched_setup["worker"]._orch.malloc.side_effect = [0xA000, 0xB000]
+        patched_setup["worker"].malloc.side_effect = [0xA000, 0xB000]
         rt = DistributedWorker(_compiled_2cards())
         host = torch.zeros(2, 4, 4, dtype=torch.float32).share_memory_()
         rt.alloc_stacked_tensor(host)  # leak — close() must release both shards
 
-        patched_setup["worker"]._orch.free.reset_mock()
+        patched_setup["worker"].free.reset_mock()
         rt.close()
-        orch = patched_setup["worker"]._orch
-        orch.free.assert_any_call(0, 0xA000)
-        orch.free.assert_any_call(1, 0xB000)
+        worker = patched_setup["worker"]
+        worker.free.assert_any_call(0xA000, 0)
+        worker.free.assert_any_call(0xB000, 1)
 
     def test_worker_ids_out_of_range_rejected(self, patched_setup):
         rt = DistributedWorker(_compiled_2cards())
@@ -640,7 +638,7 @@ class TestAllocStackedTensor:
         host = torch.zeros(0, 4, 4, dtype=torch.float32).share_memory_()
         with pytest.raises(ValueError, match="at least one shard"):
             rt.alloc_stacked_tensor(host)
-        patched_setup["worker"]._orch.malloc.assert_not_called()
+        patched_setup["worker"].malloc.assert_not_called()
         rt.close()
 
     def test_worker_ids_length_mismatch_rejected(self, patched_setup):
@@ -651,7 +649,7 @@ class TestAllocStackedTensor:
         rt.close()
 
     def test_non_shared_host_rejected_and_rolled_back(self, patched_setup):
-        patched_setup["worker"]._orch.malloc.side_effect = [0xA000, 0xB000]
+        patched_setup["worker"].malloc.side_effect = [0xA000, 0xB000]
         rt = DistributedWorker(_compiled_2cards())
         host = torch.zeros(2, 4, 4, dtype=torch.float32)  # NOT shared
 
@@ -666,11 +664,11 @@ class TestCopyStackedFrom:
     """``copy_stacked_from`` reads each resident shard back into host[i] (D2H)."""
 
     def _make_stacked(self, patched_setup, worker_ids=None):
-        patched_setup["worker"]._orch.malloc.side_effect = [0xA000, 0xB000]
+        patched_setup["worker"].malloc.side_effect = [0xA000, 0xB000]
         rt = DistributedWorker(_compiled_2cards())
         host = torch.zeros(2, 4, 4, dtype=torch.float32).share_memory_()
         stacked = rt.alloc_stacked_tensor(host, worker_ids=worker_ids)
-        patched_setup["worker"]._orch.copy_from.reset_mock()
+        patched_setup["worker"].copy_from.reset_mock()
         return rt, stacked
 
     def test_reads_each_shard_back(self, patched_setup):
@@ -679,12 +677,11 @@ class TestCopyStackedFrom:
 
         rt.copy_stacked_from(stacked, out)
 
-        orch = patched_setup["worker"]._orch
+        worker = patched_setup["worker"]
         nbytes = 4 * 4 * 4
-        # Facade arg order: copy_from(worker_id, dst_host_ptr, src_dev_ptr, nbytes).
-        orch.copy_from.assert_any_call(0, out[0].data_ptr(), 0xA000, nbytes)
-        orch.copy_from.assert_any_call(1, out[1].data_ptr(), 0xB000, nbytes)
-        assert orch.copy_from.call_count == 2
+        worker.copy_from.assert_any_call(out[0].data_ptr(), 0xA000, nbytes, 0)
+        worker.copy_from.assert_any_call(out[1].data_ptr(), 0xB000, nbytes, 1)
+        assert worker.copy_from.call_count == 2
         rt.close()
 
     def test_permuted_worker_ids(self, patched_setup):
@@ -693,11 +690,11 @@ class TestCopyStackedFrom:
 
         rt.copy_stacked_from(stacked, out)
 
-        orch = patched_setup["worker"]._orch
+        worker = patched_setup["worker"]
         nbytes = 4 * 4 * 4
         # shard 0 resides on worker 1, shard 1 on worker 0.
-        orch.copy_from.assert_any_call(1, out[0].data_ptr(), 0xA000, nbytes)
-        orch.copy_from.assert_any_call(0, out[1].data_ptr(), 0xB000, nbytes)
+        worker.copy_from.assert_any_call(out[0].data_ptr(), 0xA000, nbytes, 1)
+        worker.copy_from.assert_any_call(out[1].data_ptr(), 0xB000, nbytes, 0)
         rt.close()
 
     def test_shape_mismatch_rejected(self, patched_setup):
@@ -1011,12 +1008,11 @@ class TestExplicitDispatchAPI:
         t = rt.alloc_tensor((4,), torch.float32, init=host)
         assert (0, t.data_ptr) in rt._owned_tensors
 
-        # Spy on the orchestrator's free so we can assert close drove the
-        # auto-free path (L3 routes free through the orchestrator facade).
-        orch = patched_setup["worker"]._orch
-        orch.free.reset_mock()
+        # Spy on Simpler's public free so we can assert close drove auto-free.
+        worker = patched_setup["worker"]
+        worker.free.reset_mock()
         rt.close()
-        assert orch.free.called
+        assert worker.free.called
 
 
 class TestLoadOrchEntry:
@@ -1922,25 +1918,81 @@ class TestMakeCallConfigDepGenType:
         assert cfg.enable_dep_gen is True
 
 
+class _PersistentRunResources:
+    """Small model of Simpler's per-run domain journal."""
+
+    def __init__(self) -> None:
+        self.live_domains: dict[str, Any] = {}
+        self.pending_release_domains: list[Any] = []
+        self.retired = False
+        self.domain_lock = threading.Lock()
+        self.requires_ordered_cleanup = False
+
+
 class _PersistentDomainHandle:
-    def __init__(self, name: str, workers: list[int], window_size: int, allocation_index: int) -> None:
+    def __init__(
+        self,
+        name: str,
+        workers: list[int],
+        window_size: int,
+        allocation_index: int,
+        worker: Any,
+        owner: _PersistentRunResources,
+    ) -> None:
         self.name = name
         self.workers = tuple(workers)
         self.contexts = {
-            worker: SimpleNamespace(
-                local_window_base=0x10000000 + allocation_index * 0x100000 + worker * 0x10000,
+            worker_id: SimpleNamespace(
+                local_window_base=0x10000000 + allocation_index * 0x100000 + worker_id * 0x10000,
                 actual_window_size=window_size,
             )
-            for worker in workers
+            for worker_id in workers
         }
+        self.worker = worker
+        self.owner = owner
         self.release_count = 0
+        self.close_sweep_count = 0
+        self.backend_release_count = 0
+        self.released = False
         self.freed = False
+        self.release_error: BaseException | None = None
+        self.free_on_release = True
 
     def __getitem__(self, worker_id: int):
         return self.contexts[worker_id]
 
     def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
         self.release_count += 1
+        with self.owner.domain_lock:
+            if not self.owner.retired:
+                self.owner.pending_release_domains.append(self)
+                self.owner.live_domains.pop(self.name, None)
+                if self.worker._live_domains.get(self.name) is self:
+                    self.worker._live_domains.pop(self.name)
+                return
+        self._free_from_global_registry(from_close=False)
+
+    def close_sweep(self) -> None:
+        """Model Worker.close()'s direct global live-domain sweep."""
+        self.close_sweep_count += 1
+        self.released = True
+        self._free_from_global_registry(from_close=True)
+
+    def _free_from_global_registry(self, *, from_close: bool) -> None:
+        if self.freed:
+            return
+        if not from_close and not self.free_on_release:
+            return
+        if self.backend_release_count == 0:
+            self.backend_release_count = 1
+        if self.release_error is not None:
+            raise self.release_error
+        self.freed = True
+        if self.worker._live_domains.get(self.name) is self:
+            self.worker._live_domains.pop(self.name)
 
 
 class _PersistentOrch:
@@ -1949,27 +2001,77 @@ class _PersistentOrch:
         self.allocate_calls: list[dict[str, Any]] = []
         self.copy_calls: list[tuple[int, int, int, int]] = []
         self.handles: list[_PersistentDomainHandle] = []
-        self.worker._execute_pending_domain_releases.side_effect = self._mark_released_domains_freed
+        self.resources: list[_PersistentRunResources] = []
+        self.worker.close.side_effect = self._close_live_domains
+
+    def _begin_run(self) -> _PersistentRunResources:
+        resources = _PersistentRunResources()
+        self.resources.append(resources)
+        self.worker._building_run_resources = resources
+        return resources
+
+    def _retire_run(self, resources: _PersistentRunResources) -> None:
+        assert self.worker._building_run_resources is resources
+        self.worker._building_run_resources = None
+        with resources.domain_lock:
+            resources.retired = True
+
+    def run(self, fn, *, before_retire=None, on_error=None):
+        resources = self._begin_run()
+        try:
+            result = fn(self, None, None)
+        except BaseException:
+            if on_error is not None:
+                on_error()
+            raise
+        else:
+            if before_retire is not None:
+                before_retire()
+            return result
+        finally:
+            self._retire_run(resources)
+
+    def run_with_abandoned_finalization(self, fn):
+        """Leave the owner unretired, as an ambiguous finalizer boundary does."""
+        resources = self._begin_run()
+        try:
+            fn(self, None, None)
+        finally:
+            assert self.worker._building_run_resources is resources
+            self.worker._building_run_resources = None
+        raise RuntimeError("run finalization abandoned")
 
     def allocate_domain(self, **kwargs):
         self.allocate_calls.append(kwargs)
+        resources = self.worker._building_run_resources
+        assert isinstance(resources, _PersistentRunResources)
         handle = _PersistentDomainHandle(
             kwargs["name"],
             list(kwargs["workers"]),
             int(kwargs["window_size"]),
             len(self.handles),
+            self.worker,
+            resources,
         )
         self.handles.append(handle)
         self.worker._live_domains[handle.name] = handle
+        resources.live_domains[handle.name] = handle
+        resources.requires_ordered_cleanup = True
         return handle
 
     def copy_to(self, worker_id: int, dst: int, src: int, size: int) -> None:
         self.copy_calls.append((worker_id, dst, src, size))
 
-    def _mark_released_domains_freed(self) -> None:
-        for handle in self.handles:
-            if handle.release_count:
-                handle.freed = True
+    def _close_live_domains(self) -> None:
+        first_error: BaseException | None = None
+        for handle in list(self.worker._live_domains.values())[::-1]:
+            try:
+                handle.close_sweep()
+            except BaseException as exc:  # noqa: BLE001 - model best-effort close
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
 
 def _persistent_entry(window_size: int, seen_handles: list[Any]):
@@ -2009,16 +2111,13 @@ class TestPersistentDistributedWorker:
         with pytest.raises(ValueError, match="requires regenerated host orchestration"):
             DistributedWorker(compiled, persistent=True)
 
-    @pytest.mark.parametrize(
-        ("attribute", "value"),
-        [
-            ("_live_domains", None),
-            ("_execute_pending_domain_releases", None),
-        ],
-    )
-    def test_rejects_missing_persistent_runtime_hooks_before_init(self, patched_setup, attribute, value):
+    @pytest.mark.parametrize("attribute", ["_live_domains", "_building_run_resources"])
+    def test_rejects_missing_persistent_runtime_hooks_before_init(self, patched_setup, attribute):
         m = patched_setup
-        setattr(m["worker"], attribute, value)
+        if attribute == "_live_domains":
+            m["worker"]._live_domains = None
+        else:
+            del m["worker"]._building_run_resources
         m["load_entry"].return_value = (_persistent_entry(64, []), None)
         compiled = _fake_compiled([_param("a", [16, 16])], [])
 
@@ -2032,7 +2131,7 @@ class TestPersistentDistributedWorker:
         m = patched_setup
         m["worker"]._live_domains = {}
         orch = _PersistentOrch(m["worker"])
-        m["worker"].run.side_effect = lambda fn: fn(orch, None, None)
+        m["worker"].run.side_effect = orch.run
         seen_handles: list[Any] = []
         window_size = (1 << 20) + 17
         m["load_entry"].return_value = (_persistent_entry(window_size, seen_handles), None)
@@ -2042,6 +2141,14 @@ class TestPersistentDistributedWorker:
         rt = DistributedWorker(compiled, persistent=True)
         arg = DeviceTensor(0x1000, (16, 16), torch.float32)
         rt(arg)
+        handle = orch.handles[0]
+        owner = orch.resources[0]
+        assert owner.live_domains == {}
+        assert owner.retired
+        assert owner.requires_ordered_cleanup
+        assert m["worker"]._live_domains == {"p0:comm_d0": handle}
+        assert not handle.released
+        assert not handle.freed
         rt(arg)
         rt.close()
 
@@ -2059,15 +2166,17 @@ class TestPersistentDistributedWorker:
         ]
         # A retained domain survives both request run-fences and is released
         # once when the persistent dispatcher closes.
-        assert orch.handles[0].release_count == 1
+        assert handle.release_count == 1
+        assert handle.close_sweep_count == 0
+        assert handle.backend_release_count == 1
+        assert handle.freed
         assert m["worker"]._live_domains == {}
-        m["worker"]._execute_pending_domain_releases.assert_called_once_with()
 
     def test_reused_domain_skips_window_reset_when_disabled(self, patched_setup):
         m = patched_setup
         m["worker"]._live_domains = {}
         orch = _PersistentOrch(m["worker"])
-        m["worker"].run.side_effect = lambda fn: fn(orch, None, None)
+        m["worker"].run.side_effect = orch.run
         seen_handles: list[Any] = []
         m["load_entry"].return_value = (_persistent_entry(64, seen_handles), None)
         compiled = _fake_compiled([_param("a", [16, 16])], [])
@@ -2115,13 +2224,9 @@ class TestPersistentDistributedWorker:
             assert task_args_ref is not None
             assert task_args_ref() is not None
 
-        def worker_run(fn):
-            fn(orch, None, None)
-            # The request-owned keepalive stays populated until Worker.run's
-            # completion fence and cleanup return.
-            assert_task_args_alive()
-
-        m["worker"].run.side_effect = worker_run
+        # The request-owned keepalive stays populated until Worker.run's
+        # completion fence and cleanup return.
+        m["worker"].run.side_effect = lambda fn: orch.run(fn, before_retire=assert_task_args_alive)
         m["load_entry"].return_value = (entry, None)
         compiled = _fake_compiled([_param("a", [16, 16])], [])
 
@@ -2138,7 +2243,7 @@ class TestPersistentDistributedWorker:
         m = patched_setup
         m["worker"]._live_domains = {}
         orch = _PersistentOrch(m["worker"])
-        m["worker"].run.side_effect = lambda fn: fn(orch, None, None)
+        m["worker"].run.side_effect = orch.run
         seen_a: list[Any] = []
         seen_b: list[Any] = []
         m["load_entry"].side_effect = [
@@ -2173,47 +2278,59 @@ class TestPersistentDistributedWorker:
         # Isolation does not change final ownership: each retained domain is
         # released exactly once when the shared persistent worker closes.
         assert [handle.release_count for handle in orch.handles] == [1, 1]
+        assert [handle.close_sweep_count for handle in orch.handles] == [0, 0]
+        assert [handle.backend_release_count for handle in orch.handles] == [1, 1]
 
     def test_domain_release_error_reaches_close(self, patched_setup):
         m = patched_setup
         m["worker"]._live_domains = {}
         orch = _PersistentOrch(m["worker"])
-        m["worker"].run.side_effect = lambda fn: fn(orch, None, None)
+        m["worker"].run.side_effect = orch.run
         m["load_entry"].return_value = (_persistent_entry(64, []), None)
         compiled = _fake_compiled([_param("a", [16, 16])], [])
         rt = DistributedWorker(compiled, persistent=True)
         rt(DeviceTensor(0x1000, (16, 16), torch.float32))
-        m["worker"]._execute_pending_domain_releases.side_effect = RuntimeError(
-            "persistent domain release failed"
-        )
+        handle = orch.handles[0]
+        handle.release_error = RuntimeError("persistent domain release failed")
 
         with pytest.raises(RuntimeError, match="persistent domain release failed"):
             rt.close()
 
-        assert orch.handles[0].release_count == 1
+        assert handle.release_count == 1
+        assert handle.close_sweep_count == 1
+        # Worker.close() observes the cached backend failure instead of
+        # issuing the collective release a second time.
+        assert handle.backend_release_count == 1
+        assert not handle.freed
+        assert m["worker"]._live_domains == {"p0:comm_d0": handle}
         m["worker"].close.assert_called_once_with()
 
     def test_unfreed_domain_release_reaches_close(self, patched_setup):
         m = patched_setup
         orch = _PersistentOrch(m["worker"])
-        m["worker"].run.side_effect = lambda fn: fn(orch, None, None)
+        m["worker"].run.side_effect = orch.run
         m["load_entry"].return_value = (_persistent_entry(64, []), None)
         compiled = _fake_compiled([_param("a", [16, 16])], [])
         rt = DistributedWorker(compiled, persistent=True)
         rt(DeviceTensor(0x1000, (16, 16), torch.float32))
-        m["worker"]._execute_pending_domain_releases.side_effect = None
+        handle = orch.handles[0]
+        handle.free_on_release = False
 
         with pytest.raises(RuntimeError, match="did not free.*p0:comm_d0"):
             rt.close()
 
-        assert not orch.handles[0].freed
+        assert handle.release_count == 1
+        assert handle.close_sweep_count == 1
+        assert handle.backend_release_count == 1
+        assert handle.freed
+        assert m["worker"]._live_domains == {}
         m["worker"].close.assert_called_once_with()
 
-    def test_dispatch_error_reaches_caller_and_releases_domain(self, patched_setup):
+    def test_dispatch_error_defers_domain_to_worker_close(self, patched_setup):
         m = patched_setup
         m["worker"]._live_domains = {}
         orch = _PersistentOrch(m["worker"])
-        m["worker"].run.side_effect = lambda fn: fn(orch, None, None)
+        m["worker"].run.side_effect = orch.run
 
         def failing_entry(
             orch,
@@ -2244,44 +2361,51 @@ class TestPersistentDistributedWorker:
 
         with pytest.raises(RuntimeError, match="persistent dispatch failed"):
             rt(arg)
+        handle = orch.handles[0]
+        owner = orch.resources[0]
+        assert owner.retired
+        assert owner.live_domains == {}
+        assert handle.release_count == 0
+        assert handle.close_sweep_count == 0
+        assert m["worker"]._live_domains == {"p0:comm_d0": handle}
+
         rt.close()
 
-        # The failing request's Worker.run completes before the error reaches
-        # the caller, then dispatcher teardown releases the retained domain.
-        assert orch.handles[0].release_count == 1
+        # A failed request never calls handle.release(): even a conservatively
+        # unretired owner must stay globally reachable for whole-tree teardown.
+        assert handle.release_count == 0
+        assert handle.close_sweep_count == 1
+        assert handle.backend_release_count == 1
+        assert handle.freed
+        assert m["worker"]._live_domains == {}
         assert m["worker"].run.call_count == 1
 
-    def test_dispatch_error_keeps_teardown_error_as_context(self, patched_setup):
+    def test_abandoned_run_keeps_domain_reachable_for_worker_close(self, patched_setup):
         m = patched_setup
         orch = _PersistentOrch(m["worker"])
-        m["worker"].run.side_effect = lambda fn: fn(orch, None, None)
-
-        def failing_entry(
-            orch,
-            _args,
-            config,
-            *,
-            tensors,
-            callables,
-            sub_ids,
-            _keep,
-            world_size,
-            _domain_provider=None,
-        ):
-            del orch, _args, config, tensors, callables, sub_ids, _keep, world_size, _domain_provider
-            raise RuntimeError("persistent dispatch failed")
-
-        m["load_entry"].return_value = (failing_entry, None)
-        m["worker"]._execute_pending_domain_releases.side_effect = RuntimeError("persistent teardown failed")
+        m["worker"].run.side_effect = orch.run_with_abandoned_finalization
+        m["load_entry"].return_value = (_persistent_entry(64, []), None)
         compiled = _fake_compiled([_param("a", [16, 16])], [])
         rt = DistributedWorker(compiled, persistent=True)
 
-        with pytest.raises(RuntimeError, match="persistent dispatch failed") as exc_info:
+        with pytest.raises(RuntimeError, match="run finalization abandoned"):
             rt(DeviceTensor(0x1000, (16, 16), torch.float32))
 
-        assert isinstance(exc_info.value.__context__, RuntimeError)
-        assert str(exc_info.value.__context__) == "persistent teardown failed"
+        handle = orch.handles[0]
+        owner = orch.resources[0]
+        assert not owner.retired
+        assert owner.live_domains == {}
+        assert owner.pending_release_domains == []
+        assert handle.release_count == 0
+        assert m["worker"]._live_domains == {"p0:comm_d0": handle}
+
         rt.close()
+
+        assert handle.release_count == 0
+        assert handle.close_sweep_count == 1
+        assert handle.backend_release_count == 1
+        assert handle.freed
+        assert m["worker"]._live_domains == {}
 
     def test_dispatch_error_waits_for_request_worker_cleanup(self, patched_setup):
         m = patched_setup
@@ -2290,17 +2414,13 @@ class TestPersistentDistributedWorker:
         request_finalizer_started = threading.Event()
         allow_request_finalizer_to_finish = threading.Event()
 
-        def worker_run(fn):
-            try:
-                fn(orch, None, None)
-            except BaseException:
-                # Model the interval between orchestration failing and this
-                # request's Worker.run fence/cleanup finally completing.
-                request_finalizer_started.set()
-                assert allow_request_finalizer_to_finish.wait(timeout=2)
-                raise
+        def wait_for_request_finalizer() -> None:
+            # Model the interval between orchestration failing and this
+            # request's Worker.run fence/cleanup finally completing.
+            request_finalizer_started.set()
+            assert allow_request_finalizer_to_finish.wait(timeout=2)
 
-        m["worker"].run.side_effect = worker_run
+        m["worker"].run.side_effect = lambda fn: orch.run(fn, on_error=wait_for_request_finalizer)
 
         def failing_entry(
             orch,

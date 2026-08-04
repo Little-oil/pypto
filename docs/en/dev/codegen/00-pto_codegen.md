@@ -596,8 +596,8 @@ The orchestration codegen generates identical orchestration C++ code using the P
 
 | Key | When emitted | Notes |
 | --- | ------------ | ----- |
-| `runtime` | Always | Currently `"tensormap_and_ringbuffer"` — the runtime requires 4 AICPU threads (3 schedulers + 1 orchestrator on thread 3). |
-| `aicpu_thread_num` | Always (`4`) | Dictated by the chosen runtime. |
+| `runtime` | Always | Currently `"tensormap_and_ringbuffer"`. |
+| `aicpu_thread_num` | Always (`0`) | `0` selects the runtime's architecture default (a2a3: 4; a5: 5); callers may explicitly override it. |
 
 ### Argument Unpacking
 

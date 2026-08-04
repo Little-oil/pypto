@@ -88,6 +88,17 @@ def test_invalidate_binary_cache_walks_next_levels(tmp_path: Path) -> None:
     assert cpp_r0.exists(), "cpp source must not be deleted"
 
 
+def test_invalidate_binary_cache_discards_context_stamps(tmp_path: Path) -> None:
+    """Manual replay invalidation cannot leave partial rebuilds authorized."""
+    root_stamp = _touch(tmp_path / "cache" / "binary_context.json")
+    rank_stamp = _touch(tmp_path / "next_levels" / "rank0" / "cache" / "binary_context.json")
+
+    invalidate_binary_cache(tmp_path)
+
+    assert not root_stamp.exists()
+    assert not rank_stamp.exists()
+
+
 def test_invalidate_binary_cache_noop_on_empty_dir(tmp_path: Path) -> None:
     invalidate_binary_cache(tmp_path)  # must not raise
 

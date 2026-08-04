@@ -48,6 +48,7 @@ class TestKernelConfigSignature:
         )
         # ArgDirection import is present and the kernel carries the signature.
         assert "from simpler.task_interface import ArgDirection as _D" in text
+        assert '"aicpu_thread_num": 0' in text
         assert '"signature": [_D.IN, _D.IN, _D.INOUT]' in text
         # 3 non-SCALAR entries == payload tensor_count for the matmul (a, b, c).
         assert text.count("_D.") == 3

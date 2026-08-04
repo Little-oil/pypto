@@ -807,6 +807,7 @@ def test_backend_materializes_builtin_next_level_files(tmp_path):
     assert "submit_allreduce_kernel<ReduceOp::kSum>" in entry_cpp
 
     kernel_config = files[f"{base}/kernel_config.py"]
+    assert '"aicpu_thread_num": 0' in kernel_config
     assert '"function_name": "aicpu_orchestration_entry"' in kernel_config
     assert '"signature": [_D.INOUT, _D.INOUT]' in kernel_config
 
@@ -1164,6 +1165,7 @@ def test_host_collective_builtin_template_package_exists(package_name, variant):
     assert templates.is_dir(), f"missing templates/ for {package_name}"
     for name in ("entry.cpp.in", "kernel.cpp.in", "kernel_config.py.in"):
         assert (templates / name).is_file(), f"missing {name} in {package_name}"
+    assert '"aicpu_thread_num": 0' in (templates / "kernel_config.py.in").read_text()
     assert (root / "__init__.py").is_file(), f"missing __init__.py in {package_name}"
     assert variant.startswith("builtin.tensor."), variant
 

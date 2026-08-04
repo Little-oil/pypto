@@ -398,6 +398,7 @@ class TestMakeCallConfigRing:
         from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
 
         cfg = _make_dist_call_config_with_fake(DistributedConfig(), None, monkeypatch)
+        assert cfg.aicpu_thread_num == 0
         assert cfg.runtime_env.ring_task_window == 0
         assert cfg.runtime_env.ring_heap == 0
         assert cfg.runtime_env.ring_dep_pool == 0

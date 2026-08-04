@@ -832,7 +832,7 @@ def _generate_config_file(
     runtime_lines = [
         "RUNTIME_CONFIG = {",
         '\t"runtime": "tensormap_and_ringbuffer",',
-        '\t"aicpu_thread_num": 4,',
+        '\t"aicpu_thread_num": 0,',
     ]
     if enable_sdma:
         runtime_lines.append('\t"enable_sdma": True,')
@@ -851,7 +851,7 @@ def _generate_config_file(
     lines = [
         *header,
         "# Runtime configuration for tensormap_and_ringbuffer.",
-        "# This runtime requires 4 AICPU threads (3 schedulers + 1 orchestrator on thread 3).",
+        "# AICPU thread count 0 selects the runtime's architecture default (a2a3: 4; a5: 5).",
         *runtime_lines,
         "ORCHESTRATION = {",
         f'\t"source": str(_ROOT_DIR / "orchestration" / "{orch_func_name}.cpp"),',

@@ -71,14 +71,16 @@ class DistributedConfig:
             pipelining scenarios.
         runtime: Simpler runtime flavour. ``"tensormap_and_ringbuffer"`` (default)
             enables the tensor-map helpers and the ring-buffer DMA driver.
-        aicpu_thread_num: Number of aiCPU threads allocated to the simpler
-            runtime (3 schedulers + 1 dispatcher = 4 by default). Must be ≥ 1.
+        aicpu_thread_num: Number of AICPU threads allocated to the simpler
+            runtime. ``0`` (default) selects the architecture default (a2a3: 4;
+            a5: 5). Explicit normal-run values must be at least 2 and are
+            validated against the selected platform's limit by the runtime.
     """
 
     device_ids: list[int] = field(default_factory=lambda: [0])
     num_sub_workers: int = 0
     runtime: str = "tensormap_and_ringbuffer"
-    aicpu_thread_num: int = 4
+    aicpu_thread_num: int = 0
 
 
 class DistributedCompiledProgram:
