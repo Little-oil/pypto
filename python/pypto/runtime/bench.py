@@ -1363,7 +1363,7 @@ def benchmark(
 
     # The C++ host logger that prints the ``[STRACE]`` markers is seeded from the
     # simpler Python logger snapshot at worker ``init`` (and inherited by the L3
-    # fork), so raise the level before constructing the worker. Restore afterward.
+    # fork), so set the level to ``timing`` before constructing the worker. Restore afterward.
     prior_level = current_level()
     configure_log(_STRACE_LOG_LEVEL)
     try:

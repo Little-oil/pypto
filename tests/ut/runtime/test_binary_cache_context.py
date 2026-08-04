@@ -9,10 +9,7 @@
 
 """Regression tests for generated-binary runtime compatibility stamps."""
 
-from __future__ import annotations
-
 import fcntl
-import importlib
 import json
 import multiprocessing
 import subprocess
@@ -22,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pypto.runtime._binary_cache as binary_cache
 import pytest
 from pypto.runtime._binary_cache import (
     BinaryCacheContext,
@@ -106,7 +104,7 @@ def test_runtime_revision_change_invalidates_both_orchestration_caches(tmp_path:
     assert not binary_context_path(tmp_path).exists()
 
 
-def test_matching_context_preserves_orchestration_caches(tmp_path: Path) -> None:
+def test_matching_context_preserves_binaries_but_discards_stamp(tmp_path: Path) -> None:
     context = _context()
     record_binary_context(tmp_path, context)
     orch_prebuild = _touch(tmp_path / "cache" / "orch_main.bin")
@@ -115,7 +113,7 @@ def test_matching_context_preserves_orchestration_caches(tmp_path: Path) -> None
     assert prepare_binary_context(tmp_path, context) == 0
     assert orch_prebuild.exists()
     assert orch_sidecar.exists()
-    assert binary_context_path(tmp_path).exists()
+    assert not binary_context_path(tmp_path).exists()
 
 
 def test_legacy_unstamped_cache_is_invalidated_once(tmp_path: Path) -> None:
@@ -168,7 +166,27 @@ def test_unknown_current_identity_never_authorizes_binary_reuse(tmp_path: Path) 
     assert not binary_context_path(tmp_path).exists()
 
 
-def test_record_binary_context_writes_schema_atomically(tmp_path: Path) -> None:
+def test_invalidation_discards_stamp_before_removing_artifacts(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    context = _context()
+    stamp = binary_context_path(tmp_path)
+    record_binary_context(tmp_path, context)
+
+    def fail_artifact_removal(_work_dir: Path | str) -> int:
+        assert not stamp.exists()
+        raise RuntimeError("artifact removal failed")
+
+    monkeypatch.setattr(binary_cache, "_invalidate_binary_artifacts", fail_artifact_removal)
+
+    with pytest.raises(RuntimeError, match="artifact removal failed"):
+        binary_cache.invalidate_binary_context(tmp_path)
+
+    assert not stamp.exists()
+
+
+def test_record_binary_context_writes_schema_and_cleans_temp_file(tmp_path: Path) -> None:
     context = _context()
 
     record_binary_context(tmp_path, context)
@@ -176,40 +194,6 @@ def test_record_binary_context_writes_schema_atomically(tmp_path: Path) -> None:
     stamp = binary_context_path(tmp_path)
     assert json.loads(stamp.read_text(encoding="utf-8")) == context.to_dict()
     assert not list(stamp.parent.glob(f"{stamp.name}.*.tmp"))
-
-
-@pytest.fixture
-def device_runner(monkeypatch):
-    """Import device_runner with optional Simpler/compiler surfaces stubbed."""
-    import pypto.runtime as runtime_package  # noqa: PLC0415
-
-    fake_kernel_compiler = SimpleNamespace(KernelCompiler=object)
-    fake_task_interface = SimpleNamespace(
-        CallConfig=object,
-        ChipCallable=object,
-        ChipStorageTaskArgs=object,
-        CoreCallable=object,
-        Worker=object,
-        make_tensor_arg=object,
-        scalar_to_uint64=object,
-    )
-    monkeypatch.setitem(sys.modules, "pypto.runtime.kernel_compiler", fake_kernel_compiler)
-    monkeypatch.setitem(sys.modules, "pypto.runtime.task_interface", fake_task_interface)
-
-    module_name = "pypto.runtime.device_runner"
-    previous = sys.modules.pop(module_name, None)
-    previous_attribute = getattr(runtime_package, "device_runner", None)
-    try:
-        module = importlib.import_module(module_name)
-        yield module
-    finally:
-        sys.modules.pop(module_name, None)
-        if previous is not None:
-            sys.modules[module_name] = previous
-        if previous_attribute is not None:
-            setattr(runtime_package, "device_runner", previous_attribute)
-        elif hasattr(runtime_package, "device_runner"):
-            delattr(runtime_package, "device_runner")
 
 
 def test_dirty_runtime_checkout_disables_binary_reuse(device_runner, monkeypatch, tmp_path: Path) -> None:
@@ -356,6 +340,34 @@ def test_compile_and_assemble_does_not_stamp_failed_assembly(
     record.assert_not_called()
 
 
+def test_failed_matching_cache_is_invalidated_before_retry(
+    device_runner,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    context = _context()
+    record_binary_context(tmp_path, context)
+    cached_binary = _touch(tmp_path / "cache" / "orch_main.bin", b"cached orchestration")
+    chip = object()
+    build = Mock(side_effect=[RuntimeError("assemble failed"), chip])
+    _stub_assembly(device_runner, monkeypatch, tmp_path, build)
+    compile_orchestration = device_runner.compile_single_orchestration
+
+    with pytest.raises(RuntimeError, match="assemble failed"):
+        device_runner.compile_and_assemble(tmp_path, "a2a3sim")
+
+    assert cached_binary.exists()
+    assert not binary_context_path(tmp_path).exists()
+    compile_orchestration.assert_not_called()
+
+    assembled, _, _ = device_runner.compile_and_assemble(tmp_path, "a2a3sim")
+
+    assert assembled is chip
+    assert not cached_binary.exists()
+    compile_orchestration.assert_called_once()
+    assert json.loads(binary_context_path(tmp_path).read_text(encoding="utf-8")) == context.to_dict()
+
+
 def test_compile_and_assemble_serializes_same_work_dir(
     device_runner,
     monkeypatch,
@@ -397,3 +409,7 @@ def test_compile_and_assemble_serializes_same_work_dir(
         if process.is_alive():
             process.terminate()
         process.join(timeout=5)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

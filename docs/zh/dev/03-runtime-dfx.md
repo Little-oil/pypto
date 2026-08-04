@@ -316,9 +316,14 @@ python -m pypto.runtime.debug.replay build_output/_jit_xxx/ \
     --pmu 2 --swimlane --log-level debug
 ```
 
-默认 `recompile=True` 会清掉缓存的 `.so` / `.bin`,确保手改的 cpp
-能被重新编译。如果没改 cpp、想跳过重编译,传 `recompile=False`
-（或 CLI 的 `--no-recompile`）即可。`--log-level` 接受和
+默认 `recompile=True` 会强制清掉缓存的 `.so` / `.bin`,确保手改的 cpp
+能被重新编译。`recompile=False`（或 CLI 的 `--no-recompile`）只关闭该
+强制失效；runtime / PTO-ISA 兼容性检查仍会运行，并可能清理和重建缓存产物。
+复用还要求 runtime 与 PTO-ISA 的身份都能确定。runtime 源码 checkout 必须
+保持干净；安装版 runtime 也可以使用内嵌的 build commit。PTO-ISA 目前必须是
+干净的 Git checkout。若任一身份无法确定，PyPTO 会按安全失败策略重新构建，
+而不会信任已有二进制。
+`--log-level` 接受和
 `PYPTO_RUNTIME_LOG` 相同的值（`debug`、`info`、`timing`、`warn`、
 `error`、`null`）;加上 `--log-sync-pypto` 可以把同一档位推到
 PyPTO 的 C++ logger。

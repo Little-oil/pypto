@@ -85,7 +85,7 @@ worker execute multiple L3 DAGs concurrently.
 This implementation does not modify Simpler. Each queued request uses the
 public `Worker.run()` completion boundary. PyPTO detaches retained CommDomains
 from Simpler's per-run release set and releases them when the prepared worker
-closes. That retention currently depends on Simpler's private global
+closes. That retention currently depends on Simpler's private Worker-level
 live-domain registry and active run-resource journal (`_live_domains` and
 `_building_run_resources.live_domains`); a future public retention API should
 encapsulate this lifecycle.

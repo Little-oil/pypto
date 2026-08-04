@@ -9,49 +9,14 @@
 
 """Regression tests for device-runner diagnostics and PTO-ISA resolution."""
 
-import importlib
 import logging
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from unittest.mock import Mock
 
 import pytest
 
 _RUNTIME_PIN = "83d01313d9bfc247c4b7c8bcf969d1019f0d106f"
-
-
-@pytest.fixture
-def device_runner(monkeypatch):
-    """Import ``device_runner`` without requiring the optional simpler package."""
-    import pypto.runtime as runtime_package  # noqa: PLC0415
-
-    fake_kernel_compiler = SimpleNamespace(KernelCompiler=object)
-    fake_task_interface = SimpleNamespace(
-        CallConfig=object,
-        ChipCallable=object,
-        ChipStorageTaskArgs=object,
-        CoreCallable=object,
-        Worker=object,
-        make_tensor_arg=object,
-        scalar_to_uint64=object,
-    )
-    monkeypatch.setitem(sys.modules, "pypto.runtime.kernel_compiler", fake_kernel_compiler)
-    monkeypatch.setitem(sys.modules, "pypto.runtime.task_interface", fake_task_interface)
-
-    module_name = "pypto.runtime.device_runner"
-    previous = sys.modules.pop(module_name, None)
-    previous_attribute = getattr(runtime_package, "device_runner", None)
-    try:
-        module = importlib.import_module(module_name)
-        yield module
-    finally:
-        sys.modules.pop(module_name, None)
-        if previous is not None:
-            sys.modules[module_name] = previous
-        if previous_attribute is not None:
-            setattr(runtime_package, "device_runner", previous_attribute)
-        elif hasattr(runtime_package, "device_runner"):
-            delattr(runtime_package, "device_runner")
 
 
 def _configure_existing_clone(device_runner, monkeypatch, tmp_path):

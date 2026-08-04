@@ -25,7 +25,8 @@ each level.
 
 ### Levels
 
-`LogLevel` is a coarse enum exposed in [python/pypto/pypto_core/logging.pyi:18](../../../python/pypto/pypto_core/logging.pyi#L18):
+`LogLevel` is a coarse enum exposed in
+[python/pypto/pypto_core/logging.pyi](../../../python/pypto/pypto_core/logging.pyi):
 
 | Value | Name | Use |
 | ----- | ---- | --- |
@@ -67,7 +68,7 @@ launching kernels, waiting on tasks, or tearing down the worker flows
 through here.
 
 The user-facing entry point lives in
-[python/pypto/runtime/log_config.py:38](../../../python/pypto/runtime/log_config.py#L38):
+[python/pypto/runtime/log_config.py](../../../python/pypto/runtime/log_config.py):
 
 ```python
 from pypto.runtime import configure_log, log_level
@@ -103,7 +104,7 @@ visible while ordinary INFO and DEBUG traffic stays silent.
 | `sync_pypto` | `bool` (default `False`) | When `True`, also push the closest `LogLevel` band onto PyPTO's C++ logger — useful when you want a single knob to cover both subsystems. |
 
 The band mapping used by `sync_pypto=True`
-([log_config.py:63-81](../../../python/pypto/runtime/log_config.py#L63-L81)):
+([log_config.py](../../../python/pypto/runtime/log_config.py)):
 
 | runtime threshold | PyPTO `LogLevel` |
 | ----------------- | ---------------- |
@@ -144,7 +145,7 @@ env bootstrap chose.
 ## 3. pytest options (`tests/st/`)
 
 The integration-test harness exposes both subsystems as CLI options
-([tests/st/conftest.py:157-170](../../../tests/st/conftest.py#L157-L170)).
+([tests/st/conftest.py](../../../tests/st/conftest.py)).
 They are applied in `pytest_configure` so collection-time logs already
 respect them.
 

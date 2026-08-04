@@ -254,6 +254,7 @@ def test_pto_codegen_tensor_parameters():
     assert "pto.make_tensor_view" in mlir_code
     assert "shape = [%c64_index, %c64_index]" in mlir_code or "shape = [%c32_index, %c32_index]" in mlir_code
     assert "strides = " in mlir_code
+    assert "} : !pto.tensor_view" in mlir_code
     assert "!pto.tensor_view<?x?xf32>" in mlir_code
 
 
@@ -2774,6 +2775,7 @@ def test_pto_codegen_tensor_view_aliases_input_base_ptr():
     view_line = _single_line(lines, "pto.make_tensor_view %arg0, shape = [%c16_index, %c8_index]")
     assert "strides = [%c1_index, %c16_index]" in view_line
     assert "{layout = #pto.layout<dn>}" in view_line
+    assert "} : !pto.tensor_view" in view_line
 
     view_ssa = view_line.split(" = ", 1)[0].strip()
     assert any(f"pto.partition_view {view_ssa}" in line for line in lines), (

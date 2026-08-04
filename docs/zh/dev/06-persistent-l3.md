@@ -74,7 +74,7 @@ program 仍须满足原有的 platform、runtime 和 device ID 兼容性检查�
 
 该实现不修改 Simpler。每个 Queue 请求都使用公开的 `Worker.run()` completion
 boundary。PyPTO 会让 retained CommDomain 脱离 Simpler 的 per-run release set，
-并在 prepared worker 关闭时统一释放。目前该保留机制仍依赖 Simpler 私有的全局
-live-domain registry 和当前 run-resource journal（`_live_domains` 和
+并在 prepared worker 关闭时统一释放。目前该保留机制仍依赖 Simpler 私有的
+Worker 级 live-domain registry 和当前 run-resource journal（`_live_domains` 和
 `_building_run_resources.live_domains`）；后续应由公开的 retention API 封装该
 lifecycle。

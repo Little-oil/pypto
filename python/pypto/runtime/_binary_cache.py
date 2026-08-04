@@ -9,8 +9,6 @@
 
 """Compatibility stamps for generated kernel and orchestration binaries."""
 
-from __future__ import annotations
-
 import contextlib
 import fcntl
 import json
@@ -27,7 +25,7 @@ _BINARY_CONTEXT_FILENAME = "binary_context.json"
 
 @dataclass(frozen=True)
 class BinaryCacheContext:
-    """Inputs whose ABI/content determine whether generated binaries are reusable."""
+    """Runtime and PTO-ISA inputs checked before reusing generated binaries."""
 
     platform: str
     runtime_name: str
@@ -62,7 +60,7 @@ def binary_context_lock(work_dir: Path | str) -> Iterator[None]:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def invalidate_binary_artifacts(work_dir: Path | str) -> int:
+def _invalidate_binary_artifacts(work_dir: Path | str) -> int:
     """Delete reusable binaries for one chip sub-build, preserving all sources."""
     work_dir = Path(work_dir)
     candidates: list[Path] = []
@@ -93,10 +91,9 @@ def invalidate_binary_context(work_dir: Path | str) -> int:
     deliberately not included in that count because it is metadata, not a
     generated binary.
     """
-    removed = invalidate_binary_artifacts(work_dir)
     with contextlib.suppress(FileNotFoundError):
         binary_context_path(work_dir).unlink()
-    return removed
+    return _invalidate_binary_artifacts(work_dir)
 
 
 def _read_binary_context(path: Path) -> dict[str, Any] | None:
@@ -108,17 +105,21 @@ def _read_binary_context(path: Path) -> dict[str, Any] | None:
 
 
 def prepare_binary_context(work_dir: Path | str, context: BinaryCacheContext | None) -> int:
-    """Invalidate binaries unless their recorded context exactly matches *context*.
+    """Begin a cache transaction, invalidating binaries with a mismatched context.
 
     ``None`` means that the current runtime identity cannot be established. In
-    that case cached binaries are never trusted and no compatibility stamp is
-    retained for a later call to mistake as reusable.
+    that case cached binaries are never trusted.  A matching stamp preserves
+    the binaries for this transaction, but the stamp itself is always discarded
+    before compilation starts.  A caller must write a fresh stamp only after all
+    binaries assemble successfully so an interrupted transaction fails closed.
 
     Returns the number of binary files removed.
     """
     stamp_path = binary_context_path(work_dir)
     cached = _read_binary_context(stamp_path)
     if context is not None and cached == context.to_dict():
+        with contextlib.suppress(FileNotFoundError):
+            stamp_path.unlink()
         return 0
 
     return invalidate_binary_context(work_dir)
@@ -151,7 +152,6 @@ __all__ = [
     "BinaryCacheContext",
     "binary_context_lock",
     "binary_context_path",
-    "invalidate_binary_artifacts",
     "invalidate_binary_context",
     "prepare_binary_context",
     "record_binary_context",

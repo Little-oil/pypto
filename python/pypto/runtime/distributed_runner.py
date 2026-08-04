@@ -15,6 +15,7 @@ import ctypes
 import importlib.util
 import inspect
 import json
+import logging
 import queue
 import sys
 import threading
@@ -31,6 +32,8 @@ import torch
 
 from .device_tensor import DeviceTensor, StackedDeviceTensor
 from .runtime_base import Worker
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pypto.ir.distributed_compiled_program import DistributedCompiledProgram, DistributedConfig
@@ -330,6 +333,37 @@ def _construct_worker(
         runtime=runtime_name,
         enable_sdma=enable_sdma,
     )
+
+
+def _close_local_worker(w: Any) -> None:
+    """Close a locally owned Worker, retrying incomplete Simpler cleanup once.
+
+    Simpler keeps failed cleanup-journal entries for the next ``close()`` call.
+    Local workers are not returned to the user, so give transient cleanup one
+    bounded retry here while still surfacing a persistent failure.
+    """
+    try:
+        w.close()
+    except BaseException as first_error:  # noqa: BLE001 - cleanup can preserve control-flow failures
+        try:
+            w.close()
+        except BaseException:  # noqa: BLE001 - surface the retry outcome
+            raise
+        if not isinstance(first_error, Exception):
+            # Cleanup completed, but KeyboardInterrupt/SystemExit must remain
+            # visible when there is no earlier operation failure to preserve.
+            raise
+
+
+def _close_local_worker_after_error(w: Any, operation: str) -> None:
+    """Best-effort cleanup without replacing an active operation failure."""
+    try:
+        _close_local_worker(w)
+    except BaseException:  # noqa: BLE001 - preserve the primary failure below
+        logger.exception(
+            "%s failed; Worker cleanup was interrupted or still failed after one retry",
+            operation,
+        )
 
 
 def _register_callables(
@@ -1073,9 +1107,13 @@ def execute_distributed(
             # build inside the timed dispatch. No-op without a prebuilt arena.
             w.init(prewarm_config=call_config)
             _dispatch(w, entry_fn, tensors, chip_cids, sub_ids, call_config, len(dc.device_ids))
-        finally:
+        except BaseException:  # noqa: BLE001 - cleanup must also run for interruption
             if w is not None:
-                w.close()
+                _close_local_worker_after_error(w, "one-shot distributed execution")
+            raise
+        else:
+            if w is not None:
+                _close_local_worker(w)
 
     dfx_base = output_dir / "dfx_outputs"
     swimlane = config is not None and config.enable_l2_swimlane
@@ -1376,15 +1414,13 @@ class DistributedWorker(Worker):
             # separate call into Simpler's private startup implementation.
             if self._persistent:
                 self._start_persistent_dispatcher()
-        except Exception:
+        except BaseException:  # noqa: BLE001 - partially built Workers still require cleanup
             if self._w is not None:
-                try:
-                    self._w.close()
-                except Exception:
-                    pass
+                _close_local_worker_after_error(self._w, "DistributedWorker construction")
             raise
 
         self._closed = False
+        self._close_complete = False
         # Live RegistrationHandles so close() can mark them closed. WeakSet
         # so handles that drop out of scope first don't pin DistributedWorker.
         self._handles: weakref.WeakSet[Any] = weakref.WeakSet()
@@ -2036,25 +2072,32 @@ class DistributedWorker(Worker):
             raise RuntimeError(f"DistributedWorker.{op}() called after close()")
 
     def close(self) -> None:
-        """Release the Worker and comm rootinfo file. Idempotent."""
-        if self._closed:
+        """Release runtime resources, retrying incomplete Worker cleanup."""
+        if self._close_complete:
             return
-        # Auto-free any DeviceTensors the caller forgot. Run BEFORE we set
-        # ``_closed`` so the per-op ``_require_open`` guard inside ``free``
-        # still admits these calls, and BEFORE we tear down the underlying
-        # worker so the free path is still live.
-        self._close_owned_tensors()
-        self._closed = True
-        # Mark every still-alive RegistrationHandle as closed so subsequent
-        # handle(...) calls raise instead of dispatching to a torn-down runtime.
-        for handle in list(self._handles):
-            handle._mark_closed()
-        self._handles.clear()
+        first_attempt = not self._closed
+        if first_attempt:
+            # Auto-free any DeviceTensors the caller forgot. Run BEFORE we set
+            # ``_closed`` so the per-op ``_require_open`` guard inside ``free``
+            # still admits these calls, and BEFORE we tear down the underlying
+            # worker so the free path is still live.
+            self._close_owned_tensors()
+            self._closed = True
+            # Mark every still-alive RegistrationHandle as closed so subsequent
+            # handle(...) calls raise instead of dispatching to a torn-down runtime.
+            for handle in list(self._handles):
+                handle._mark_closed()
+            self._handles.clear()
         try:
-            self._stop_persistent_dispatcher()
+            if first_attempt:
+                self._stop_persistent_dispatcher()
         finally:
             try:
                 self._w.close()
+                # Recent Simpler versions keep a cleanup journal when close()
+                # fails. Only mark cleanup complete after that journal drains,
+                # so a later close() can retry the underlying Worker.
+                self._close_complete = True
             finally:
                 self._inherited_host_tensors = ()
                 self._inherited_host_storage_ptrs.clear()

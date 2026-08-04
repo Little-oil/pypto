@@ -350,9 +350,15 @@ python -m pypto.runtime.debug.replay build_output/_jit_xxx/ \
     --pmu 2 --swimlane --log-level debug
 ```
 
-`recompile=True` (default) deletes cached `.so`/`.bin` artefacts so
+`recompile=True` (default) force-invalidates cached `.so`/`.bin` artefacts so
 hand-edited cpps are picked up. Pass `recompile=False` (or
-`--no-recompile`) when no cpp changed and you want to skip the rebuild.
+`--no-recompile`) to disable only that forced invalidation. Runtime / PTO-ISA
+compatibility checks still run and may invalidate and rebuild cached artefacts.
+Reuse also requires resolvable runtime and PTO-ISA identities. Runtime source
+checkouts must be clean; an installed runtime may instead use its embedded
+build commit. PTO-ISA currently must be a clean Git checkout. If either
+identity cannot be established, PyPTO fails closed and rebuilds instead of
+trusting the existing binaries.
 `--log-level` accepts the same values as `PYPTO_RUNTIME_LOG`
 (`debug`, `info`, `timing`, `warn`, `error`, `null`); add
 `--log-sync-pypto` to also push the band to PyPTO's C++ logger.

@@ -116,10 +116,11 @@ def replay(
             corresponding host tensors.
         config: Run configuration (platform, device_id, DFX flags, ...).
             Defaults to ``RunConfig()``.
-        recompile: When ``True`` (default), invalidate cached kernel /
+        recompile: When ``True`` (default), force-invalidate cached kernel /
             orchestration binaries via :func:`invalidate_binary_cache` so
-            hand-edited cpps are picked up. Set to ``False`` to reuse
-            cached binaries (faster re-runs when no cpp has been modified).
+            hand-edited cpps are picked up. Set to ``False`` to skip only
+            this forced invalidation. Runtime / PTO-ISA compatibility checks
+            still invalidate and rebuild incompatible cached binaries.
         rebuild_from_pto: When ``True`` (default), before cache
             invalidation, scan ``ptoas/*.pto`` and rerun ``ptoas`` for any
             file newer than its sibling ``ptoas/<unit>.cpp``; the new body
@@ -188,7 +189,7 @@ def replay(
     if recompile:
         invalidate_binary_cache(work_dir)
     else:
-        print("[cpp->.so] reusing cached binaries (recompile=False)")
+        print("[cpp->.so] skipped forced invalidation; compatibility checks still apply (recompile=False)")
 
     print("[execute] running on device...")
     if is_l3:
@@ -328,7 +329,10 @@ def _main(
     parser.add_argument(
         "--no-recompile",
         action="store_true",
-        help="Reuse cached binaries (faster, but ignores cpp edits)",
+        help=(
+            "Skip forced invalidation for cpp edits; runtime/PTO-ISA compatibility "
+            "checks may still rebuild cached binaries"
+        ),
     )
     parser.add_argument(
         "--no-rebuild-from-pto",

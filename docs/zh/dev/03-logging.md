@@ -23,7 +23,7 @@ Diagnostics（`Warning`、`PerfHint`）；各级别在何处触发请参考
 ### 级别
 
 `LogLevel` 是一组较粗的枚举，定义见
-[python/pypto/pypto_core/logging.pyi:18](../../../python/pypto/pypto_core/logging.pyi#L18)：
+[python/pypto/pypto_core/logging.pyi](../../../python/pypto/pypto_core/logging.pyi)：
 
 | 值 | 名称 | 用途 |
 | -- | ---- | ---- |
@@ -63,7 +63,7 @@ python my_program.py
 worker 阶段的所有日志都经此输出。
 
 用户入口位于
-[python/pypto/runtime/log_config.py:38](../../../python/pypto/runtime/log_config.py#L38)：
+[python/pypto/runtime/log_config.py](../../../python/pypto/runtime/log_config.py)：
 
 ```python
 from pypto.runtime import configure_log, log_level
@@ -98,7 +98,7 @@ INFO 与 DEBUG 日志。
 | `sync_pypto` | `bool`，默认 `False` | 为 `True` 时同步把对应 band 的 `LogLevel` 推送给 PyPTO C++ 日志器，便于一个开关同时控制两套子系统 |
 
 `sync_pypto=True` 使用的 band 映射见
-[log_config.py:63-81](../../../python/pypto/runtime/log_config.py#L63-L81)：
+[log_config.py](../../../python/pypto/runtime/log_config.py)：
 
 | runtime 阈值 | PyPTO `LogLevel` |
 | ------------ | ---------------- |
@@ -137,7 +137,7 @@ PYPTO_RUNTIME_LOG=debug PYPTO_RUNTIME_LOG_SYNC=1 python -m my_test
 ## 3. pytest 选项（`tests/st/`）
 
 集成测试 harness 把两套子系统都暴露成命令行参数，定义见
-[tests/st/conftest.py:157-170](../../../tests/st/conftest.py#L157-L170)，
+[tests/st/conftest.py](../../../tests/st/conftest.py)，
 并在 `pytest_configure` 中提前应用，因此 collection 阶段的日志也会
 受影响。
 

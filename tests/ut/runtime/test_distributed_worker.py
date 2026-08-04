@@ -752,17 +752,27 @@ class TestLifecycle:
         rt.close()  # second close is a no-op
         assert patched_setup["worker"].close.call_count == 1
 
-    def test_close_releases_inherited_refs_when_worker_close_raises(self, patched_setup):
+    def test_close_retries_worker_cleanup_after_failure(self, patched_setup):
         compiled = _fake_compiled([_param("weight", [16, 16])], [])
         weight = torch.zeros(16, 16, dtype=torch.float32)
         rt = DistributedWorker(compiled, inherited_host_tensors=[weight])
-        patched_setup["worker"].close.side_effect = RuntimeError("worker close failed")
+        worker = patched_setup["worker"]
+        worker.close.side_effect = [RuntimeError("worker close failed"), None]
 
         with pytest.raises(RuntimeError, match="worker close failed"):
             rt.close()
 
+        assert rt._closed is True
+        assert rt._close_complete is False
         assert rt._inherited_host_tensors == ()
         assert not rt._inherited_host_storage_ptrs
+        with pytest.raises(RuntimeError, match="after close"):
+            rt(DeviceTensor(0x1000, (16, 16), torch.float32))
+
+        rt.close()
+        assert rt._close_complete is True
+        rt.close()  # cleanup completed, so further calls are no-ops
+        assert worker.close.call_count == 2
 
     def test_context_manager_closes(self, patched_setup):
         compiled = _fake_compiled([_param("a", [16, 16])], [])
@@ -907,6 +917,17 @@ class TestOneShotRegression:
 
         assert patched_setup["construct"].call_args.kwargs["enable_sdma"] is True
 
+    def test_one_shot_retries_incomplete_worker_cleanup(self, patched_setup):
+        from pypto.runtime.distributed_runner import execute_distributed  # noqa: PLC0415
+
+        worker = patched_setup["worker"]
+        worker.close.side_effect = [RuntimeError("cleanup pending"), None]
+        compiled = _fake_compiled([_param("a", [8, 8])], [])
+
+        execute_distributed(compiled, [torch.zeros(8, 8, dtype=torch.float32)])
+
+        assert worker.close.call_count == 2
+
 
 class TestWorkerConstruction:
     def test_forwards_enable_sdma_to_simpler_worker(self, monkeypatch):
@@ -924,6 +945,33 @@ class TestWorkerConstruction:
             runtime="tensormap_and_ringbuffer",
             enable_sdma=True,
         )
+
+    def test_failure_preserves_primary_error_when_cleanup_retry_fails(self, patched_setup, caplog):
+        worker = patched_setup["worker"]
+        worker.init.side_effect = RuntimeError("init failed")
+        worker.close.side_effect = [
+            RuntimeError("cleanup pending"),
+            RuntimeError("cleanup still pending"),
+        ]
+        compiled = _fake_compiled([_param("a", [8, 8])], [])
+
+        with pytest.raises(RuntimeError, match="init failed"):
+            DistributedWorker(compiled)
+
+        assert worker.close.call_count == 2
+        assert "Worker cleanup was interrupted or still failed after one retry" in caplog.text
+
+    def test_interrupted_failure_still_retries_cleanup_and_preserves_primary(self, patched_setup, caplog):
+        worker = patched_setup["worker"]
+        worker.init.side_effect = KeyboardInterrupt("init interrupted")
+        worker.close.side_effect = [KeyboardInterrupt("cleanup interrupted"), None]
+        compiled = _fake_compiled([_param("a", [8, 8])], [])
+
+        with pytest.raises(KeyboardInterrupt, match="init interrupted"):
+            DistributedWorker(compiled)
+
+        assert worker.close.call_count == 2
+        assert "Worker cleanup was interrupted or still failed after one retry" in caplog.text
 
 
 class TestExplicitDispatchAPI:
