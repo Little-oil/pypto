@@ -130,8 +130,8 @@ def test_graph_is_a_named_file_scope_function(orch):
 
 def test_boundary_tensors_are_bound_from_the_task_args(orch):
     body = _graph_body(orch)
-    assert "const TaskTensor& a = args.tensor(0).ref();" in body
-    assert "const TaskTensor& c = args.tensor(1).ref();" in body
+    assert "const Tensor& a = args.tensor(0).ref();" in body
+    assert "const Tensor& c = args.tensor(1).ref();" in body
 
 
 def test_boundary_scalars_are_bound_by_reference(orch):
@@ -252,7 +252,7 @@ def test_generated_orchestration_compiles_against_the_pinned_runtime(artifact_ro
     actual types: `rt_submit_graph` takes `void (*)(const GraphTaskArgs&)` and
     `GraphTaskArgs` is a different `Arg` instantiation from `CoreTaskArgs`, while
     `args.tensor(i).ref()` yields `const simpler::hbg::Tensor&` (aliased
-    `TaskTensor`). Emitting `CoreTaskArgs` or a boundary tensor type there is a
+    `Tensor`). Emitting `CoreTaskArgs` or a boundary tensor type there is a
     hard compile error in the generated file that a string assertion happily
     confirms instead of catching.
     """

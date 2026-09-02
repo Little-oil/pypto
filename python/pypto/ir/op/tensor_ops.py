@@ -1877,7 +1877,7 @@ def view(
     PTO in-core lowering. Only orchestration lowering is restricted: it supports
     ND shape reinterprets and shaped ND/MX_A_ZZ/MX_B_NN backing/consumer views
     for FP8E8M0 MX scales; other layout-changing shape reinterprets are
-    unsupported because the runtime ``TaskTensor::reshape`` cannot express an
+    unsupported because the runtime ``Tensor::reshape`` cannot express an
     arbitrary-layout view.
 
     Args:
