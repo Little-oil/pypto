@@ -131,7 +131,7 @@ def preprocess_ptoas_output(content: str) -> str:
     # (simpler#1681), split it in two (simpler#1974) so the 72-byte
     # ``ChipTensor`` is only the argument as it arrives at the boundary, and
     # then named the descriptor a kernel actually reads ``Tensor`` in the
-    # per-runtime ``tensor.h`` shim (simpler#2044), retiring ``TaskTensor``.
+    # per-runtime ``tensor.h`` shim (simpler#2044), retiring ``Tensor``.
     result = re.sub(
         r'(?:extern\s*"C"\s*)?(?:__global__\s+)?AICORE\s+void',
         "static __aicore__ void",

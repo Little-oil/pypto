@@ -220,28 +220,33 @@ def test_artifact_targets_the_graph_runtime(artifacts):
 def _runtime_include_args(repo_root: Path) -> list[str]:
     """``-I`` flags for the a2a3 host_build_graph orchestration headers.
 
-    Every directory holding a header, minus ``tensormap_and_ringbuffer``: the two
-    runtimes ship same-named headers (``types.h``, ``runtime_status.h``), so
-    leaving the other one on the path lets it shadow the one under test. The
-    tree roots come last, for the includes spelled with a directory prefix
-    (``common/host_phase_kind.h``, ``host_build_graph/graph_cache.h``).
+    The same directories, in the same order, that simpler's own kernel compiler
+    puts on an orchestration TU: ``get_orchestration_include_dirs`` followed by
+    the runtime's ``build_config`` ``orchestration.include_dirs``. Handing the
+    compiler every directory that holds a header instead lets a runtime that is
+    not under test shadow the one that is -- ``common/hierarchical/types.h``
+    wins over ``host_build_graph/types.h`` and drags in
+    ``task_interface/buffer.h``, whose global ``Tensor`` then collides with the
+    runtime's own ``Tensor`` alias. The tree root comes last, for the includes
+    spelled with a directory prefix (``common/host_phase_kind.h``).
     """
     src = repo_root / "runtime" / "src"
-    dirs = sorted(
-        {
-            header.parent
-            for tree in ("common", "a2a3")
-            for header in (src / tree).rglob("*.h")
-            if "tensormap_and_ringbuffer" not in header.parts
-        }
-    )
-    roots = [
-        src / "common" / "platform" / "include",
-        src / "a2a3" / "platform" / "include",
-        src / "common",
-        src,
+    runtime_dir = src / "a2a3" / "runtime" / "host_build_graph"
+    return [
+        f"-I{path}"
+        for path in (
+            runtime_dir / "runtime",
+            runtime_dir / "orchestration",
+            runtime_dir / "common",
+            src / "a2a3" / "runtime",
+            src / "common" / "host_build_graph",
+            src / "common" / "task_interface",
+            src / "common",
+            src / "a2a3" / "platform" / "include",
+            src / "common" / "platform" / "include",
+            src,
+        )
     ]
-    return [f"-I{path}" for path in [*dirs, *roots]]
 
 
 def test_generated_orchestration_compiles_against_the_pinned_runtime(artifact_root):

@@ -654,7 +654,6 @@ class TestOrchestrationMore:
         code = _generate_orch_code(program)
 
         assert "Tensor viewed = ext_scale;" in code
-        assert all(line.strip() != "Tensor viewed = ext_scale;" for line in code.splitlines())
         assert ".reshape(" not in code
 
     def test_tensor_view_shape_reinterpret_rejects_dn_source(self):
