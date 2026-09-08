@@ -251,6 +251,9 @@ void OpConversionRegistry::RegisterScalarAndUnaryOps() {
   RegisterSimple("tensor.abs", "tile.abs");
   RegisterSimple("tensor.recip", "tile.recip");
   RegisterSimple("tensor.exp", "tile.exp");
+  RegisterSimple("tensor.pow", "tile.pow");
+  RegisterSimple("tensor.mean", "tile.mean");
+  RegisterSimple("tensor.clamp", "tile.clamp");
   RegisterSimple("tensor.log", "tile.log");
   RegisterSimple("tensor.sin", "tile.sin");
   RegisterSimple("tensor.cos", "tile.cos");

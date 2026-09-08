@@ -53,6 +53,8 @@ _SHAPE_CANDIDATES = ([64, 32], [64, 1], [1, 32])
 # be neutral: they must not themselves depend on a tile operand's extent, or the probe would read the
 # kwarg's influence as the operand's.
 _KWARGS: dict[str, dict] = {
+    "tile.pow": {"exponent": 2.0},
+    "tile.clamp": {"min": 0.0},
     "tile.cast": {"target_type": DataType.INT32, "mode": 0},
     "tile.cmp": {"cmp_type": 0},
     "tile.gather_compare": {"cmp_mode": 0, "out_cols": 32},

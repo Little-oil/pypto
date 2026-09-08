@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <any>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -22,6 +23,9 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_config.h"
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/comm.h"
@@ -34,6 +38,7 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/mutator.h"
+#include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
@@ -2456,7 +2461,7 @@ ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>
 }
 
 // ----------------------------------------------------------------------------
-// Composite-op dispatch table.
+// Composite-op recipes and dispatch table.
 //
 // ``LowerCompositeOps`` is a generic dispatcher: it rewrites a ``var = Call(...)``
 // AssignStmt (or a composite-op Call embedded directly in a ReturnStmt) only
@@ -2470,8 +2475,8 @@ ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>
 // total credit count it issued so the signal returns to all-zero after the
 // call.
 //
-// Today the rules are ``tile.sin`` / ``tile.cos``, ``tile.tquant_mx``, and
-// ``pld.tensor.*`` distributed collectives. Host-level allreduce is skipped here
+// Rules include standalone math recipes, ``tile.sin`` / ``tile.cos``,
+// ``tile.tquant_mx``, and ``pld.tensor.*`` collectives. Host allreduce is skipped here
 // and lowered later by LowerHostTensorCollectives. The pass is idempotent
 // provided each rule emits only ops not listed here.
 //
@@ -2479,10 +2484,166 @@ ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>
 // translation unit — promote this back to a standalone registry under
 // ``src/ir/transforms/composite_ops/``.
 // ----------------------------------------------------------------------------
+// Standalone math recipes bind every intermediate once so shared reductions
+// and their scratch allocations are not duplicated.
+class BasicMathRecipe {
+ public:
+  BasicMathRecipe(LoweringBuilder& builder, const Span& span) : builder_(builder), span_(span) {}
+
+  ExprPtr Op(const std::string& name, const std::vector<ExprPtr>& args,
+             const std::vector<std::pair<std::string, std::any>>& kwargs = {}) {
+    return builder_.Bind("math", OpRegistry::GetInstance().Create(name, args, kwargs, span_), span_);
+  }
+
+  ExprPtr Constant(double value, DataType dtype = DataType::FP32) const {
+    return std::make_shared<ConstFloat>(value, dtype, span_);
+  }
+
+  ExprPtr Scratch(const ExprPtr& input) {
+    const auto type = As<TileType>(input->GetType());
+    INTERNAL_CHECK_SPAN(type, span_) << "Internal error: math recipe requires a tile";
+    return Op("tile.create", {tile_conversion_utils::MakeShapeTuple(type->shape_, span_)},
+              {{"dtype", DataType(DataType::FP32)}, {"target_memory", MemorySpace::Vec}});
+  }
+
+  ExprPtr Reshape(const ExprPtr& input, const std::vector<ExprPtr>& shape) {
+    return Op("tile.reshape", {input, tile_conversion_utils::MakeShapeTuple(shape, span_)});
+  }
+
+ private:
+  LoweringBuilder& builder_;
+  const Span& span_;
+};
+
+ExprPtr LowerBasicMathRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b) {
+  const auto input_type = As<TileType>(args[0]->GetType());
+  INTERNAL_CHECK_SPAN(input_type, call->span_) << "Internal error: math recipe requires TileType";
+  BasicMathRecipe r(b, call->span_);
+  ExprPtr input = args[0];
+  TileView input_view;
+  InheritTileViewLayout(input_view, input_type);
+  const bool column_major = input_view.blayout == TileLayout::col_major;
+  const bool is_mean = IsOp(call, "tile.mean");
+  const bool is_pow = IsOp(call, "tile.pow");
+  const double exponent = is_pow ? GetKwargOr<double>(call->kwargs_, "exponent", 1.0) : 1.0;
+  const bool fill_pow_zero = is_pow && exponent == 0.0;
+  int mean_axis = is_mean ? GetKwargOr<int>(call->kwargs_, "axis", -1) : 0;
+  if (mean_axis < 0) mean_axis += 2;
+  const bool transpose_mean = is_mean && column_major;
+  const bool row_reduce = (transpose_mean ? 1 - mean_axis : mean_axis) == 1;
+  if (transpose_mean) input = r.Op("tile.transpose_view", {input});
+  if (is_mean) {
+    const auto normalized_type = As<TileType>(input->GetType());
+    auto padded_shape = normalized_type->shape_;
+    const int64_t block = 32 / input_type->dtype_.GetByte();
+    for (size_t axis = 0; axis < 2; ++axis) {
+      if (axis == 0 && !row_reduce) continue;
+      if (const auto extent = As<ConstInt>(padded_shape[axis]); extent && extent->value_ % block != 0) {
+        padded_shape[axis] = std::make_shared<ConstInt>(((extent->value_ + block - 1) / block) * block,
+                                                        DataType::INDEX, call->span_);
+      }
+    }
+    if (!AreExprVectorsEqual(padded_shape, normalized_type->shape_)) {
+      // Pad before either cast or reduction allocates an undersized vector.
+      // Restore validity immediately so neither padding nor the divisor can
+      // change the logical mean. The public tile type retains padded physical
+      // storage and exposes the original logical result through valid_shape.
+      const auto valid = GetValidShape(normalized_type);
+      input = r.Op("tile.fillpad_expand",
+                   {input, tile_conversion_utils::MakeShapeTuple(padded_shape, call->span_)},
+                   {{"pad_value", PadValue::zero}});
+      input = r.Op("tile.set_validshape", {input, valid[0], valid[1]});
+    }
+  }
+  if (input_type->dtype_ != DataType::FP32 && !fill_pow_zero) {
+    input = r.Op("tile.cast", {input}, {{"target_type", DataType(DataType::FP32)}, {"mode", 0}});
+  }
+  ExprPtr result = input;
+  bool transpose_result = false;
+  if (is_pow) {
+    if (exponent == 0.0) {
+      // A real fill, not x*0+1: 0**0 and NaN**0 are both 1. Fill in
+      // row-major order, then express validity/layout through real view ops,
+      // so passes that re-deduce allocations cannot lose that metadata.
+      auto shape = input_type->shape_;
+      auto valid = GetValidShape(input_type);
+      transpose_result = column_major && shape.size() == 2;
+      if (transpose_result) {
+        std::swap(shape[0], shape[1]);
+        std::swap(valid[0], valid[1]);
+      }
+      const auto result_shape = shape;
+      // Validity is expressed by the real 2D set_validshape operation; an ND
+      // slice is not a supported input to FlattenTileNdTo2D. Merge complete
+      // physical rows before filling, then restore the public logical rank.
+      if (shape.size() != 2) {
+        ExprPtr rows = std::make_shared<ConstInt>(1, DataType::INDEX, call->span_);
+        for (size_t i = 0; i + 1 < shape.size(); ++i) {
+          rows = tile_conversion_utils::MakeCanonicalIndexMul(rows, shape[i], call->span_, "pow");
+        }
+        const std::vector<ExprPtr> flat_shape = {rows, shape.back()};
+        valid = ComputeReshapeValidShape(valid, shape, flat_shape, true, call->span_, "pow");
+        shape = flat_shape;
+      }
+      const auto shape_tuple = tile_conversion_utils::MakeShapeTuple(shape, call->span_);
+      result = r.Op("tile.full", {shape_tuple, r.Constant(1.0, input_type->dtype_)},
+                    {{"dtype", input_type->dtype_}});
+      if (!AreExprVectorsEqual(shape, valid)) {
+        result = r.Op("tile.set_validshape", {result, valid[0], valid[1]});
+      }
+      if (result_shape.size() != 2) result = r.Reshape(result, result_shape);
+    } else if (std::floor(exponent) == exponent) {
+      // Exponentiation by squaring is bounded by 31 steps by the public
+      // exponent contract, and preserves the sign of negative bases.
+      uint64_t power = static_cast<uint64_t>(std::abs(exponent));
+      ExprPtr factor = input;
+      if (exponent < 0) factor = r.Op("tile.recip", {factor});
+      result = nullptr;
+      while (power != 0) {
+        if (power & 1) result = result ? r.Op("tile.mul", {result, factor}) : factor;
+        power >>= 1;
+        if (power != 0) factor = r.Op("tile.mul", {factor, factor});
+      }
+    } else {
+      const auto logarithm = r.Op("tile.log", {input});
+      result = r.Op("tile.exp", {r.Op("tile.muls", {logarithm, r.Constant(exponent)})});
+    }
+  } else if (IsOp(call, "tile.clamp")) {
+    // Applying the lower bound first intentionally makes min > max produce max.
+    for (const auto* bound : {"min", "max"}) {
+      for (const auto& kwarg : call->kwargs_) {
+        const auto& key = kwarg.first;
+        if (key != bound) continue;
+        result = r.Op(key == "min" ? "tile.maximums" : "tile.minimums",
+                      {result, r.Constant(GetKwargOr<double>(call->kwargs_, key, 0.0))});
+      }
+    }
+  } else {
+    INTERNAL_CHECK_SPAN(IsOp(call, "tile.mean"), call->span_) << "Internal error: unknown basic math recipe";
+    const auto count = As<ConstInt>(GetValidShape(input_type)[mean_axis]);
+    INTERNAL_CHECK_SPAN(count && count->value_ > 0, call->span_)
+        << "Internal error: mean requires a positive static reduction count";
+    transpose_result = mean_axis == 1;
+    result = row_reduce ? r.Op("tile.row_sum", {input, r.Scratch(input)}) : r.Op("tile.col_sum", {input});
+    // Scalar vector instructions require contiguous rows. The row sum's
+    // column-major [M,1] becomes row-major [1,M] without moving data.
+    if (row_reduce) result = r.Op("tile.transpose_view", {result});
+    result = r.Op("tile.muls", {result, r.Constant(1.0 / static_cast<double>(count->value_))});
+  }
+  if (input_type->dtype_ != DataType::FP32 && !fill_pow_zero) {
+    result = r.Op("tile.cast", {result}, {{"target_type", input_type->dtype_}, {"mode", 1}});
+  }
+  if (transpose_result) result = r.Op("tile.transpose_view", {result});
+  return result;
+}
+
 CompositeLoweringFn LookupCompositeRule(const std::string& op_name) {
   static const std::unordered_map<std::string, CompositeLoweringFn> kRules = {
       {"tile.sin", &LowerSinRule},
       {"tile.cos", &LowerCosRule},
+      {"tile.pow", &LowerBasicMathRule},
+      {"tile.mean", &LowerBasicMathRule},
+      {"tile.clamp", &LowerBasicMathRule},
       // tile.tquant_mx → tile.tquant_mx_raw + tile.tmov_x2zz (value-returning SSA).
       // Scratch tiles are created with MemorySpace::Vec before InferTileMemorySpace.
       {"tile.tquant_mx", &LowerTileTQuantMxRule},
@@ -2627,7 +2788,10 @@ class LowerCompositeOpsMutator : public IRMutator {
         // continues to hold a Var (matches the SSA invariant the rest of the
         // pipeline expects). The Bind appends to the same builder, so a single
         // TakeStmts() drains the rule's prelude + the result binding.
-        auto result_var = builder.Bind("result", decomposed, call->span_);
+        // Keep a multi-result recipe in the same tuple form used by the
+        // assignment lowering; rebinding it would only be folded on pass 2.
+        auto result_var =
+            As<MakeTuple>(decomposed) ? decomposed : builder.Bind("result", decomposed, call->span_);
         for (auto& s : builder.TakeStmts()) prelude.push_back(std::move(s));
         new_values.push_back(result_var);
         changed = true;

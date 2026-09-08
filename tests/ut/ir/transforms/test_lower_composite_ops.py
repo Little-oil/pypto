@@ -66,6 +66,65 @@ def _collect_op_names(prog) -> list[str]:
     return collector.op_names
 
 
+def test_pow_square_lowers_to_multiply():
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def square(self, x: pl.Tile[[16, 32], pl.FP32]) -> pl.Tile[[16, 32], pl.FP32]:
+            y = pl.pow(x, 2)
+            return y
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.InCore)
+        def square(self, x: pl.Tile[[16, 32], pl.FP32]) -> pl.Tile[[16, 32], pl.FP32]:
+            product = pl.mul(x, x)
+            y = product
+            return y
+
+    ir.assert_structural_equal(passes.lower_composite_ops()(Before), Expected)
+
+
+def test_clamp_lowers_to_scalar_minimum_and_maximum():
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def clamp(self, x: pl.Tile[[16, 32], pl.FP32]) -> pl.Tile[[16, 32], pl.FP32]:
+            y = pl.clamp(x, -1, 1)
+            return y
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.InCore)
+        def clamp(self, x: pl.Tile[[16, 32], pl.FP32]) -> pl.Tile[[16, 32], pl.FP32]:
+            lower = pl.maximum(x, -1.0)
+            upper = pl.minimum(lower, 1.0)
+            y = upper
+            return y
+
+    ir.assert_structural_equal(passes.lower_composite_ops()(Before), Expected)
+
+
+def test_mean_positional_axis_lowers_to_column_sum():
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def mean(self, x: pl.Tile[[16, 32], pl.FP32]) -> pl.Tile[[1, 32], pl.FP32]:
+            y = pl.mean(x, 0)
+            return y
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.InCore)
+        def mean(self, x: pl.Tile[[16, 32], pl.FP32]) -> pl.Tile[[1, 32], pl.FP32]:
+            total = pl.tile.col_sum(x)
+            scaled = pl.mul(total, 0.0625)
+            y = scaled
+            return y
+
+    ir.assert_structural_equal(passes.lower_composite_ops()(Before), Expected)
+
+
 def test_lower_composite_ops_pass_factory_exists():
     """The factory returns a Pass instance with the expected name."""
     p = passes.lower_composite_ops()

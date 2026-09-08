@@ -101,6 +101,9 @@ WINDOW_REJECT_BY_DESIGN = {
 
 #: Operators whose deducer accepts a window today. Keep this list growing, never shrinking.
 WINDOW_OK = _ops(
+    "tensor.pow",
+    "tensor.mean",
+    "tensor.clamp",
     # element-wise / unary / scalar-rhs (relaxed by issue #1694)
     "tensor.abs",
     "tensor.add",
@@ -274,6 +277,13 @@ _COL_CARRIER = partial(T, shape=(1, 32))
 
 for _n in _UNARY:
     PROBES[ir.get_op(f"tensor.{_n}").name] = _probe(getattr(t, _n), W)
+PROBES.update(
+    {
+        ir.get_op("tensor.pow").name: lambda: t.pow(W(), 2),
+        ir.get_op("tensor.mean").name: lambda: t.mean(W()),
+        ir.get_op("tensor.clamp").name: lambda: t.clamp(W(), min=0),
+    }
+)
 for _n in _BINARY:
     PROBES[ir.get_op(f"tensor.{_n}").name] = _probe(getattr(t, _n), W, T)
 for _n in _SCALAR_RHS:

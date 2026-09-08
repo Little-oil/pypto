@@ -19,6 +19,9 @@ from collections.abc import Sequence
 from typing import Any, Literal, NoReturn, TypeVar, overload
 
 __all__ = [
+    "pow",
+    "mean",
+    "clamp",
     "add",
     "sub",
     "mul",
@@ -554,6 +557,77 @@ def minimum(lhs, rhs):
     if isinstance(lhs, Tile) and isinstance(rhs, (int, float, Scalar, _ir_core.Expr)):
         return _tile.minimums(lhs, rhs)
     _raise_type_dispatch_error("minimum", lhs, rhs)
+
+
+def pow(input: T, exponent: int | float) -> T:
+    """Raise each element to a compile-time scalar exponent.
+
+    Accepts FP16/FP32, computes in FP32 and returns the input dtype.
+    Preserves the input shape and valid region. The exponent must be finite
+    with absolute value at most 2**31 - 1. Integer exponents support negative
+    bases; fractional exponents require strictly positive bases. Negative
+    exponents require nonzero bases.
+
+    Args:
+        input: Input tensor or tile.
+        exponent: Compile-time integer or floating-point scalar exponent.
+
+    Returns:
+        Result tensor or tile with the input dtype.
+    """
+    if isinstance(input, Tensor):
+        return _tensor.pow(input, exponent=exponent)
+    if isinstance(input, Tile):
+        return _tile.pow(input, exponent=exponent)
+    raise TypeError(f"pl.pow: expected Tensor or Tile, got {type(input).__name__}")
+
+
+def mean(input: T, axis: int = -1) -> T:
+    """Average the valid elements along one axis, retaining that dimension.
+
+    Requires nonempty rank-2 FP16/FP32 input. Accumulates in FP32 and returns the input
+    dtype. The reduced axis must have a positive static valid extent; padding
+    does not contribute to the sum or divisor. The reduced dimension becomes
+    one and the non-reduced valid extent is unchanged. Tensor results preserve
+    the non-reduced shape. Tile results round that physical extent up to a
+    multiple of 32 / sizeof(dtype): 16 elements for FP16, 8 for FP32, without
+    enlarging the logical valid region.
+
+    Args:
+        input: Input tensor or tile.
+        axis: Axis to reduce: 0 or -2 for rows, 1 or -1 for columns.
+
+    Returns:
+        Result tensor or tile with the input dtype.
+    """
+    if isinstance(input, Tensor):
+        return _tensor.mean(input, axis=axis)
+    if isinstance(input, Tile):
+        return _tile.mean(input, axis=axis)
+    raise TypeError(f"pl.mean: expected Tensor or Tile, got {type(input).__name__}")
+
+
+def clamp(input: T, min: int | float | None = None, max: int | float | None = None) -> T:
+    """Clamp each element between optional compile-time scalar bounds.
+
+    Accepts FP16/FP32, computes in FP32 and returns the input dtype.
+    Preserves the input shape and valid region. At least one bound is required;
+    provided bounds must be finite and representable in FP32. Applies the
+    lower bound first and upper bound second, so min > max produces max.
+
+    Args:
+        input: Input tensor or tile.
+        min: Optional inclusive lower bound.
+        max: Optional inclusive upper bound.
+
+    Returns:
+        Result tensor or tile with the input dtype.
+    """
+    if isinstance(input, Tensor):
+        return _tensor.clamp(input, min=min, max=max)
+    if isinstance(input, Tile):
+        return _tile.clamp(input, min=min, max=max)
+    raise TypeError(f"pl.clamp: expected Tensor or Tile, got {type(input).__name__}")
 
 
 def exp(input: T) -> T:

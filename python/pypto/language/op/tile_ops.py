@@ -20,6 +20,9 @@ from collections.abc import Sequence
 from typing import Any, Literal, TypeVar, overload
 
 __all__ = [
+    "pow",
+    "mean",
+    "clamp",
     "MemRefType",
     "alloc",
     "create_tile",
@@ -1160,6 +1163,64 @@ def neg(tile: Tile) -> Tile:
     """
     call_expr = _ir_ops.neg(tile.unwrap())
     return Tile(expr=call_expr)
+
+
+def pow(input: Tile, exponent: int | float) -> Tile:
+    """Raise each element to a compile-time scalar exponent.
+
+    Accepts FP16/FP32, computes in FP32 and returns the input dtype.
+    Preserves the input shape and valid region. The exponent must be finite
+    with absolute value at most 2**31 - 1. Integer exponents support negative
+    bases; fractional exponents require strictly positive bases. Negative
+    exponents require nonzero bases.
+
+    Args:
+        input: Input tile.
+        exponent: Compile-time integer or floating-point scalar exponent.
+
+    Returns:
+        Result tile with the input dtype.
+    """
+    return Tile(expr=_ir_ops.pow(input.unwrap(), exponent=exponent))
+
+
+def mean(input: Tile, axis: int = -1) -> Tile:
+    """Average the valid elements along one axis, retaining that dimension.
+
+    Requires nonempty rank-2 FP16/FP32 input. Accumulates in FP32 and returns the input
+    dtype. The reduced axis must have a positive static valid extent; padding
+    does not contribute to the sum or divisor. The reduced dimension becomes
+    one. The non-reduced physical extent is rounded up to a multiple of
+    32 / sizeof(dtype): 16 elements for FP16, 8 for FP32. Its valid extent is
+    unchanged, so this physical padding does not enlarge the logical result.
+
+    Args:
+        input: Input tile.
+        axis: Axis to reduce: 0 or -2 for rows, 1 or -1 for columns.
+
+    Returns:
+        Result tile with the input dtype.
+    """
+    return Tile(expr=_ir_ops.mean(input.unwrap(), axis=axis))
+
+
+def clamp(input: Tile, min: int | float | None = None, max: int | float | None = None) -> Tile:
+    """Clamp each element between optional compile-time scalar bounds.
+
+    Accepts FP16/FP32, computes in FP32 and returns the input dtype.
+    Preserves the input shape and valid region. At least one bound is required;
+    provided bounds must be finite and representable in FP32. Applies the
+    lower bound first and upper bound second, so min > max produces max.
+
+    Args:
+        input: Input tile.
+        min: Optional inclusive lower bound.
+        max: Optional inclusive upper bound.
+
+    Returns:
+        Result tile with the input dtype.
+    """
+    return Tile(expr=_ir_ops.clamp(input.unwrap(), min=min, max=max))
 
 
 def exp(tile: Tile) -> Tile:

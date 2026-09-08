@@ -401,6 +401,32 @@ _COL_EXPAND_OPS = [
 ]
 
 
+def test_basic_math_tensor_to_tile_conversion():
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def math(self, x: pl.Tensor[[16, 32], pl.FP32]) -> pl.Tensor[[16, 1], pl.FP32]:
+            squared = pl.pow(x, exponent=2)
+            bounded = pl.clamp(squared, min=0, max=4)
+            average = pl.mean(bounded)
+            return average
+
+    @pl.program
+    class Expected:
+        @pl.function(type=pl.FunctionType.InCore)
+        def math(
+            self, x: pl.Tensor[[16, 32], pl.FP32], out_0: pl.Out[pl.Tensor[[16, 1], pl.FP32]]
+        ) -> pl.Tensor[[16, 1], pl.FP32]:
+            x_tile = pl.load(x, [0, 0], [16, 32])
+            squared = pl.tile.pow(x_tile, exponent=2)
+            bounded = pl.tile.clamp(squared, min=0, max=4)
+            average = pl.tile.mean(bounded)
+            result = pl.store(average, [0, 0], out_0)
+            return result
+
+    ir.assert_structural_equal(passes.convert_tensor_to_tile_ops()(Before), Expected)
+
+
 class TestConvertTensorToTileOps:
     """Test ConvertTensorToTileOps pass."""
 

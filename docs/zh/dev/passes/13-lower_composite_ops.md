@@ -28,6 +28,24 @@ host-orchestrator 中的 `pld.tensor.allreduce` 调用会跳过本 Pass：`Synth
 
 ## 架构 (Architecture)
 
+### 独立数学算子规则
+
+`pow`、`mean`、`clamp` 是独立的 tensor/tile API。中间运算使用 FP32，
+结果保留 FP16/FP32 输入 dtype；`sqrt` 复用现有基础算子。
+
+- `pow(x, exponent)` 的整数指数使用平方求幂，负指数先将底数取倒数；分数指数使用
+  `exp(exponent * log(x))`，要求底数严格为正。指数是有限的编译期标量，
+  绝对值不超过 `2**31 - 1`。
+- `mean(x, axis=-1)` 选择行或列求和，再除以规约轴上正的静态有效长度；
+  不计入 padding，使用 FP32 累加，规约维度保留为一。仅支持非空 rank-2 和 `0/1/-1/-2` 轴。
+  Tile 结果保留物理 padding：非规约轴长度向上对齐到 32 / sizeof(dtype) 的倍数
+  （16 个 FP16 / 8 个 FP32 元素），其有效长度和除数不变，规约轴长度仍为一；
+  Tensor 结果 shape 不引入该 padding，不再用最终切片缩窄 padded Tile 分配。
+- `clamp(x, min=None, max=None)` 先做标量 maximum，再做标量 minimum；
+  至少提供一个有限且 FP32 可表示的边界，下界大于上界时结果为上界。
+
+### Builder 与分发
+
 本 Pass 是单个翻译单元 (translation unit)，即 `src/ir/transforms/lower_composite_ops_pass.cpp`：
 
 ```text

@@ -45,6 +45,7 @@
 | 算子 | 可达 | 作用 |
 | ---- | ---- | ---- |
 | [`exp`][pypto.language.exp] [`log`][pypto.language.log] | `pl.` | 指数、自然对数 |
+| [`pow`][pypto.language.pow] | `pl.` | FP32 中间运算的标量幂；整数指数支持负底数，分数指数要求正底数 |
 | [`sqrt`][pypto.language.sqrt] [`rsqrt`][pypto.language.rsqrt] | `pl.` | 平方根；倒数平方根。`high_precision=` 只作用于张量路径，传给 Tile 会**抛异常** —— tile 级的精度由是否传入 scratch tile 决定：`pl.tile.rsqrt(src, tmp)` |
 | [`sin`][pypto.language.tensor.sin] [`cos`][pypto.language.tensor.cos] | `pl.` | 三角函数 |
 
@@ -54,6 +55,7 @@
 | ---- | ---- | ---- |
 | [`cmp`][pypto.language.cmp] [`cmps`][pypto.language.tile.cmps] | `pl.` | 比较两个操作数 / 操作数与标量 |
 | [`maximum`][pypto.language.maximum] [`minimum`][pypto.language.minimum] | `pl.` | 两个操作数的逐元素最大 / 最小 |
+| [`clamp`][pypto.language.clamp] | `pl.` | FP16/FP32 裁剪，至少提供一个有限且 FP32 可表示的标量边界；先应用下界再应用上界 |
 | [`maximums`][pypto.language.tile.maximums] [`minimums`][pypto.language.tile.minimums] | `pl.` (t) | 与标量的逐元素最大 / 最小 |
 | [`max`][pypto.language.tile.max] [`min`][pypto.language.tile.min] | `pl.` (t) | 两个标量取最大 / 最小 —— **不是** tile 规约。规约 tile 请用 `row_max` / `col_max`（以及对应的 `min` 形式） |
 | [`sel`][pypto.language.tile.sel] [`sels`][pypto.language.tile.sels] | `pl.` (t) | 按掩码选择，张量与标量形式 |
@@ -81,6 +83,7 @@
 | 算子 | 可达 | 作用 |
 | ---- | ---- | ---- |
 | [`row_sum`][pypto.language.row_sum] [`row_prod`][pypto.language.row_prod] [`row_max`][pypto.language.row_max] [`row_min`][pypto.language.row_min] | `pl.` | 沿行规约 |
+| [`mean`][pypto.language.mean] | `pl.` | 对非空 rank-2 FP16/FP32 有效区域求均值，FP32 累加；`axis=0/1/-1/-2`，保留规约维度 |
 | [`col_sum`][pypto.language.col_sum] [`col_prod`][pypto.language.col_prod] [`col_max`][pypto.language.col_max] [`col_min`][pypto.language.col_min] | `pl.` | 沿列规约 |
 | [`row_argmax`][pypto.language.row_argmax] [`row_argmin`][pypto.language.row_argmin] | `pl.` | 行极值的下标 |
 | [`col_argmax`][pypto.language.col_argmax] [`col_argmin`][pypto.language.col_argmin] | `pl.` | 列极值的下标 |

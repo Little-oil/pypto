@@ -18,6 +18,9 @@ from collections.abc import Sequence
 from typing import Any, TypeVar, overload
 
 __all__ = [
+    "pow",
+    "mean",
+    "clamp",
     "create_tensor",
     "create",
     "no_dep",
@@ -1756,6 +1759,62 @@ def expand_clone(src: Tensor, target: Tensor) -> Tensor:
     target_expr = target.unwrap()
     call_expr = _ir_ops.expand_clone(src_expr, target_expr)
     return Tensor(expr=call_expr)
+
+
+def pow(input: Tensor, exponent: int | float) -> Tensor:
+    """Raise each element to a compile-time scalar exponent.
+
+    Accepts FP16/FP32, computes in FP32 and returns the input dtype.
+    Preserves the input shape and valid region. The exponent must be finite
+    with absolute value at most 2**31 - 1. Integer exponents support negative
+    bases; fractional exponents require strictly positive bases. Negative
+    exponents require nonzero bases.
+
+    Args:
+        input: Input tensor.
+        exponent: Compile-time integer or floating-point scalar exponent.
+
+    Returns:
+        Result tensor with the input dtype.
+    """
+    return Tensor(expr=_ir_ops.pow(input.unwrap(), exponent=exponent))
+
+
+def mean(input: Tensor, axis: int = -1) -> Tensor:
+    """Average the valid elements along one axis, retaining that dimension.
+
+    Requires nonempty rank-2 FP16/FP32 input. Accumulates in FP32 and returns the input
+    dtype. The reduced axis must have a positive static valid extent; padding
+    does not contribute to the sum or divisor. The reduced dimension becomes
+    one and the other dimension preserves its physical and valid extent.
+
+    Args:
+        input: Input tensor.
+        axis: Axis to reduce: 0 or -2 for rows, 1 or -1 for columns.
+
+    Returns:
+        Result tensor with the input dtype.
+    """
+    return Tensor(expr=_ir_ops.mean(input.unwrap(), axis=axis))
+
+
+def clamp(input: Tensor, min: int | float | None = None, max: int | float | None = None) -> Tensor:
+    """Clamp each element between optional compile-time scalar bounds.
+
+    Accepts FP16/FP32, computes in FP32 and returns the input dtype.
+    Preserves the input shape and valid region. At least one bound is required;
+    provided bounds must be finite and representable in FP32. Applies the
+    lower bound first and upper bound second, so min > max produces max.
+
+    Args:
+        input: Input tensor.
+        min: Optional inclusive lower bound.
+        max: Optional inclusive upper bound.
+
+    Returns:
+        Result tensor with the input dtype.
+    """
+    return Tensor(expr=_ir_ops.clamp(input.unwrap(), min=min, max=max))
 
 
 def exp(input: Tensor) -> Tensor:

@@ -50,6 +50,7 @@ See [Memory and Data Movement](../language/03-memory.md) for which moves are leg
 | Operator | Reach | What it does |
 | -------- | ----- | ------------ |
 | [`exp`][pypto.language.exp] [`log`][pypto.language.log] | `pl.` | Exponential, natural logarithm |
+| [`pow`][pypto.language.pow] | `pl.` | Scalar power in FP32; integer exponents support negative bases, fractional exponents require positive bases |
 | [`sqrt`][pypto.language.sqrt] [`rsqrt`][pypto.language.rsqrt] | `pl.` | Square root; reciprocal square root. `high_precision=` is tensor-only and **raises** on a Tile — at tile level precision is selected by passing the scratch tile to `pl.tile.rsqrt(src, tmp)` |
 | [`sin`][pypto.language.tensor.sin] [`cos`][pypto.language.tensor.cos] | `pl.` | Trigonometric |
 
@@ -59,6 +60,7 @@ See [Memory and Data Movement](../language/03-memory.md) for which moves are leg
 | -------- | ----- | ------------ |
 | [`cmp`][pypto.language.cmp] [`cmps`][pypto.language.tile.cmps] | `pl.` | Compare two operands / operand against a scalar |
 | [`maximum`][pypto.language.maximum] [`minimum`][pypto.language.minimum] | `pl.` | Elementwise max / min of two operands |
+| [`clamp`][pypto.language.clamp] | `pl.` | FP16/FP32 clipping with at least one finite FP32-representable scalar bound; lower bound is applied before upper bound |
 | [`maximums`][pypto.language.tile.maximums] [`minimums`][pypto.language.tile.minimums] | `pl.` (t) | Elementwise max / min against a scalar |
 | [`max`][pypto.language.tile.max] [`min`][pypto.language.tile.min] | `pl.` (t) | Scalar max / min of two values — **not** a tile reduction. To reduce a tile use `row_max` / `col_max` (and the `min` forms) |
 | [`sel`][pypto.language.tile.sel] [`sels`][pypto.language.tile.sels] | `pl.` (t) | Select by mask, tensor and scalar forms |
@@ -86,6 +88,7 @@ Row reductions collapse the last axis; column reductions collapse the first.
 | Operator | Reach | What it does |
 | -------- | ----- | ------------ |
 | [`row_sum`][pypto.language.row_sum] [`row_prod`][pypto.language.row_prod] [`row_max`][pypto.language.row_max] [`row_min`][pypto.language.row_min] | `pl.` | Reduce along a row |
+| [`mean`][pypto.language.mean] | `pl.` | Nonempty rank-2 FP16/FP32 mean over the valid region, FP32 accumulation; `axis=0/1/-1/-2`, reduced dimension retained |
 | [`col_sum`][pypto.language.col_sum] [`col_prod`][pypto.language.col_prod] [`col_max`][pypto.language.col_max] [`col_min`][pypto.language.col_min] | `pl.` | Reduce along a column |
 | [`row_argmax`][pypto.language.row_argmax] [`row_argmin`][pypto.language.row_argmin] | `pl.` | Index of the row extremum |
 | [`col_argmax`][pypto.language.col_argmax] [`col_argmin`][pypto.language.col_argmin] | `pl.` | Index of the column extremum |

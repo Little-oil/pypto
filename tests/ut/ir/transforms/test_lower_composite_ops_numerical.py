@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Numerical validation of the FP32 sin/cos recipe used by LowerCompositeOps.
+"""Numerical validation of recipes used by LowerCompositeOps.
 
 This test file mirrors the exact mathematical recipe implemented in
 ``src/ir/transforms/lower_composite_ops_pass.cpp`` (Cody-Waite range reduction +
@@ -15,15 +15,16 @@ degree-9 odd Horner polynomial) in pure NumPy, then compares the result
 against ``numpy.sin`` / ``numpy.cos`` over the validated input range
 ``|x| <= 2*pi*1024``.
 
-The PyPTO unit test layer has no IR interpreter, so we cannot run the
-lowered IR end-to-end without hardware. Instead, this test verifies that
-the constants and operation sequence baked into the C++ pass are
-numerically correct. A regression here means a transcription error in
-either this file or the C++ pass.
+The standalone-math tests additionally evaluate the emitted primitive IR using
+a small NumPy interpreter. This checks the actual lowering rather than a mirror
+of each composite recipe; layouts and target legality are covered by compilation tests.
 """
+
+from typing import Any
 
 import numpy as np
 import pytest
+from pypto import ir, passes
 
 # ============================================================================
 # FP32 constants. These MUST match the values in
@@ -180,6 +181,197 @@ def test_recipe_special_points_cos():
     for x_val, expected in cases:
         actual = lowered_cos(np.array([x_val], dtype=np.float32))[0]
         np.testing.assert_allclose(actual, expected, atol=1e-5)
+
+
+def _math_program(name, shape, dtype, valid_shape=None, **kwargs):
+    span = ir.Span.unknown()
+    view = ir.TileView(valid_shape=valid_shape) if valid_shape is not None else None
+    x = ir.Var("x", ir.TileType(shape, dtype, tile_view=view), span)
+    call = ir.create_op_call(f"tile.{name}", [x], kwargs, span)
+    func = ir.Function("math", [x], [call.type], ir.ReturnStmt([call], span), span, ir.FunctionType.InCore)
+    return ir.Program([func], "math_test", span)
+
+
+class _PrimitiveEvaluator:
+    """Evaluate emitted primitive IR, not a duplicated composite recipe.
+
+    This is deliberately limited to the straight-line vector primitives in
+    these recipes. Memory layouts and target instructions are tested by the
+    compiler tests; unsupported primitives fail loudly here.
+    """
+
+    def __init__(self, x):
+        self.values = {"x": x}
+        unary = {
+            "exp": np.exp,
+            "log": np.log,
+            "recip": np.reciprocal,
+        }
+        binary = {
+            "mul": np.multiply,
+            "maximum": np.maximum,
+            "minimum": np.minimum,
+        }
+        self.primitives = {ir.get_op(f"tile.{name}").name: fn for name, fn in unary.items()}
+        for name, fn in binary.items():
+            self.primitives[ir.get_op(f"tile.{name}").name] = fn
+            self.primitives[ir.get_op(f"tile.{name}s").name] = fn
+        self.primitives[ir.get_op("tile.create").name] = lambda shape: np.zeros(shape, np.float32)
+        self.primitives[ir.get_op("tile.transpose_view").name] = lambda x: x.T
+        self.primitives[ir.get_op("tile.set_validshape").name] = lambda x, rows, cols: x
+        self.primitives[ir.get_op("tile.reshape").name] = np.reshape
+
+    def expr(self, expr: ir.Expr) -> Any:
+        if isinstance(expr, ir.Var):
+            return self.values[expr.name_hint]
+        if isinstance(expr, ir.ConstInt):
+            return expr.value
+        if isinstance(expr, ir.ConstFloat):
+            return np.float32(expr.value)
+        if isinstance(expr, ir.MakeTuple):
+            return tuple(self.expr(item) for item in expr.elements)
+        assert isinstance(expr, ir.Call), type(expr)
+        args = [self.expr(arg) for arg in expr.args]
+        if expr.op.name == ir.get_op("tile.col_sum").name:
+            input_type = expr.args[0].type
+            assert isinstance(input_type, ir.TileType)
+            rows = input_type.get_effective_tile_view().valid_shape[0]
+            assert isinstance(rows, ir.ConstInt)
+            return np.sum(args[0][: rows.value], axis=0, keepdims=True)
+        if expr.op.name == ir.get_op("tile.row_sum").name:
+            input_type = expr.args[0].type
+            assert isinstance(input_type, ir.TileType)
+            columns = input_type.get_effective_tile_view().valid_shape[-1]
+            assert isinstance(columns, ir.ConstInt)
+            return np.sum(args[0][:, : columns.value], axis=-1, keepdims=True)
+        if expr.op.name == ir.get_op("tile.fillpad_expand").name:
+            input_type = expr.args[0].type
+            assert isinstance(input_type, ir.TileType)
+            valid = input_type.get_effective_tile_view().valid_shape
+            assert all(isinstance(dim, ir.ConstInt) for dim in valid)
+            region = tuple(slice(0, dim.value) for dim in valid if isinstance(dim, ir.ConstInt))
+            result = np.zeros(args[1], dtype=args[0].dtype) if len(args) == 2 else np.zeros_like(args[0])
+            result[region] = args[0][region]
+            return result
+        if expr.op.name == ir.get_op("tile.full").name:
+            assert isinstance(expr.type, ir.TileType)
+            dtype = {ir.DataType.FP16: np.float16, ir.DataType.FP32: np.float32, ir.DataType.INT32: np.int32}[
+                expr.type.dtype
+            ]
+            return np.full(args[0], args[1], dtype=dtype)
+        if expr.op.name == ir.get_op("tile.cast").name:
+            attrs = dict(expr.kwargs)
+            target_type = attrs["target_type"]
+            assert isinstance(target_type, ir.DataType)
+            dtype = {ir.DataType.FP32: np.float32, ir.DataType.FP16: np.float16, ir.DataType.INT32: np.int32}[
+                target_type
+            ]
+            value = args[0]
+            if dtype == np.int32:
+                mode = attrs["mode"]
+                assert isinstance(mode, int)
+                value = {1: np.rint, 2: lambda x: np.sign(x) * np.floor(np.abs(x) + 0.5), 3: np.floor}[mode](
+                    value
+                )
+            return value.astype(dtype)
+        return self.primitives[expr.op.name](*args)
+
+    def run(self, program: ir.Program, function: str) -> Any:
+        func = program.get_function(function)
+        assert func is not None
+        return self.stmt(func.body)
+
+    def stmt(self, stmt: ir.Stmt) -> Any:
+        if isinstance(stmt, ir.SeqStmts):
+            result = None
+            for child in stmt.stmts:
+                result = self.stmt(child)
+            return result
+        if isinstance(stmt, ir.AssignStmt):
+            self.values[stmt.var.name_hint] = self.expr(stmt.value)
+            return None
+        assert isinstance(stmt, ir.ReturnStmt), type(stmt)
+        return self.expr(stmt.value[0])
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32])
+@pytest.mark.parametrize("exponent", [-5, -2, -1, 0, 1, 2, 3, 4, 7, 0.5, -0.5, 1.25])
+def test_pow_lowered_ir_matches_numpy(dtype, exponent):
+    rng = np.random.default_rng(2665)
+    x = rng.uniform(0.5, 2, size=(16, 32)).astype(dtype)
+    if float(exponent).is_integer():
+        x[:, ::2] *= -1
+    if exponent == 0:
+        x[0, :4] = [0, np.inf, -np.inf, np.nan]
+    ir_dtype = ir.DataType.FP16 if dtype == np.float16 else ir.DataType.FP32
+    before = _math_program("pow", x.shape, ir_dtype, valid_shape=[7, 19], exponent=float(exponent))
+    after = passes.lower_composite_ops()(before)
+    actual = _PrimitiveEvaluator(x).run(after, "math")
+    expected = np.power(x.astype(np.float32), exponent).astype(dtype)
+    np.testing.assert_allclose(actual[:7, :19], expected[:7, :19], rtol=2e-3, atol=2e-6)
+    assert actual.dtype == dtype
+    ir.assert_structural_equal(passes.lower_composite_ops()(after), after)
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32])
+def test_pow_zero_preserves_nd_partial_valid_region(dtype):
+    x = np.full((2, 16, 32), np.nan, dtype=dtype)
+    ir_dtype = ir.DataType.FP16 if dtype == np.float16 else ir.DataType.FP32
+    before = _math_program("pow", x.shape, ir_dtype, valid_shape=[1, 16, 19], exponent=0.0)
+    after = passes.lower_composite_ops()(before)
+    actual = _PrimitiveEvaluator(x).run(after, "math")
+    assert actual.shape == x.shape
+    assert actual.dtype == dtype
+    np.testing.assert_array_equal(actual[0, :, :19], 1)
+    func = after.get_function("math")
+    assert func is not None and isinstance(func.body, ir.SeqStmts)
+    for stmt in func.body.stmts:
+        if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call):
+            assert stmt.value.op.name != ir.get_op("tile.slice").name
+    result = func.body.stmts[-1]
+    assert isinstance(result, ir.ReturnStmt)
+    result_type = result.value[0].type
+    assert isinstance(result_type, ir.TileType)
+    for dimension, expected in zip(
+        result_type.get_effective_tile_view().valid_shape, (1, 16, 19), strict=True
+    ):
+        assert isinstance(dimension, ir.ConstInt) and dimension.value == expected
+    ir.assert_structural_equal(passes.lower_composite_ops()(after), after)
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32])
+@pytest.mark.parametrize("axis", [0, 1, -1, -2])
+def test_mean_lowered_ir_excludes_padding(dtype, axis):
+    rng = np.random.default_rng(2665)
+    x = rng.normal(size=(16, 32)).astype(dtype)
+    x[7:, :] = 10000
+    x[:, 19:] = 10000
+    ir_dtype = ir.DataType.FP16 if dtype == np.float16 else ir.DataType.FP32
+    before = _math_program("mean", x.shape, ir_dtype, valid_shape=[7, 19], axis=axis)
+    after = passes.lower_composite_ops()(before)
+    actual = _PrimitiveEvaluator(x).run(after, "math")
+    expected = x[:7, :19].astype(np.float32).mean(axis=axis, keepdims=True).astype(dtype)
+    np.testing.assert_allclose(
+        actual[: expected.shape[0], : expected.shape[1]], expected, rtol=2e-3, atol=2e-6
+    )
+    assert actual.dtype == dtype
+    ir.assert_structural_equal(passes.lower_composite_ops()(after), after)
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32])
+@pytest.mark.parametrize(
+    "bounds", [{"min": -1.0}, {"max": 1.0}, {"min": -1.0, "max": 1.0}, {"min": 2.0, "max": -2.0}]
+)
+def test_clamp_lowered_ir_matches_numpy(dtype, bounds):
+    x = np.linspace(-3, 3, 16 * 32).reshape(16, 32).astype(dtype)
+    ir_dtype = ir.DataType.FP16 if dtype == np.float16 else ir.DataType.FP32
+    before = _math_program("clamp", x.shape, ir_dtype, **bounds)
+    after = passes.lower_composite_ops()(before)
+    actual = _PrimitiveEvaluator(x).run(after, "math")
+    expected = np.clip(x, bounds.get("min"), bounds.get("max"))
+    np.testing.assert_array_equal(actual, expected)
+    assert actual.dtype == dtype
+    ir.assert_structural_equal(passes.lower_composite_ops()(after), after)
 
 
 if __name__ == "__main__":

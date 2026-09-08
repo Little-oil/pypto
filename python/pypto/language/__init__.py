@@ -174,6 +174,7 @@ from .op.unified_ops import (
     assemble,
     batch_matmul,
     cast,
+    clamp,
     cmp,
     col_argmax,
     col_argmin,
@@ -203,6 +204,7 @@ from .op.unified_ops import (
     matmul,
     matmul_acc,
     maximum,
+    mean,
     minimum,
     mrgsort,
     mul,
@@ -214,6 +216,7 @@ from .op.unified_ops import (
     part_max,
     part_min,
     part_mul,
+    pow,
     read,
     recip,
     reinterpret_view,
@@ -311,6 +314,9 @@ TASK_ID = DataType.TASK_ID
 TaskId = Scalar[TASK_ID]
 
 __all__ = [
+    "pow",
+    "mean",
+    "clamp",
     "jit",
     "JITFunction",
     "function",

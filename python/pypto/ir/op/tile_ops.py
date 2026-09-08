@@ -1661,6 +1661,85 @@ def neg(tile: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tile.neg", [tile], {}, actual_span)
 
 
+def pow(input: Expr, exponent: int | float | ConstInt | ConstFloat, span: Span | None = None) -> Call:
+    """Raise each element to a compile-time scalar exponent.
+
+    Accepts FP16/FP32, computes in FP32 and returns the input dtype.
+    Preserves the input shape and valid region. The exponent must be finite
+    with absolute value at most 2**31 - 1. Integer exponents support negative
+    bases; fractional exponents require strictly positive bases. Negative
+    exponents require nonzero bases.
+
+    Args:
+        input: Input tile.
+        exponent: Compile-time integer or floating-point scalar exponent.
+        span: Optional source span.
+
+    Returns:
+        Call producing the result tile.
+    """
+    return _ir_core.create_op_call(
+        "tile.pow",
+        [input],
+        {"exponent": float(exponent.value if isinstance(exponent, (ConstInt, ConstFloat)) else exponent)},
+        _get_span_or_capture(span),
+    )
+
+
+def mean(input: Expr, axis: int | ConstInt = -1, span: Span | None = None) -> Call:
+    """Average the valid elements along one axis, retaining that dimension.
+
+    Requires nonempty rank-2 FP16/FP32 input. Accumulates in FP32 and returns the input
+    dtype. The reduced axis must have a positive static valid extent; padding
+    does not contribute to the sum or divisor. The reduced dimension becomes
+    one. The non-reduced physical extent is rounded up to a multiple of
+    32 / sizeof(dtype): 16 elements for FP16, 8 for FP32. Its valid extent is
+    unchanged, so this physical padding does not enlarge the logical result.
+
+    Args:
+        input: Input tile.
+        axis: Axis to reduce: 0 or -2 for rows, 1 or -1 for columns.
+        span: Optional source span.
+
+    Returns:
+        Call producing the result tile.
+    """
+    axis_value = int(axis.value) if isinstance(axis, ConstInt) else axis
+    if not isinstance(axis_value, int):
+        raise TypeError(f"mean axis must be a compile-time integer, got {type(axis).__name__}")
+    return _ir_core.create_op_call("tile.mean", [input], {"axis": axis_value}, _get_span_or_capture(span))
+
+
+def clamp(
+    input: Expr,
+    min: int | float | ConstInt | ConstFloat | None = None,
+    max: int | float | ConstInt | ConstFloat | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Clamp each element between optional compile-time scalar bounds.
+
+    Accepts FP16/FP32, computes in FP32 and returns the input dtype.
+    Preserves the input shape and valid region. At least one bound is required;
+    provided bounds must be finite and representable in FP32. Applies the
+    lower bound first and upper bound second, so min > max produces max.
+
+    Args:
+        input: Input tile.
+        min: Optional inclusive lower bound.
+        max: Optional inclusive upper bound.
+        span: Optional source span.
+
+    Returns:
+        Call producing the result tile.
+    """
+    kwargs: dict[str, Any] = {}
+    if min is not None:
+        kwargs["min"] = float(min.value if isinstance(min, (ConstInt, ConstFloat)) else min)
+    if max is not None:
+        kwargs["max"] = float(max.value if isinstance(max, (ConstInt, ConstFloat)) else max)
+    return _ir_core.create_op_call("tile.clamp", [input], kwargs, _get_span_or_capture(span))
+
+
 def exp(tile: Expr, span: Span | None = None) -> Call:
     """Element-wise exponential function of a tile.
 

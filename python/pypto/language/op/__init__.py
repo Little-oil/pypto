@@ -123,6 +123,7 @@ from .unified_ops import (
     assemble,
     batch_matmul,
     cast,
+    clamp,
     cmp,
     col_argmax,
     col_argmin,
@@ -152,6 +153,7 @@ from .unified_ops import (
     matmul,
     matmul_acc,
     maximum,
+    mean,
     minimum,
     mrgsort,
     mul,
@@ -163,6 +165,7 @@ from .unified_ops import (
     part_max,
     part_min,
     part_mul,
+    pow,
     read,
     recip,
     reinterpret_view,
@@ -200,6 +203,9 @@ from .unified_ops import (
 )
 
 __all__ = [
+    "pow",
+    "mean",
+    "clamp",
     "array",
     "prefetch",
     "tile",

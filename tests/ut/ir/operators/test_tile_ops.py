@@ -67,6 +67,131 @@ def _valid_of(result_type):
     ]
 
 
+@pytest.mark.parametrize("kind", ["tile", "tensor"])
+@pytest.mark.parametrize("dtype", [DataType.FP16, DataType.FP32])
+@pytest.mark.parametrize(
+    "name,kwargs,shape",
+    [
+        ("pow", {"exponent": 2}, [16, 32]),
+        ("clamp", {"min": -1, "max": 1}, [16, 32]),
+        ("mean", {}, [16, 1]),
+        ("mean", {"axis": 0}, [1, 32]),
+    ],
+)
+def test_basic_math_public_dispatch(kind, dtype, name, kwargs, shape):
+    type_class = ir.TileType if kind == "tile" else ir.TensorType
+    wrapper = pl.Tile if kind == "tile" else pl.Tensor
+    x = ir.Var("x", type_class([16, 32], dtype), ir.Span.unknown())
+    result = getattr(pl, name)(wrapper(expr=x), **kwargs).unwrap()
+    assert isinstance(result, ir.Call)
+    assert result.op.name == ir.get_op(f"{kind}.{name}").name
+    assert isinstance(result.type, type_class)
+    assert [_const_int(d) for d in result.type.shape] == shape
+    assert result.type.dtype == dtype
+    assert result.type.memref is None
+
+
+@pytest.mark.parametrize("kind", ["tile", "tensor"])
+@pytest.mark.parametrize(
+    "name,kwargs,message",
+    [
+        ("pow", {}, "finite scalar exponent"),
+        ("pow", {"exponent": float("nan")}, "finite scalar exponent"),
+        ("pow", {"exponent": float("inf")}, "finite scalar exponent"),
+        ("pow", {"exponent": float(2**31)}, "finite scalar exponent"),
+        ("clamp", {}, "at least one"),
+        ("clamp", {"min": float("inf")}, "finite FP32"),
+        ("clamp", {"max": float("nan")}, "finite FP32"),
+        ("clamp", {"max": 1e100}, "finite FP32"),
+        ("mean", {"axis": 2}, "requires axis"),
+        ("mean", {"axis": -3}, "requires axis"),
+    ],
+)
+def test_basic_math_rejects_invalid_parameters(kind, name, kwargs, message):
+    type_class = ir.TileType if kind == "tile" else ir.TensorType
+    x = ir.Var("x", type_class([16, 32], DataType.FP32), ir.Span.unknown())
+    with pytest.raises(ValueError, match=message):
+        ir.create_op_call(f"{kind}.{name}", [x], kwargs, x.span)
+
+
+@pytest.mark.parametrize("name,kwargs", [("pow", {"exponent": 2.0}), ("clamp", {"min": 0.0}), ("mean", {})])
+@pytest.mark.parametrize("kind", ["tile", "tensor"])
+def test_basic_math_rejects_integer_dtype(name, kwargs, kind):
+    type_class = ir.TileType if kind == "tile" else ir.TensorType
+    x = ir.Var("x", type_class([16, 32], DataType.INT32), ir.Span.unknown())
+    with pytest.raises(ValueError, match="FP16 or FP32"):
+        ir.create_op_call(f"{kind}.{name}", [x], kwargs, x.span)
+
+
+@pytest.mark.parametrize("axis,expected", [(-2, [1, 19]), (0, [1, 19]), (-1, [7, 1]), (1, [7, 1])])
+def test_mean_preserves_unreduced_valid_extent(axis, expected):
+    result = tile.mean(_partial_tile([16, 32], [7, 19]), axis=axis).type
+    assert _valid_of(result) == expected
+
+
+@pytest.mark.parametrize("kind", ["tile", "tensor"])
+@pytest.mark.parametrize("dtype,block", [(DataType.FP16, 16), (DataType.FP32, 8)])
+@pytest.mark.parametrize("axis", [0, 1, -2, -1])
+@pytest.mark.parametrize(
+    "shape,valid",
+    [([1, 1], [1, 1]), ([1, 32], [1, 19]), ([3, 19], [2, 7]), ([9, 17], [7, 13])],
+)
+def test_mean_tile_padding_keeps_tensor_shape(
+    kind: str, dtype: DataType, block: int, axis: int, shape: list[int], valid: list[int]
+) -> None:
+    """Only Tile physical extents are padded; both kinds keep the valid region."""
+    span = ir.Span.unknown()
+    if kind == "tile":
+        input_type = ir.TileType(shape, dtype, tile_view=ir.TileView(valid_shape=valid))
+        x = pl.Tile(expr=ir.Var("x", input_type, span))
+    else:
+        view = ir.TensorView(stride=[], layout=ir.TensorLayout.ND, valid_shape=valid)
+        input_type = ir.TensorType(shape, dtype, tensor_view=view)
+        x = pl.Tensor(expr=ir.Var("x", input_type, span))
+
+    result = pl.mean(x, axis=axis).unwrap().type
+    normalized_axis = axis % 2
+    expected_shape = list(shape)
+    expected_shape[normalized_axis] = 1
+    expected_valid = list(valid)
+    expected_valid[normalized_axis] = 1
+    if kind == "tile":
+        other_axis = 1 - normalized_axis
+        expected_shape[other_axis] = ((shape[other_axis] + block - 1) // block) * block
+        assert isinstance(result, ir.TileType)
+        assert _valid_of(result) == expected_valid
+        expected_layout = ir.TileLayout.col_major if normalized_axis == 1 else ir.TileLayout.row_major
+        assert result.get_effective_tile_view().blayout == expected_layout
+    else:
+        assert isinstance(result, ir.TensorType)
+        view = result.tensor_view
+        result_valid = view.valid_shape if view is not None and view.valid_shape else result.shape
+        assert [_const_int(dim) for dim in result_valid] == expected_valid
+    assert [_const_int(dim) for dim in result.shape] == expected_shape
+    assert result.dtype == dtype
+    assert result.memref is None
+
+
+def test_mean_rejects_dynamic_reduction_extent():
+    extent = ir.Var("n", ir.ScalarType(DataType.INDEX), ir.Span.unknown())
+    rows = ir.ConstInt(16, DataType.INDEX, extent.span)
+    x = ir.Var("x", ir.TileType([rows, extent], DataType.FP32), extent.span)
+    with pytest.raises(ValueError, match="positive static valid extent"):
+        tile.mean(x)
+
+
+@pytest.mark.parametrize("axis,valid", [(1, [0, 19]), (0, [7, 0])])
+def test_mean_rejects_empty_unreduced_extent(axis, valid):
+    with pytest.raises(ValueError, match="non-empty|empty|zero"):
+        tile.mean(_partial_tile([16, 32], valid), axis=axis)
+
+
+@pytest.mark.parametrize("name,kwargs", [("pow", {"exponent": 0}), ("clamp", {"max": 1})])
+def test_basic_elementwise_preserves_valid_shape(name, kwargs):
+    result = getattr(tile, name)(_partial_tile([16, 32], [7, 19]), **kwargs).type
+    assert _valid_of(result) == [7, 19]
+
+
 class TestTileElementwiseOps:
     """Test suite for tile-level element-wise operators (tile-tile and tile-scalar)."""
 

@@ -28,6 +28,28 @@ The empty `PassProperties` contract (`kLowerCompositeOpsProperties` in `include/
 
 ## Architecture
 
+### Standalone math recipes
+
+`pow`, `mean`, and `clamp` are independent tensor/tile APIs. They use FP32
+intermediates and retain FP16/FP32 input dtype. `sqrt` remains the existing primitive.
+
+- `pow(x, exponent)` uses exponentiation by squaring for integer exponents,
+  taking the base's reciprocal first for negative exponents. Fractional powers use
+  `exp(exponent * log(x))` and require positive bases. Exponents are finite,
+  compile-time scalars with magnitude at most `2**31 - 1`.
+- `mean(x, axis=-1)` selects a row or column sum and divides by the positive
+  static valid extent of the reduced axis. It excludes padding, accumulates in
+  FP32, and keeps the reduced dimension as one; nonempty rank 2 and axes `0/1/-1/-2` only.
+  Tile results retain physical padding: the non-reduced extent rounds up to a
+  multiple of 32 / sizeof(dtype) (16 FP16 / 8 FP32 elements), while its valid
+  extent and the divisor remain unchanged. The reduced extent is one; Tensor
+  result shapes remain unpadded. No final slice narrows the padded Tile allocation.
+- `clamp(x, min=None, max=None)` applies scalar maximum then scalar minimum.
+  At least one bound is required; bounds must be finite and representable in
+  FP32. Reversed bounds produce the upper bound.
+
+### Builder and dispatch
+
 The pass is a single translation unit, `src/ir/transforms/lower_composite_ops_pass.cpp`:
 
 ```text

@@ -120,6 +120,7 @@ set(PYPTO_SOURCES
     src/ir/type.cpp
 
     # IR - Operators
+    src/ir/op/composite_ops.cpp
     src/ir/op/tile_ops/batch_matmul.cpp
     src/ir/op/tile_ops/broadcast.cpp
     src/ir/op/tile_ops/elementwise.cpp
