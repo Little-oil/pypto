@@ -253,6 +253,15 @@ class _PrimitiveEvaluator:
             result = np.zeros(args[1], dtype=args[0].dtype) if len(args) == 2 else np.zeros_like(args[0])
             result[region] = args[0][region]
             return result
+        if expr.op.name == ir.get_op("tile.fillpad_inplace").name:
+            input_type = expr.args[0].type
+            assert isinstance(input_type, ir.TileType)
+            valid = input_type.get_effective_tile_view().valid_shape
+            assert all(isinstance(dim, ir.ConstInt) for dim in valid)
+            region = tuple(slice(0, dim.value) for dim in valid if isinstance(dim, ir.ConstInt))
+            result = np.zeros_like(args[0])
+            result[region] = args[0][region]
+            return result
         if expr.op.name == ir.get_op("tile.full").name:
             assert isinstance(expr.type, ir.TileType)
             dtype = {ir.DataType.FP16: np.float16, ir.DataType.FP32: np.float32, ir.DataType.INT32: np.int32}[
@@ -323,6 +332,8 @@ def test_pow_zero_preserves_nd_partial_valid_region(dtype):
     assert actual.shape == x.shape
     assert actual.dtype == dtype
     np.testing.assert_array_equal(actual[0, :, :19], 1)
+    np.testing.assert_array_equal(actual[0, :, 19:], 0)
+    np.testing.assert_array_equal(actual[1], 0)
     func = after.get_function("math")
     assert func is not None and isinstance(func.body, ir.SeqStmts)
     for stmt in func.body.stmts:
