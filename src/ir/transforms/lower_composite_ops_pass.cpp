@@ -2560,34 +2560,35 @@ ExprPtr LowerBasicMathRule(const CallPtr& call, const std::vector<ExprPtr>& args
   bool transpose_result = false;
   if (is_pow) {
     if (exponent == 0.0) {
-      // x < x is false for every floating-point value, including NaN. Select
-      // the scalar one from that mask so 0**0, NaN**0, and Inf**0 are all 1,
-      // while the real input carries an ND valid region through the lowering.
+      // A real fill, not x*0+1: 0**0 and NaN**0 are both 1. Fill in
+      // row-major order, then express validity/layout through real view ops,
+      // so passes that re-deduce allocations cannot lose that metadata.
       auto shape = input_type->shape_;
+      auto valid = GetValidShape(input_type);
       transpose_result = column_major && shape.size() == 2;
       if (transpose_result) {
-        input = r.Op("tile.transpose_view", {input});
         std::swap(shape[0], shape[1]);
+        std::swap(valid[0], valid[1]);
       }
       const auto result_shape = shape;
-      // TSEL(S) is a 2D primitive. Merge complete physical rows before the
-      // comparison, then restore the public logical rank after selection.
+      // Validity is expressed by the real 2D set_validshape operation; an ND
+      // slice is not a supported input to FlattenTileNdTo2D. Merge complete
+      // physical rows before filling, then restore the public logical rank.
       if (shape.size() != 2) {
         ExprPtr rows = std::make_shared<ConstInt>(1, DataType::INDEX, call->span_);
         for (size_t i = 0; i + 1 < shape.size(); ++i) {
           rows = tile_conversion_utils::MakeCanonicalIndexMul(rows, shape[i], call->span_, "pow");
         }
         const std::vector<ExprPtr> flat_shape = {rows, shape.back()};
-        input = r.Reshape(input, flat_shape);
+        valid = ComputeReshapeValidShape(valid, shape, flat_shape, true, call->span_, "pow");
         shape = flat_shape;
       }
-      const auto false_mask = r.Op("tile.cmp", {input, input}, {{"cmp_type", 2}});
-      const std::vector<ExprPtr> scratch_shape = {std::make_shared<ConstInt>(1, DataType::INDEX, call->span_),
-                                                  shape[1]};
-      const auto scratch =
-          r.Op("tile.create", {tile_conversion_utils::MakeShapeTuple(scratch_shape, call->span_)},
-               {{"dtype", input_type->dtype_}, {"target_memory", MemorySpace::Vec}});
-      result = r.Op("tile.sels", {false_mask, input, scratch, r.Constant(1.0, input_type->dtype_)});
+      const auto shape_tuple = tile_conversion_utils::MakeShapeTuple(shape, call->span_);
+      result = r.Op("tile.full", {shape_tuple, r.Constant(1.0, input_type->dtype_)},
+                    {{"dtype", input_type->dtype_}});
+      if (!AreExprVectorsEqual(shape, valid)) {
+        result = r.Op("tile.set_validshape", {result, valid[0], valid[1]});
+      }
       if (result_shape.size() != 2) result = r.Reshape(result, result_shape);
     } else if (std::floor(exponent) == exponent) {
       // Exponentiation by squaring is bounded by 31 steps by the public

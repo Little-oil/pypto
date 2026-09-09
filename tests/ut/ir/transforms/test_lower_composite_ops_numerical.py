@@ -253,14 +253,6 @@ class _PrimitiveEvaluator:
             result = np.zeros(args[1], dtype=args[0].dtype) if len(args) == 2 else np.zeros_like(args[0])
             result[region] = args[0][region]
             return result
-        if expr.op.name == ir.get_op("tile.cmp").name:
-            attrs = dict(expr.kwargs)
-            assert attrs["cmp_type"] == 2
-            return np.less(args[0], args[1])
-        if expr.op.name == ir.get_op("tile.sels").name:
-            assert isinstance(expr.type, ir.TileType)
-            dtype = {ir.DataType.FP16: np.float16, ir.DataType.FP32: np.float32}[expr.type.dtype]
-            return np.where(args[0], args[1], args[3]).astype(dtype)
         if expr.op.name == ir.get_op("tile.full").name:
             assert isinstance(expr.type, ir.TileType)
             dtype = {ir.DataType.FP16: np.float16, ir.DataType.FP32: np.float32, ir.DataType.INT32: np.int32}[

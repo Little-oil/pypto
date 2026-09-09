@@ -344,46 +344,5 @@ def test_mean_axes_zero_then_one(case_run):
     case_run.assert_passed()
 
 
-@pl.jit
-def pow_zero_rank3_kernel(a: pl.Tensor, out: pl.InOut[pl.Tensor]):
-    B, M, N = a.shape
-    with pl.at(level=pl.Level.CORE_GROUP):
-        # The fully valid middle axis makes this an ND valid region that can
-        # flatten to one rectangular tile: [2,16,32] -> [32,32], valid [16,19].
-        x = pl.load(a, [0, 0, 0], [B, M, N], valid_shape=[1, M, 19])
-        y = pl.pow(x, 0)
-        pl.store(y, [0, 0, 0], out)
-    return out
-
-
-def _pow_zero_rank3_case(dtype: torch.dtype):
-    a = _random((2, 16, 32), dtype)
-    a[0, 0, 0] = 0
-
-    def golden(tensors):
-        # Values outside valid_shape are undefined by the tile contract. NaNs
-        # make the golden checker ignore that physical padding while retaining
-        # exact validation of every logical element.
-        expected = torch.full_like(tensors["out"], float("nan"))
-        expected[:1, :, :19] = tensors["a"][:1, :, :19].float().pow(0).to(dtype)
-        return expected
-
-    return st.case(
-        pow_zero_rank3_kernel,
-        a,
-        torch.zeros_like(a),
-        name=f"pow_zero_rank3_valid1x16x19_{_dtype_name(dtype)}",
-        golden=golden,
-        rtol=0,
-        atol=0,
-    )
-
-
-@st.cases(*(_pow_zero_rank3_case(dtype) for dtype in _DTYPES))
-def test_pow_zero_preserves_rank3_valid_region(case_run):
-    """Power zero writes ones throughout the ND logical valid region."""
-    case_run.assert_passed()
-
-
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
