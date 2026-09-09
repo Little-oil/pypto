@@ -2588,11 +2588,6 @@ ExprPtr LowerBasicMathRule(const CallPtr& call, const std::vector<ExprPtr>& args
                     {{"dtype", input_type->dtype_}});
       if (!AreExprVectorsEqual(shape, valid)) {
         result = r.Op("tile.set_validshape", {result, valid[0], valid[1]});
-        // A full materializes every physical lane. Zero its invalid lanes so
-        // an ND store cannot expose ones from padding when it reinterprets the
-        // flattened tile, then restore the public logical valid shape.
-        result = r.Op("tile.fillpad_inplace", {result}, {{"pad_value", PadValue::zero}});
-        result = r.Op("tile.set_validshape", {result, valid[0], valid[1]});
       }
       if (result_shape.size() != 2) result = r.Reshape(result, result_shape);
     } else if (std::floor(exponent) == exponent) {

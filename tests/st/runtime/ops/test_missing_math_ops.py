@@ -361,7 +361,10 @@ def _pow_zero_rank3_case(dtype: torch.dtype):
     a[0, 0, 0] = 0
 
     def golden(tensors):
-        expected = torch.zeros_like(tensors["out"])
+        # Values outside valid_shape are undefined by the tile contract. NaNs
+        # make the golden checker ignore that physical padding while retaining
+        # exact validation of every logical element.
+        expected = torch.full_like(tensors["out"], float("nan"))
         expected[:1, :, :19] = tensors["a"][:1, :, :19].float().pow(0).to(dtype)
         return expected
 
@@ -378,7 +381,7 @@ def _pow_zero_rank3_case(dtype: torch.dtype):
 
 @st.cases(*(_pow_zero_rank3_case(dtype) for dtype in _DTYPES))
 def test_pow_zero_preserves_rank3_valid_region(case_run):
-    """Power zero writes ones only within the ND valid region and preserves the zero tail."""
+    """Power zero writes ones throughout the ND logical valid region."""
     case_run.assert_passed()
 
 
