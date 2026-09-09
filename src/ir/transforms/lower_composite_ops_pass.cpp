@@ -24,8 +24,6 @@
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
-#include "pypto/backend/common/backend_config.h"
-#include "pypto/backend/common/backend_handler.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/comm.h"
@@ -2495,7 +2493,7 @@ class BasicMathRecipe {
     return builder_.Bind("math", OpRegistry::GetInstance().Create(name, args, kwargs, span_), span_);
   }
 
-  ExprPtr Constant(double value, DataType dtype = DataType::FP32) const {
+  [[nodiscard]] ExprPtr Constant(double value, DataType dtype = DataType::FP32) const {
     return std::make_shared<ConstFloat>(value, dtype, span_);
   }
 
@@ -2535,7 +2533,7 @@ ExprPtr LowerBasicMathRule(const CallPtr& call, const std::vector<ExprPtr>& args
   if (is_mean) {
     const auto normalized_type = As<TileType>(input->GetType());
     auto padded_shape = normalized_type->shape_;
-    const int64_t block = 32 / input_type->dtype_.GetByte();
+    const int64_t block = static_cast<int64_t>(32 / input_type->dtype_.GetByte());
     for (size_t axis = 0; axis < 2; ++axis) {
       if (axis == 0 && !row_reduce) continue;
       if (const auto extent = As<ConstInt>(padded_shape[axis]); extent && extent->value_ % block != 0) {

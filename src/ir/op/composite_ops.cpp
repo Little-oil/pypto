@@ -94,7 +94,7 @@ TypePtr DeduceMean(const std::vector<ExprPtr>& args, const OpAttrs& kwargs, bool
   auto shape = input->shape_;
   shape[axis] = valid[axis] = std::make_shared<ConstInt>(1, DataType::INDEX, args[0]->span_);
   if (tile) {
-    const int64_t block = 32 / input->dtype_.GetByte();
+    const int64_t block = static_cast<int64_t>(32 / input->dtype_.GetByte());
     if (const auto extent = As<ConstInt>(shape[1 - axis]); extent && extent->value_ % block != 0) {
       shape[1 - axis] = std::make_shared<ConstInt>(((extent->value_ + block - 1) / block) * block,
                                                    DataType::INDEX, args[0]->span_);
