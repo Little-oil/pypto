@@ -868,9 +868,10 @@ Pass Simplify();
  *
  * Lowering rules live in a file-local dispatch table inside
  * ``src/ir/transforms/lower_composite_ops_pass.cpp``. Today the pass handles
- * ``tile.sin`` / ``tile.cos``, packed ``tile.tquant_mx``, and explicit-signal
- * InCore ``pld.tensor.allreduce``; host-level allreduce is skipped and lowered
- * later by ``LowerHostTensorCollectives``. Future single-result composite ops
+ * standalone ``tile.pow`` / ``tile.mean`` / ``tile.clamp``, ``tile.sin`` /
+ * ``tile.cos``, packed ``tile.tquant_mx``, and explicit-signal InCore
+ * ``pld.tensor.allreduce``; host-level allreduce is skipped and lowered later
+ * by ``LowerHostTensorCollectives``. Future single-result composite ops
  * (softmax, gelu, layernorm, ...) are added by appending a rule function + one
  * dispatch-table row. Multi-result rules may also need projection remapping in
  * the mutator, as ``tile.tquant_mx`` does.

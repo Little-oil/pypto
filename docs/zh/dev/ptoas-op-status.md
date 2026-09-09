@@ -113,7 +113,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tfmod | TFMOD | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 FP32 tile-tile 同名真机 ST 已通过，覆盖完整与尾部 valid shape；A5 真机待验证 |
 | pto.tfmods | TFMODS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 FP32 scalar 同名真机 ST 已通过，覆盖负值与尾部 valid shape；A5 真机待验证 |
 | pto.tpow | TPOW | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
-| pto.tpows | TPOWS | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
+| pto.tpows | TPOWS | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | 公共 `pow` 前端使用组合基础算子 recipe；直接 `pto.tpows` codegen 和同名 ST 仍缺失 |
 | pto.trandom | TRANDOM | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | PTOAS source-only 兼容接口 |
 | **归约（13）** |  |  |  |  |  |  |  |  |
 | pto.trowsum | TROWSUM | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |

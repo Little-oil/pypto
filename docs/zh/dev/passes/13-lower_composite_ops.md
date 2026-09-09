@@ -1,16 +1,16 @@
 # LowerCompositeOps Pass
 
-把组合 (composite) tile / distributed 算子降级 (lower) 为基础操作，使代码生成 (codegen) 不再需要发射其高层形式。当前支持 `tile.sin` / `tile.cos`（FP32 Cody-Waite + Horner）、packed `tile.tquant_mx`，以及 `pld.tensor.*` 分布式集合通信算子（`allreduce`（mesh 与 ring）、`allgather`、`reduce_scatter`、`broadcast`、`barrier`）。mesh 和 ring allreduce 还可能创建保留元数据的 `tensor.view`，让 tile load/remote/store 操作一个 2D 展平目标窗口。
+把组合 (composite) tile / distributed 算子降级 (lower) 为基础操作，使代码生成 (codegen) 不再需要发射其高层形式。当前支持独立的 `tile.pow` / `tile.mean` / `tile.clamp`、`tile.sin` / `tile.cos`（FP32 Cody-Waite + Horner）、packed `tile.tquant_mx`，以及 `pld.tensor.*` 分布式集合通信算子（`allreduce`（mesh 与 ring）、`allgather`、`reduce_scatter`、`broadcast`、`barrier`）。mesh 和 ring allreduce 还可能创建保留元数据的 `tensor.view`，让 tile load/remote/store 操作一个 2D 展平目标窗口。
 
 ## 概览 (Overview)
 
-`LowerCompositeOps` 是函数级 (function-level) Pass，对每条 `var = Call(...)` 形式的 `AssignStmt`，若其被调对象出现在 Pass 的降级分发表里，则将其改写为一个 `SeqStmts`。对 `tile.sin` / `tile.cos`，规则会发射固定形态的基本 tile 算子序列。`tile.tquant_mx` 会变为值返回的 `tile.tquant_mx_raw` + `tile.tmov_x2zz`（gather_compare 形态 SSA）及显式 workspace tile；公开 FP8 alias 经 `reinterpret_view` / `transpose_view` 补齐。对 `pld.tensor.*` 分布式集合通信算子，规则会发射下文记录的跨 rank recipe。
+`LowerCompositeOps` 是函数级 (function-level) Pass，对每条 `var = Call(...)` 形式的 `AssignStmt`，若其被调对象出现在 Pass 的降级分发表里，则将其改写为一个 `SeqStmts`。独立数学规则会把 `tile.pow`、`tile.mean`、`tile.clamp` 分解为基础算术、规约和类型转换算子。对 `tile.sin` / `tile.cos`，规则会发射固定形态的基本 tile 算子序列。`tile.tquant_mx` 会变为值返回的 `tile.tquant_mx_raw` + `tile.tmov_x2zz`（gather_compare 形态 SSA）及显式 workspace tile；公开 FP8 alias 经 `reinterpret_view` / `transpose_view` 补齐。对 `pld.tensor.*` 分布式集合通信算子，规则会发射下文记录的跨 rank recipe。
 
 host-orchestrator 中的 `pld.tensor.allreduce` 调用会跳过本 Pass：`SynthesizeAllReduceSignals` 先把可选 signal 的 host 调用规范化为显式 signal 形态，`MaterializeCommDomainScopes` 再把 data 和 signal window 放入 comm domain，随后由 `LowerHostTensorCollectives` 降级为内部 builtin dispatch。
 
 `tile.sin` / `tile.cos` 规则**仅支持 FP32**。非 FP32 三角函数输入会在算子构造时被共享的 `DeduceTileFP32OnlyType` 类型推导器 (deducer) 拒绝（见 `src/ir/op/tile_ops/unary.cpp:94`），因此这些规则只会看到良类型的 FP32 操作数。分布式规则各自有独立的 dtype 约束；allreduce 如下文所述支持 FP16 和 FP32。
 
-对不含已注册组合调用（例如 `tile.sin`、`tile.cos`、`tile.tquant_mx` 或 `pld.tensor.*` 分布式集合通信算子）的程序，Pass 是**结构性 no-op**：所有其他语句都直接走 `IRMutator::VisitStmt_`。展开生成的只包含基本 tile 算子、内部值返回的 `tile.tquant_mx_raw` / `tile.tmov_x2zz` 形式和分布式原语，mutator 不会再改写它们，因此 Pass 也是**幂等的 (idempotent)**。
+对不含已注册组合调用（例如 `tile.pow`、`tile.mean`、`tile.clamp`、`tile.sin`、`tile.cos`、`tile.tquant_mx` 或 `pld.tensor.*` 分布式集合通信算子）的程序，Pass 是**结构性 no-op**：所有其他语句都直接走 `IRMutator::VisitStmt_`。展开生成的只包含基本 tile 算子、内部值返回的 `tile.tquant_mx_raw` / `tile.tmov_x2zz` 形式和分布式原语，mutator 不会再改写它们，因此 Pass 也是**幂等的 (idempotent)**。
 
 **所需 (Requires)**：无。
 
@@ -22,7 +22,7 @@ host-orchestrator 中的 `pld.tensor.allreduce` 调用会跳过本 Pass：`Synth
 
 ## 运行时机 (When It Runs)
 
-`LowerCompositeOps` 是 `Default` 流水线 `tile_pto_passes` 的**第一个 Pass**（见 `python/pypto/ir/pass_manager.py`），紧跟 `ConvertTensorToTileOps`（位置 12）和 `OptimizeOrchTensors`（位置 13）之后。此时所有 tensor 级三角调用 (`tensor.sin`、`tensor.cos`) 已经被转换注册表 (conversion registry) 改写成 tile 等价物 (`tile.sin`、`tile.cos`)，tile 流水线即将开始 tile-shape 规范化 (canonicalisation)。在 `FlattenTileNdTo2D` 之前完成三角函数降级，可以让本 Pass 与 2D 展平规则解耦——展开生成的所有基本 tile 算子（`tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.cast`）在任意 rank 下都有定义良好的语义。Packed `tile.tquant_mx` 也在此降级（`FlattenCallExpr` 已先稳定 tuple consumer）。
+`LowerCompositeOps` 是 `Default` 流水线 `tile_pto_passes` 的**第一个 Pass**（见 `python/pypto/ir/pass_manager.py`），紧跟 `ConvertTensorToTileOps`（位置 12）和 `OptimizeOrchTensors`（位置 13）之后。此时 tensor 级组合调用（`tensor.pow`、`tensor.mean`、`tensor.clamp`、`tensor.sin`、`tensor.cos`）已经被转换注册表 (conversion registry) 改写成对应的 tile 算子，tile 流水线即将开始 tile-shape 规范化 (canonicalisation)。在 `FlattenTileNdTo2D` 之前完成这些 recipe 的降级，可以让本 Pass 与 2D 展平规则解耦——recipe 生成的基础 tile 算子在其支持的 rank 下都有定义良好的语义。Packed `tile.tquant_mx` 也在此降级（`FlattenCallExpr` 已先稳定 tuple consumer）。
 
 **与 memory space 的顺序关系：** `LowerCompositeOps` 运行在 `InferTileMemorySpace` **之前**。因此 `tile.tquant_mx` 规则创建的 scratch tile 会在 `tile.create` 上显式盖上 `MemorySpace::Vec`，以便后续 memory planning 仍能拿到地址；这是刻意设计，并不表示 Infer 应该已经跑过。
 

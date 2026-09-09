@@ -612,9 +612,10 @@ void BindPass(nb::module_& m) {
       "Create a pass that simplifies expressions and statements using algebraic rules and bound analysis");
   passes.def("lower_composite_ops", &pass::LowerCompositeOps,
              "Decompose composite tile/distributed ops into primitives via the "
-             "composite-lowering registry. Today lowers tile.sin/tile.cos, packed "
-             "tile.tquant_mx, and explicit-signal InCore pld.tensor.allreduce; host "
-             "allreduce is skipped for LowerHostTensorCollectives. FP32-only for trig. Idempotent.");
+             "composite-lowering registry. Today lowers standalone tile.pow/tile.mean/tile.clamp, "
+             "tile.sin/tile.cos, packed tile.tquant_mx, and explicit-signal InCore "
+             "pld.tensor.allreduce; host allreduce is skipped for LowerHostTensorCollectives. "
+             "FP32-only for trig. Idempotent.");
   passes.def("flatten_call_expr", &pass::FlattenCallExpr,
              "Create a pass that flattens nested call expressions");
   passes.def("inline_functions", &pass::InlineFunctions,
