@@ -1375,7 +1375,7 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
 
   // TIMG2COL stores scalar instruction attributes, while the DSL groups them
   // into geometry tuples. Preserve that public signature in executable IR.
-  if (IsOp(op, "tile.img2col")) {
+  if (IsOp(op, "tile.img2col") || IsOp(op, "tensor.img2col")) {
     const auto print_pair = [&](const char* public_name, const char* h, const char* w, int fallback) {
       stream_ << ", " << public_name << "=(" << op->GetKwarg<int>(h, fallback) << ", "
               << op->GetKwarg<int>(w, fallback) << ")";

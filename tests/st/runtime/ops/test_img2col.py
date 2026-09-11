@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from harness import st
 
 
-def _conv_case(h, w, channels, kernel, stride, padding, dilation, dtype):
+def _conv_case(h, w, channels, kernel, stride, padding, dilation, dtype, *, tensor_level):
     kh, kw = kernel
     sh, sw = stride
     pt, pb, pad_left, pad_right = padding
@@ -32,13 +32,13 @@ def _conv_case(h, w, channels, kernel, stride, padding, dilation, dtype):
     acc_dtype = pl.INT32 if dtype == torch.int8 else pl.FP32
 
     @pl.jit.incore
-    def conv(x: pl.Tensor, weight: pl.Tensor, out: pl.Out[pl.Tensor]):
+    def conv_tile(x: pl.Tensor, weight: pl.Tensor, out: pl.Out[pl.Tensor]):
         fmap = pl.load(x, [0, 0], [h * w, packed_channels], target_memory=pl.MemorySpace.Mat)
         weights = pl.load(weight, [0, 0], [reduction, outputs], target_memory=pl.MemorySpace.Mat)
         for m in pl.range(0, oh * ow, 16):
             acc = pl.tile.create([16, outputs], acc_dtype, target_memory=pl.MemorySpace.Acc)
             for k in pl.range(0, reduction, k_tile):
-                lhs = pl.tile.img2col(
+                lhs = pl.img2col(
                     fmap,
                     m,
                     k,
@@ -53,6 +53,31 @@ def _conv_case(h, w, channels, kernel, stride, padding, dilation, dtype):
                 acc = pl.tile.matmul_acc(acc, lhs, rhs, init_cond=(k == 0))
             out = pl.store(acc, [m, 0], out)
         return out
+
+    @pl.jit.incore
+    def conv_tensor(x: pl.Tensor, weight: pl.Tensor, out: pl.Out[pl.Tensor]):
+        fmap = pl.slice(x, [h * w, packed_channels], [0, 0])
+        weights = pl.slice(weight, [reduction, outputs], [0, 0])
+        for m in pl.range(0, oh * ow, 16):
+            acc = pl.create_tensor([16, outputs], acc_dtype)
+            for k in pl.range(0, reduction, k_tile):
+                lhs = pl.img2col(
+                    fmap,
+                    m,
+                    k,
+                    [16, k_tile],
+                    image_shape=(h, w),
+                    kernel_size=kernel,
+                    stride=stride,
+                    padding=padding,
+                    dilation=dilation,
+                )
+                rhs = pl.slice(weights, [k_tile, outputs], [k, 0])
+                acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k == 0))
+            out = pl.assemble(out, acc, [m, 0])
+        return out
+
+    conv = conv_tensor if tensor_level else conv_tile
 
     @pl.jit
     def run_conv(x: pl.Tensor, weight: pl.Tensor, out: pl.Out[pl.Tensor]):
@@ -89,7 +114,7 @@ def _conv_case(h, w, channels, kernel, stride, padding, dilation, dtype):
         packed_weight,
         torch.zeros((oh * ow, outputs), dtype=output_dtype),
         name=(
-            f"img2col_conv_{h}x{w}_c{channels}_k{kh}x{kw}_s{sh}x{sw}_"
+            f"img2col_{'tensor' if tensor_level else 'tile'}_conv_{h}x{w}_c{channels}_k{kh}x{kw}_s{sh}x{sw}_"
             f"p{pt}_{pb}_{pad_left}_{pad_right}_d{dh}x{dw}_{dtype}"
         ),
         golden=lambda _: expected.to(output_dtype),
@@ -101,7 +126,8 @@ def _conv_case(h, w, channels, kernel, stride, padding, dilation, dtype):
 @pytest.mark.platforms("a2a3", reason="TIMG2COL lowering currently supports A2/A3 device execution")
 @st.cases(
     *[
-        _conv_case(h, w, c, kernel, stride, padding, dilation, dtype)
+        _conv_case(h, w, c, kernel, stride, padding, dilation, dtype, tensor_level=tensor_level)
+        for tensor_level in (False, True)
         for h, w, c, kernel, stride, padding, dilation, dtype in (
             (8, 8, 3, (3, 3), (2, 2), (1, 1, 1, 1), (1, 1), torch.float16),
             (8, 8, 32, (3, 3), (1, 1), (1, 1, 1, 1), (1, 1), torch.float16),
@@ -127,7 +153,7 @@ def _causal_conv3d(x: pl.Tensor, weight: pl.Tensor, out: pl.Out[pl.Tensor]):
             fmap = pl.load(x, [(t + kt) * 16, 0], [16, 32], target_memory=pl.MemorySpace.Mat)
             weights = pl.load(weight, [kt * 288, 0], [288, 32], target_memory=pl.MemorySpace.Mat)
             for k in pl.range(0, 288, 16):
-                lhs = pl.tile.img2col(
+                lhs = pl.img2col(
                     fmap,
                     0,
                     k,
