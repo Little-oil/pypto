@@ -89,7 +89,7 @@ def _conv_case(h, w, channels, kernel, stride, padding, dilation, dtype):
     )
 
 
-@pytest.mark.platforms("a2a3")
+@pytest.mark.platforms("a2a3", reason="TIMG2COL lowering currently supports A2/A3 device execution")
 @st.cases(
     *[
         _conv_case(h, w, c, kernel, stride, padding, dilation, dtype)
@@ -128,7 +128,7 @@ def _causal_conv3d(x: pl.Tensor, weight: pl.Tensor, out: pl.Out[pl.Tensor]):
                     padding=(1, 1, 1, 1),
                 )
                 rhs = pl.tile.extract(weights, k, 0, [16, 32], target_memory=pl.MemorySpace.Right)
-                acc = pl.tile.matmul_acc(acc, lhs, rhs, init_cond=((kt == 0) & (k == 0)))
+                acc = pl.tile.matmul_acc(acc, lhs, rhs, init_cond=((kt == 0) and (k == 0)))
         out = pl.store(acc, [t * 16, 0], out)
     return out
 
@@ -157,7 +157,7 @@ def _causal_case():
     )
 
 
-@pytest.mark.platforms("a2a3")
+@pytest.mark.platforms("a2a3", reason="TIMG2COL lowering currently supports A2/A3 device execution")
 @st.cases(_causal_case())
 def test_img2col_causal_convolution(case_run):
     """Each output frame accumulates only its current and two preceding frames."""
