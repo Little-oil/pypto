@@ -25,6 +25,8 @@ def _conv_case(h, w, channels, kernel, stride, padding, dilation, dtype):
     ow = (w + pad_left + pad_right - dw * (kw - 1) - 1) // sw + 1
     outputs = 32
     c0 = 32 // torch.empty((), dtype=dtype).element_size()
+    # TEXTRACT from NZ to Right requires K divisible by 16, including for FP32.
+    k_tile = max(16, c0)
     packed_channels = (channels + c0 - 1) // c0 * c0
     reduction = packed_channels * kh * kw
     acc_dtype = pl.INT32 if dtype == torch.int8 else pl.FP32
@@ -35,22 +37,26 @@ def _conv_case(h, w, channels, kernel, stride, padding, dilation, dtype):
         weights = pl.load(weight, [0, 0], [reduction, outputs], target_memory=pl.MemorySpace.Mat)
         for m in pl.range(0, oh * ow, 16):
             acc = pl.tile.create([16, outputs], acc_dtype, target_memory=pl.MemorySpace.Acc)
-            for k in pl.range(0, reduction, c0):
+            for k in pl.range(0, reduction, k_tile):
                 lhs = pl.tile.img2col(
                     fmap,
                     m,
                     k,
-                    [16, c0],
+                    [16, k_tile],
                     image_shape=(h, w),
                     kernel_size=kernel,
                     stride=stride,
                     padding=padding,
                     dilation=dilation,
                 )
-                rhs = pl.tile.extract(weights, k, 0, [c0, outputs], target_memory=pl.MemorySpace.Right)
+                rhs = pl.tile.extract(weights, k, 0, [k_tile, outputs], target_memory=pl.MemorySpace.Right)
                 acc = pl.tile.matmul_acc(acc, lhs, rhs, init_cond=(k == 0))
             out = pl.store(acc, [m, 0], out)
         return out
+
+    @pl.jit
+    def run_conv(x: pl.Tensor, weight: pl.Tensor, out: pl.Out[pl.Tensor]):
+        return conv(x, weight, out)
 
     generator = torch.Generator().manual_seed(2665)
     image = torch.randint(-2, 3, (1, channels, h, w), generator=generator).to(dtype)
@@ -78,11 +84,14 @@ def _conv_case(h, w, channels, kernel, stride, padding, dilation, dtype):
     )
     output_dtype = torch.int32 if dtype == torch.int8 else torch.float32
     return st.case(
-        conv,
+        run_conv,
         x,
         packed_weight,
         torch.zeros((oh * ow, outputs), dtype=output_dtype),
-        name=f"img2col_conv_{h}x{w}_c{channels}_k{kh}x{kw}_s{sh}x{sw}_p{padding}_d{dilation}_{dtype}",
+        name=(
+            f"img2col_conv_{h}x{w}_c{channels}_k{kh}x{kw}_s{sh}x{sw}_"
+            f"p{pt}_{pb}_{pad_left}_{pad_right}_d{dh}x{dw}_{dtype}"
+        ),
         golden=lambda _: expected.to(output_dtype),
         rtol=0.0,
         atol=0.0,
@@ -133,6 +142,11 @@ def _causal_conv3d(x: pl.Tensor, weight: pl.Tensor, out: pl.Out[pl.Tensor]):
     return out
 
 
+@pl.jit
+def _run_causal_conv3d(x: pl.Tensor, weight: pl.Tensor, out: pl.Out[pl.Tensor]):
+    return _causal_conv3d(x, weight, out)
+
+
 def _causal_case():
     generator = torch.Generator().manual_seed(2731)
     image = torch.randint(-2, 3, (1, 32, 3, 4, 4), generator=generator).to(torch.float16)
@@ -146,7 +160,7 @@ def _causal_case():
         .reshape(48, 32)
     )
     return st.case(
-        _causal_conv3d,
+        _run_causal_conv3d,
         x,
         packed,
         torch.zeros((48, 32)),
