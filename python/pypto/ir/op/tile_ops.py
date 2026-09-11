@@ -3003,6 +3003,73 @@ def extract(
     )
 
 
+def img2col(
+    src: Expr,
+    pos_m: int | Expr,
+    pos_k: int | Expr,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    *,
+    image_shape: Sequence[int | Expr],
+    kernel_size: Sequence[int | Expr],
+    stride: Sequence[int | Expr] = (1, 1),
+    padding: Sequence[int | Expr] = (0, 0, 0, 0),
+    dilation: Sequence[int | Expr] = (1, 1),
+    span: Span | None = None,
+) -> Call:
+    """Build TIMG2COL: full NZ ``[H*W, C]`` in Mat to ``[M, K]`` in Left.
+
+    ``image_shape``, ``kernel_size``, ``stride`` and ``dilation`` use (H, W).
+    ``padding`` is (top, bottom, left, right), filled with zero. The unfolded
+    axes are (output H, output W) and (C1, kernel H, kernel W, C0), where
+    C0=32/sizeof(dtype). Source H*W and output M must be multiples of 16;
+    C, output K and pos_k must be C0-aligned. Positions may be runtime
+    index-like expressions; callers must keep their complete output window
+    within the unfolded image and positions within uint16 range.
+
+    Args:
+        src: Full NZ Mat tile expression with FP16, BF16, FP32 or INT8 elements.
+        pos_m: Starting flattened output spatial position.
+        pos_k: Starting position along the packed reduction axis.
+        shape: Static destination shape (M, K).
+        image_shape: Static source image (H, W).
+        kernel_size: Static spatial filter (KH, KW).
+        stride: Static spatial stride (H, W).
+        padding: Static zero padding (top, bottom, left, right).
+        dilation: Static spatial dilation (H, W).
+        span: Optional source span; captured automatically when omitted.
+
+    Returns:
+        Call expression with the destination TileType in Left memory.
+    """
+    actual_span = _get_span_or_capture(span)
+    kwargs: dict[str, int] = {}
+    for names, values in (
+        (("fmap_h", "fmap_w"), image_shape),
+        (("kernel_h", "kernel_w"), kernel_size),
+        (("stride_h", "stride_w"), stride),
+        (("pad_top", "pad_bottom", "pad_left", "pad_right"), padding),
+        (("dilation_h", "dilation_w"), dilation),
+    ):
+        if len(values) != len(names):
+            raise ValueError(f"tile.img2col {names} require {len(names)} compile-time integers")
+        for name, value in zip(names, values):
+            constant = value.value if isinstance(value, ConstInt) else value
+            if not isinstance(constant, int) or isinstance(constant, bool):
+                raise ValueError(f"tile.img2col {name} requires a compile-time integer")
+            kwargs[name] = constant
+    return _ir_core.create_op_call(
+        "tile.img2col",
+        [
+            src,
+            _normalize_expr(pos_m, actual_span, int_dtype=DataType.INDEX),
+            _normalize_expr(pos_k, actual_span, int_dtype=DataType.INDEX),
+            _to_make_tuple(shape, actual_span),
+        ],
+        kwargs,
+        actual_span,
+    )
+
+
 def reshape(
     tile: Expr,
     shape: Sequence[int | Expr] | _ir_core.MakeTuple,
