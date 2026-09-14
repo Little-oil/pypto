@@ -13,12 +13,11 @@ things: the addresses of the boundary tensors, and the values of the boundary
 scalars. Everything else — node count, shapes, dependency edges, block counts —
 is frozen into the recorded Definition.
 
-That makes four classes of problem possible, and every one of them is silent at
-runtime:
+That makes four classes of problem possible:
 
 | Problem | What the runtime does | What this pass does |
 | ------- | --------------------- | ------------------- |
-| A boundary scalar is *derived* inside the region | Classifies it as static data and freezes the first call's value into the recording. No warning, ever. | **Step A** — hoists the computation to the call site, or leaves it alone when the frozen value is provably the right one |
+| A boundary scalar is *derived* inside the region | Classifies it as static data and freezes the first call's value into the recording; an implicit value conversion is deprecated | **Step A** — hoists the computation to the call site, or leaves it alone when the frozen value is provably the right one |
 | A view of a boundary tensor is taken *inside* the region | Freezes the first call's offset and patches only the address, so a later call reads call one's window | **Step B** — hoists the view to the call site, or accepts it when its window is replay-invariant |
 | The region allocates its own intermediates | Records them correctly, on a heap it never reclaims mid-run, so the live set grows with the number of submissions | **Step C** — hoists the allocation to the call site as an `InOut` boundary tensor |
 | The boundary itself is not cacheable | Declines to cache and silently runs the region as ordinary tasks | **Step D** — rejects it at compile time |
@@ -31,9 +30,10 @@ line.
 
 ## Step A — derived boundary scalars
 
-A boundary scalar is tracked by **pointer identity**. During recording the
-runtime anchors the address of each `args.scalar(k)` slot; on replay it re-reads
-those addresses. A value the body computes has no slot:
+A boundary scalar carries its **parameter origin** in the runtime's
+`InheritableScalar` wrapper. `args.scalar(k)` returns that wrapper; forwarding
+it through `add_scalar` preserves the parameter index that replay refreshes.
+Converting the wrapper to an integer or computing a new value loses that origin:
 
 ```python
 @pl.function(type=pl.FunctionType.Graph)
@@ -69,17 +69,18 @@ reintroduces the very bug Step A exists to prevent. Codegen emits a surviving
 alias as a **value copy**:
 
 ```cpp
-const uint64_t& batch = args.scalar(0);   // the slot, by reference
-int64_t n = batch;                        // a copy, at a different address
-g0_params_t0.add_scalar(n);               // the copy is what the task receives
+const auto batch = args.scalar(0);  // preserves the parameter origin
+int64_t n = batch;                  // deprecated conversion to a plain value
+g0_params_t0.add_scalar(n);         // the task no longer inherits the parameter
 ```
 
-Recording classifies a scalar by the *address its value came from*, comparing
-against `&boundary_args->scalar(i)`. The copy matches nothing, so it is recorded
-as `STATIC_VALUE` and every later replay reuses the first call's number.
+Recording classifies a scalar by its retained parameter origin. The integer
+copy no longer carries that origin, so it is recorded as static data and every
+later replay reuses the first call's number. Copying the wrapper itself with
+`auto` preserves its origin.
 
 Step A therefore substitutes the name away and erases the binding, so the task
-reads `add_scalar(batch)` — the slot itself. Chains collapse to their root in one
+reads `add_scalar(batch)` — the parameter wrapper. Chains collapse to their root in one
 pass (`a = p; b = a;` sends both readers to `p`), and an alias of a *hoisted*
 value lands on that value's new parameter. A rename that somehow survives is
 rejected rather than waved through, by both Step D and the verifier.
