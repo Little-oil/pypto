@@ -4172,6 +4172,62 @@ class TestFlattenTileNdTo2DStandaloneTranspose:
             if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call)
         ]
 
+    @pytest.mark.parametrize(
+        "dtype, rows, cols, scratch_page_rows",
+        [
+            (DataType.FP32, 24, 8, 32),
+            (DataType.FP32, 8, 8, 16),
+            (DataType.FP32, 16, 8, 16),
+            (DataType.FP32, 24, 24, 32),
+            (DataType.FP16, 16, 16, 32),
+            (DataType.FP16, 32, 16, 64),
+            (DataType.FP16, 32, 32, 32),
+            (DataType.INT8, 48, 32, 64),
+        ],
+    )
+    def test_nd_transpose_scratch_pages_cover_isa_workspace(self, dtype, rows, cols, scratch_page_rows):
+        """Reserve each ISA workspace without changing the source-shaped scratch view.
+
+        FP32 [24, 8] needs 1024 bytes, not 768. FP16 [32, 16] needs two
+        strips of 32x16 elements, and INT8 rounds its scratch stride to 32.
+        The fourth page must fit inside the pool instead of reaching the
+        following allocation, as it did in the failing hardware transpose.
+        """
+        batches = 4
+        Before = _build_before_nd(
+            [("x", [batches, rows, cols])],
+            [batches, cols, rows],
+            dtype,
+            lambda _ib, tiles: tile_ops.transpose(tiles[0], 1, 2),
+        )
+        After = passes.flatten_tile_nd_to_2d()(Before)
+        func = After.get_function("main_incore_0")
+        assert func is not None
+        definitions = {
+            stmt.var.unique_id: stmt.value
+            for stmt in cast(ir.SeqStmts, func.body).stmts
+            if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call)
+        }
+        transposes = [call for call in definitions.values() if call.op.name == _OP_TILE_TRANSPOSE]
+        assert len(transposes) == batches
+        pool_id = None
+        for batch, transpose in enumerate(transposes):
+            source = cast(ir.TileType, transpose.args[0].type)
+            scratch = cast(ir.Var, transpose.args[3])
+            assert cast(ir.TileType, scratch.type).shape == source.shape == [rows, cols]
+            assert cast(ir.TileType, transpose.type).shape == [cols, rows]
+            scratch_slice = definitions[scratch.unique_id]
+            assert scratch_slice.op.name == _OP_TILE_SLICE
+            assert _const_int_values(cast(ir.MakeTuple, scratch_slice.args[1]).elements) == [rows, cols]
+            assert _const_int_values(cast(ir.MakeTuple, scratch_slice.args[2]).elements) == [
+                batch * scratch_page_rows,
+                0,
+            ]
+            pool = cast(ir.Var, scratch_slice.args[0])
+            assert pool_id is None or pool.unique_id == pool_id
+            pool_id = pool.unique_id
+            assert cast(ir.TileType, pool.type).shape == [batches * scratch_page_rows, cols]
+
     def test_nd_transpose_unrolls_to_2d_transposes(self):
         """``transpose([2,3,8], 1, 2) -> [2,8,3]`` unrolls into 2 per-batch 2D transposes.
 

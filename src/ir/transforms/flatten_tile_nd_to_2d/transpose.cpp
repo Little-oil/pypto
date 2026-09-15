@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <any>
 #include <cstddef>
 #include <cstdint>
@@ -129,7 +130,20 @@ NdTransposeResult LowerNdTranspose(const AssignStmtPtr& assign, const CallPtr& c
   VarPtr out_var = std::make_shared<Var>(assign->var_->name_hint_, create_out->GetType(), span);
   out.stmts.push_back(std::make_shared<AssignStmt>(out_var, create_out, assign->span_));
 
-  // Pre-create one flat scratch pool [batch_count*A, B] sliced per batch.
+  // Reserve enough backing storage for every A2/A3 TTRANS path. Its temporary
+  // row stride rounds A to 32 elements for b8 or 16 for b16/b32. Tail tiles
+  // stage at least one 32-byte block of columns; b16 vtranspose stages two
+  // full-height strips of 16 columns (tmpA and tmpB).
+  const int64_t element_bytes = static_cast<int64_t>(operand_type->dtype_.GetByte());
+  const int64_t block_elements = 32 / element_bytes;
+  const int64_t row_alignment = element_bytes == 1 ? 32 : 16;
+  const int64_t tmp_stride = ((a + row_alignment - 1) / row_alignment) * row_alignment;
+  const int64_t staging_cols = element_bytes == 2 ? 2 * block_elements : block_elements;
+  const int64_t scratch_elements = tmp_stride * std::max(b, staging_cols);
+  const int64_t scratch_page_rows = (scratch_elements + b - 1) / b;
+
+  // Pre-create one flat scratch pool [batch_count*scratch_page_rows, B]. The
+  // per-batch views keep shape [A, B], but their backing pages include padding.
   // pto.ttrans requires a scratch operand whose type matches the source page's;
   // its codegen reuses the SOURCE's type for BOTH ins operands
   // (MakeTileTransposeCodegenPTO emits "src_type, src_type"). The source page is
@@ -141,7 +155,8 @@ NdTransposeResult LowerNdTranspose(const AssignStmtPtr& assign, const CallPtr& c
   // both dynamic (at its def/set_validshape) and static (at the ttrans use) ->
   // ptoas type conflict. The pool lives across the loop; being a single
   // allocation it is cheap relative to per-batch scratch churn.
-  auto tmp_pool_shape = std::make_shared<MakeTuple>(Make2DShapeExprs(batch_count * a, b, span), span);
+  auto tmp_pool_shape =
+      std::make_shared<MakeTuple>(Make2DShapeExprs(batch_count * scratch_page_rows, b, span), span);
   std::vector<std::pair<std::string, std::any>> tmp_pool_kw = {
       {"dtype", operand_type->dtype_},
       {"target_memory", target_mem},
@@ -164,8 +179,10 @@ NdTransposeResult LowerNdTranspose(const AssignStmtPtr& assign, const CallPtr& c
     out.stmts.push_back(std::make_shared<AssignStmt>(As<Var>(src_page), slice, assign->span_));
 
     // Slice the i-th 2D scratch page [A, B] from the flat tmp pool (subview with
-    // STATIC valid [A, B], matching the source page's type exactly).
-    auto tmp_offset = MakeShapeTupleFromInts({i * a, 0}, span);
+    // STATIC valid [A, B], matching the source page's type exactly). Advance
+    // by the full workspace capacity so TTRANS cannot overwrite the next page
+    // or the allocation following the pool.
+    auto tmp_offset = MakeShapeTupleFromInts({i * scratch_page_rows, 0}, span);
     auto tmp_shape = MakeShapeTupleFromInts({a, b}, span);
     auto tmp_slice = op_registry.Create("tile.slice", {tmp_pool_var, tmp_shape, tmp_offset}, span);
     ExprPtr scratch_page = std::make_shared<Var>("trans_tmp_" + suffix, tmp_slice->GetType(), span);
