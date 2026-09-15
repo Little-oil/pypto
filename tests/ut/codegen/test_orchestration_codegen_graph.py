@@ -581,6 +581,7 @@ def test_graph_scalar_value_reads_compile_and_preserve_task_forwarding(tmp_path)
     ):
         assert f"{name}.to<{cpp_type}>()" in body, body
     # Reading a value elsewhere must not discard its origin when forwarding it.
+    assert re.search(r"float \w+ = scale\.to<float>\(\);", body), body
     assert ".add_scalar(n)" in body, body
     assert ".add_scalar(scale)" in body, body
 

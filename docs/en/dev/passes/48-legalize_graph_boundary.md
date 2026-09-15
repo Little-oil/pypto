@@ -311,6 +311,8 @@ for example `for i in pl.range(n)`. Codegen emits explicit typed reads such as
 `n.to<int64_t>()` in value contexts, including loop bounds and scalar carry
 initializers. Task argument forwarding keeps the `InheritableScalar` wrapper,
 including for floating-point parameters, so replay retains the parameter origin.
+The orchestration entry reads its scalar inputs with `orch_args.scalar<T>(i)`,
+which decodes values directly in both supported runtimes.
 
 | Check | Why |
 | ----- | --- |
