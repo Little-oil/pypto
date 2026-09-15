@@ -4747,8 +4747,6 @@ std::string GenerateGraphFunctions(const ProgramPtr& program, const FunctionPtr&
         ++tensor_index;
         continue;
       }
-      // Keep the runtime's scalar wrapper so add_scalar inherits this boundary
-      // parameter instead of recording an integer conversion as static data.
       oss << "    const auto " << name << " = args.scalar(" << scalar_index << ");\n";
       ++scalar_index;
     }

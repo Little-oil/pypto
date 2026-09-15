@@ -17,13 +17,14 @@ That makes four classes of problem possible:
 
 | Problem | What the runtime does | What this pass does |
 | ------- | --------------------- | ------------------- |
-| A boundary scalar is *derived* inside the region | Classifies it as static data and freezes the first call's value into the recording; an implicit value conversion is deprecated | **Step A** — hoists the computation to the call site, or leaves it alone when the frozen value is provably the right one |
+| A boundary scalar is *derived* inside the region | Explicitly extracting a value loses its parameter origin and freezes it into the recording; implicit conversion is rejected | **Step A** — hoists the computation to the call site, or leaves it alone when the frozen value is provably the right one |
 | A view of a boundary tensor is taken *inside* the region | Freezes the first call's offset and patches only the address, so a later call reads call one's window | **Step B** — hoists the view to the call site, or accepts it when its window is replay-invariant |
 | The region allocates its own intermediates | Records them correctly, on a heap it never reclaims mid-run, so the live set grows with the number of submissions | **Step C** — hoists the allocation to the call site as an `InOut` boundary tensor |
 | The boundary itself is not cacheable | Declines to cache and silently runs the region as ordinary tasks | **Step D** — rejects it at compile time |
 
-The first two produce wrong answers. The third produces correct answers that run
-out of memory, or merely slower, as the layer count grows. The last produces
+The first two can produce wrong answers when values lose their replay linkage.
+The third produces correct answers that run out of memory, or merely slower, as
+the layer count grows. The last produces
 correct answers with none of the intended speedup — invisible to any numerical
 test, which is why the checks live here rather than being left to a runtime log
 line.
@@ -33,7 +34,9 @@ line.
 A boundary scalar carries its **parameter origin** in the runtime's
 `InheritableScalar` wrapper. `args.scalar(k)` returns that wrapper; forwarding
 it through `add_scalar` preserves the parameter index that replay refreshes.
-Converting the wrapper to an integer or computing a new value loses that origin:
+Explicitly extracting a value with `to<T>()` loses that origin; implicit integer
+conversion and arithmetic on the wrapper are rejected. Step A moves derived
+computations outside the Graph body:
 
 ```python
 @pl.function(type=pl.FunctionType.Graph)
@@ -65,12 +68,13 @@ tensor argument to precede every scalar one.
 ### A bare rename is deleted, not accepted
 
 `n = batch` computes nothing, so there is nothing to hoist — but leaving it alone
-reintroduces the very bug Step A exists to prevent. Codegen emits a surviving
-alias as a **value copy**:
+would generate `int64_t n = batch;`, which the runtime rejects because the
+wrapper has no implicit integer conversion. Explicitly extracting its value
+would compile, but lose the parameter origin:
 
 ```cpp
 const auto batch = args.scalar(0);  // preserves the parameter origin
-int64_t n = batch;                  // deprecated conversion to a plain value
+int64_t n = batch.to<int64_t>();    // explicitly reads the recording-time value
 g0_params_t0.add_scalar(n);         // the task no longer inherits the parameter
 ```
 

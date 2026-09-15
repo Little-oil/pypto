@@ -4173,6 +4173,33 @@ class TestFlattenTileNdTo2DStandaloneTranspose:
         ]
 
     @pytest.mark.parametrize(
+        "shape, dtype, message",
+        [
+            ([1, 0, 8], DataType.FP32, "must be positive"),
+            ([1, 8, 0], DataType.FP32, "must be positive"),
+            ([1, -1, 8], DataType.FP32, "must be positive"),
+            ([1, 8, -1], DataType.FP32, "must be positive"),
+            ([1, 16, 8], DataType.INT64, "requires a 1-, 2-, or 4-byte element type"),
+            ([1, (1 << 63) - 1, 1], DataType.FP32, "overflow.*scratch row alignment"),
+            ([1, 1, 1 << 59], DataType.FP32, "overflow.*scratch page elements"),
+            ([1 << 59, 1, 1], DataType.FP32, "overflow.*scratch pool rows"),
+            ([1, 1, 1 << 57], DataType.FP32, "overflow.*scratch pool bytes"),
+        ],
+    )
+    def test_nd_transpose_rejects_invalid_workspace(self, shape, dtype, message):
+        """Reject invalid or overflowing workspaces before unrolling the batches."""
+        ib = IRBuilder()
+        with ib.function("main_incore_0", type=ir.FunctionType.InCore) as f:
+            source = f.param("x", ir.TileType(shape, dtype))
+            result = ib.let("result", tile_ops.transpose(source, 1, 2))
+            f.return_type(result.type)
+            ib.return_stmt(result)
+        before = ir.Program([f.get_result()], "invalid_transpose_workspace", ir.Span.unknown())
+
+        with pytest.raises(ValueError, match=message):
+            passes.flatten_tile_nd_to_2d()(before)
+
+    @pytest.mark.parametrize(
         "dtype, rows, cols, scratch_page_rows",
         [
             (DataType.FP32, 24, 8, 32),
@@ -4186,13 +4213,7 @@ class TestFlattenTileNdTo2DStandaloneTranspose:
         ],
     )
     def test_nd_transpose_scratch_pages_cover_isa_workspace(self, dtype, rows, cols, scratch_page_rows):
-        """Reserve each ISA workspace without changing the source-shaped scratch view.
-
-        FP32 [24, 8] needs 1024 bytes, not 768. FP16 [32, 16] needs two
-        strips of 32x16 elements, and INT8 rounds its scratch stride to 32.
-        The fourth page must fit inside the pool instead of reaching the
-        following allocation, as it did in the failing hardware transpose.
-        """
+        """Keep source-shaped views while reserving non-overlapping ISA workspaces."""
         batches = 4
         Before = _build_before_nd(
             [("x", [batches, rows, cols])],

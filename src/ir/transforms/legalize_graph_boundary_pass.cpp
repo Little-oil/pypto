@@ -236,14 +236,8 @@ class DerivedScalarCollector : public IRVisitor {
         // call site, where what it names may itself be a hoist not yet bound.
         definition_index_[var.get()] = next_definition_++;
         passthrough_order_.emplace_back(var.get(), aliased);
-        // Also recorded for *body* substitution, which is a different problem
-        // from the call-site binding above. The name has to go away entirely:
-        // orchestration codegen emits a surviving scalar alias as a value copy
-        // (`int64_t n = batch;`), and recording matches a boundary scalar by the
-        // address of its argument slot, so the copy is classified as static data
-        // and frozen at the first call's value. `IsDerivable` has already proven
-        // the target is a scalar parameter or an earlier such alias, so every
-        // chain bottoms out somewhere that does own a slot.
+        // Resolve body aliases to their boundary parameter so codegen forwards
+        // its InheritableScalar wrapper without an integer conversion.
         scalar_alias_target_[var.get()] = aliased;
         return;
       }
@@ -703,13 +697,9 @@ class UnhoistableScalarChecker : public IRVisitor {
 /// Replaces hoisted body variables with their new parameters and erases the
 /// assignments that used to compute them — the value now arrives as an argument.
 ///
-/// Also erases every scalar `alias = <name>` binding, redirecting its readers to
-/// whatever the chain bottoms out at. A surviving alias is not merely redundant:
-/// orchestration codegen emits it as `int64_t n = batch;`, and the recording
-/// classifies a scalar by its retained parameter origin. The integer copy loses
-/// that origin, is recorded as static data, and every later replay reuses the
-/// first call's number. Substituting the name away keeps `add_scalar(batch)`
-/// forwarding the runtime's InheritableScalar wrapper.
+/// Erases scalar aliases so readers forward the boundary's InheritableScalar.
+/// A surviving `int64_t n = batch;` would fail to compile; explicitly extracting
+/// its value with `to<int64_t>()` would instead lose the parameter origin.
 class HoistedValueRewriter : public IRMutator {
  public:
   explicit HoistedValueRewriter(const GraphPlan& plan) {

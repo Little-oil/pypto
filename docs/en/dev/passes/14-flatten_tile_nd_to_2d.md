@@ -62,7 +62,7 @@ Per-statement handling:
 | Other tile ops (>2D) | Substitute vars, re-create with 2D types |
 | 1D/2D tile ops | Unchanged |
 
-For N-D transpose scratch, round A to 32 elements for 8-bit types or 16 for 16/32-bit types. Reserve at least one 32-byte column block, or two full-height 16-column strips for 16-bit vtranspose. Round the resulting workspace capacity up to whole rows of B elements to obtain `scratch_page_rows`; both the pool allocation and each page offset use this padded size. Thus an FP32 `[24, 8]` page has a 1024-byte workspace while its scratch view retains shape `[24, 8]`.
+For N-D transpose scratch, round A to 32 elements for 8-bit types or 16 for 16/32-bit types. Reserve at least one 32-byte column block, or two full-height 16-column strips for 16-bit vtranspose. Round the resulting workspace capacity up to whole rows of B elements to obtain `scratch_page_rows`; both the pool allocation and each page offset use this padded size. Thus an FP32 `[24, 8]` page has a 1024-byte workspace while its scratch view retains shape `[24, 8]`. Page dimensions must be positive and element storage must be 1, 2, or 4 bytes. Workspace rounding, pool dimensions, and the total pool byte size must fit in `int64_t`; unsupported types and oversized workspaces are rejected before batch expansion.
 
 **Unified operand handling — whole-fit slice vs. per-batch load.** Every
 batch_matmul operand (lhs or rhs, transposed or not, load- or move-sourced) is
