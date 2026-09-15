@@ -135,6 +135,9 @@ NdTransposeResult LowerNdTranspose(const AssignStmtPtr& assign, const CallPtr& c
   // stage at least one 32-byte block of columns; b16 vtranspose stages two
   // full-height strips of 16 columns (tmpA and tmpB).
   const int64_t element_bytes = static_cast<int64_t>(operand_type->dtype_.GetByte());
+  INTERNAL_CHECK_SPAN(element_bytes > 0, span)
+      << "Internal error: tile.transpose input dtype must have a positive byte size, got "
+      << operand_type->dtype_.ToString();
   const int64_t block_elements = 32 / element_bytes;
   const int64_t row_alignment = element_bytes == 1 ? 32 : 16;
   const int64_t tmp_stride = ((a + row_alignment - 1) / row_alignment) * row_alignment;
