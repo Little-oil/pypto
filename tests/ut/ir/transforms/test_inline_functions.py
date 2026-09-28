@@ -1948,6 +1948,39 @@ class TestInlineFunctionsSubmitCallSite:
 
 
 class TestInlineFunctionsDynamicShapes:
+    @pytest.mark.parametrize("loop_carried", [False, True])
+    @pytest.mark.parametrize("separate_symbols", [False, True])
+    def test_logical_and_padded_local_types(self, loop_carried, separate_symbols):
+        """Local/loop types require distinct symbols for distinct argument extents."""
+        rows = pl.dynamic("CALLEE_ROWS")
+        padded_rows = pl.dynamic("PADDED_ROWS") if separate_symbols else rows
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, out: pl.Tensor[[rows, 4], pl.FP32], padded: pl.Tensor[[padded_rows, 4], pl.FP32]):
+                if loop_carried:
+                    for i in pl.range(2):
+                        out = pl.add(out, out)
+                else:
+                    _updated = pl.add(padded, padded)
+
+            @pl.function
+            def main(self, out: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                self.fill(out, padded)
+                return out
+
+        if separate_symbols:
+            after = passes.inline_functions()(Before)
+            passes.convert_to_ssa()(after)
+            return
+
+        with pytest.raises(
+            ValueError,
+            match="Cannot inline 'fill': type dimension 'CALLEE_ROWS'.*Use distinct dynamic symbols",
+        ):
+            passes.inline_functions()(Before)
+
     def test_void_inline_call_preserves_logical_and_padded_arguments(self):
         """Inline helpers may use one placeholder for logical and padded buffers."""
         rows = pl.dynamic("CALLEE_ROWS")

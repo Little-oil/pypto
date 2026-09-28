@@ -36,6 +36,7 @@
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
+#include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
@@ -235,6 +236,38 @@ struct SplicedInlineBody {
   bool has_return;                     // Whether the body ended with a ReturnStmt
 };
 
+// Conflicting argument extents may leave a callee dimension unbound. Reject it
+// only if it survives cloning; a helper using just the actual arguments remains
+// valid. Reuse the shared type-field walk for tensor, tile, tuple and view types.
+class UnboundInlineDimensionChecker : public IRVisitor {
+ public:
+  UnboundInlineDimensionChecker(const FunctionPtr& callee, const std::unordered_set<const Var*>& unbound)
+      : callee_(callee), unbound_(unbound) {}
+
+  void VisitExpr(const ExprPtr& expr) override {
+    if (!expr) return;
+    if (auto var = As<Var>(expr)) CheckDimension(var.get(), expr->span_);
+    if (auto type = expr->GetType(); type && checked_types_.insert(type.get()).second) {
+      for (const auto* var : var_collectors::GetSortedVarRefs(var_collectors::CollectTypeVars(type))) {
+        CheckDimension(var, expr->span_);
+      }
+    }
+    IRVisitor::VisitExpr(expr);
+  }
+
+ private:
+  void CheckDimension(const Var* var, const Span& span) const {
+    CHECK_SPAN(unbound_.count(var) == 0, span)
+        << "Cannot inline '" << callee_->name_ << "': type dimension '" << var->name_hint_
+        << "' remains unresolved from the argument shapes. Use distinct dynamic symbols for parameters "
+           "with different extents.";
+  }
+
+  const FunctionPtr& callee_;
+  const std::unordered_set<const Var*>& unbound_;
+  std::unordered_set<const Type*> checked_types_;
+};
+
 // Steps 1-3 of an inline splice — call-site-form-agnostic. Used by every
 // SpliceInlineCall* helper.
 //
@@ -332,6 +365,26 @@ SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<E
   //    Pre-seeding fresh Vars would bypass that remapping: seeded replacements
   //    are intentionally used verbatim to preserve the caller's arguments.
   auto [renamed_body, _unused] = DeepClone(callee->body_, seed, /*clone_def_vars=*/true, FreshName);
+
+  std::unordered_set<const Var*> unbound_dimensions;
+  for (const auto& param : callee->params_) {
+    for (const auto* var : var_collectors::CollectTypeVars(param->GetType())) {
+      if (seed.count(var) == 0) unbound_dimensions.insert(var);
+    }
+  }
+  // Caller-owned symbols in actual arguments are valid even when the callee's
+  // other arguments cannot establish a single substitution for them.
+  for (const auto& arg : args) {
+    for (const auto* var : var_collectors::CollectTypeVars(arg->GetType())) {
+      unbound_dimensions.erase(var);
+    }
+    var_collectors::VarDefUseCollector uses;
+    uses.VisitExpr(arg);
+    for (const auto* var : uses.var_uses) unbound_dimensions.erase(var);
+  }
+  if (!unbound_dimensions.empty()) {
+    UnboundInlineDimensionChecker(callee, unbound_dimensions).VisitStmt(renamed_body);
+  }
 
   // 3. Walk renamed_body and separate trailing ReturnStmt from the rest.
   std::vector<StmtPtr> spliced = std::move(arg_bindings);  // must precede the body
