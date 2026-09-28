@@ -1948,6 +1948,29 @@ class TestInlineFunctionsSubmitCallSite:
 
 
 class TestInlineFunctionsDynamicShapes:
+    def test_caller_signature_dimension_not_present_in_actual_arguments(self):
+        """A signature dimension stays in scope when only static buffers reach the helper."""
+        rows = pl.dynamic("SHARED_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, out: pl.Tensor[[rows, 4], pl.FP32], padded: pl.Tensor[[rows, 4], pl.FP32]):
+                _scratch = pl.create_tensor([rows, 4], pl.FP32)
+
+            @pl.function
+            def main(
+                self,
+                marker: pl.Tensor[[rows, 4], pl.FP32],
+                out: pl.Tensor[[8, 4], pl.FP32],
+                padded: pl.Tensor[[16, 4], pl.FP32],
+            ):
+                self.fill(out, padded)
+                return marker
+
+        after = passes.inline_functions()(Before)
+        passes.convert_to_ssa()(after)
+
     @pytest.mark.parametrize("loop_carried", [False, True])
     @pytest.mark.parametrize("separate_symbols", [False, True])
     def test_logical_and_padded_local_types(self, loop_carried, separate_symbols):

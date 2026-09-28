@@ -281,7 +281,8 @@ class UnboundInlineDimensionChecker : public IRVisitor {
 //      actual, ...)` whenever the actual arg is a Var.
 //   3. Split the cloned body into pre-return statements and the trailing
 //      return value(s); reject any non-trailing return.
-SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<ExprPtr>& args) {
+SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
+                                  const std::unordered_set<const Var*>& caller_dimensions) {
   INTERNAL_CHECK_SPAN(callee->params_.size() == args.size(), callee->span_)
       << "Internal error: inline call to '" << callee->name_ << "' has " << args.size()
       << " argument(s) but callee expects " << callee->params_.size()
@@ -369,7 +370,7 @@ SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<E
   std::unordered_set<const Var*> unbound_dimensions;
   for (const auto& param : callee->params_) {
     for (const auto* var : var_collectors::CollectTypeVars(param->GetType())) {
-      if (seed.count(var) == 0) unbound_dimensions.insert(var);
+      if (seed.count(var) == 0 && caller_dimensions.count(var) == 0) unbound_dimensions.insert(var);
     }
   }
   // Caller-owned symbols in actual arguments are valid even when the callee's
@@ -455,8 +456,9 @@ SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<E
 // or a MakeTuple / TupleGetItemExpr over a call), and that cannot become an
 // EvalStmt the way a call-like value can — reject it loudly instead of deleting
 // the nested call with it.
-std::vector<StmtPtr> SpliceInlineCallAsEval(const FunctionPtr& callee, const std::vector<ExprPtr>& args) {
-  auto body = CloneInlineBody(callee, args);
+std::vector<StmtPtr> SpliceInlineCallAsEval(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
+                                            const std::unordered_set<const Var*>& caller_dimensions) {
+  auto body = CloneInlineBody(callee, args, caller_dimensions);
   for (const auto& value : body.return_values) {
     if (!value) continue;
     if (IsEffectfulCallLike(value)) {
@@ -480,8 +482,9 @@ std::vector<StmtPtr> SpliceInlineCallAsEval(const FunctionPtr& callee, const std
 // if the callee returns multiple values — multi-return goes through
 // SpliceInlineCallAsTupleSub, which avoids the dead `LHS = MakeTuple(...)`.
 std::vector<StmtPtr> SpliceInlineCallAsAssign(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
-                                              const VarPtr& lhs, const Span& call_site_span) {
-  auto body = CloneInlineBody(callee, args);
+                                              const VarPtr& lhs, const Span& call_site_span,
+                                              const std::unordered_set<const Var*>& caller_dimensions) {
+  auto body = CloneInlineBody(callee, args, caller_dimensions);
   INTERNAL_CHECK_SPAN(body.has_return, call_site_span)
       << "Internal error: inline function '" << callee->name_
       << "' is called for its value but has no return statement (parser should reject "
@@ -511,8 +514,9 @@ std::vector<StmtPtr> SpliceInlineCallAsAssign(const FunctionPtr& callee, const s
 // _tuple_tmp[i]`) means every LHS use is a TupleGetItemExpr — substituting
 // makes the LHS unreferenced and the binding effectively dead.
 std::vector<StmtPtr> SpliceInlineCallAsTupleSub(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
-                                                std::vector<ExprPtr>& out_substitution) {
-  auto body = CloneInlineBody(callee, args);
+                                                std::vector<ExprPtr>& out_substitution,
+                                                const std::unordered_set<const Var*>& caller_dimensions) {
+  auto body = CloneInlineBody(callee, args, caller_dimensions);
   INTERNAL_CHECK_SPAN(body.has_return, callee->span_)
       << "Internal error: inline function '" << callee->name_
       << "' is called for its value but has no return statement (parser should reject "
@@ -555,8 +559,9 @@ std::vector<StmtPtr> SpliceInlineCallAsTupleSub(const FunctionPtr& callee, const
 // values directly. Single-return → ReturnStmt({v}); multi-return →
 // ReturnStmt({v0, v1, ...}). No MakeTuple, no temporary.
 std::vector<StmtPtr> SpliceInlineCallAsReturn(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
-                                              const Span& call_site_span) {
-  auto body = CloneInlineBody(callee, args);
+                                              const Span& call_site_span,
+                                              const std::unordered_set<const Var*>& caller_dimensions) {
+  auto body = CloneInlineBody(callee, args, caller_dimensions);
   INTERNAL_CHECK_SPAN(body.has_return, call_site_span)
       << "Internal error: inline function '" << callee->name_
       << "' is used as a return value but has no return statement (parser should reject "
@@ -794,8 +799,20 @@ class NestedInlineCallHoister : public IRMutator {
 
 class InlineCallsMutator : public IRMutator {
  public:
-  explicit InlineCallsMutator(const std::unordered_map<std::string, FunctionPtr>& inline_fns)
-      : inline_fns_(inline_fns) {}
+  InlineCallsMutator(const std::unordered_map<std::string, FunctionPtr>& inline_fns,
+                     const FunctionPtr& caller)
+      : inline_fns_(inline_fns) {
+    // Signature dimensions are in scope throughout the caller, including when
+    // a particular inline call receives only locally allocated buffers.
+    for (const auto& param : caller->params_) {
+      auto vars = var_collectors::CollectTypeVars(param->GetType());
+      caller_dimensions_.insert(vars.begin(), vars.end());
+    }
+    for (const auto& type : caller->return_types_) {
+      auto vars = var_collectors::CollectTypeVars(type);
+      caller_dimensions_.insert(vars.begin(), vars.end());
+    }
+  }
 
   bool Changed() const { return changed_; }
 
@@ -1014,7 +1031,7 @@ class InlineCallsMutator : public IRMutator {
         if (auto assign = As<AssignStmt>(stmt)) {
           spliced = SpliceAssignCallSite(callee, call->args_, assign->var_, assign->span_);
         } else if (auto eval = As<EvalStmt>(stmt)) {
-          spliced = SpliceInlineCallAsEval(callee, call->args_);
+          spliced = SpliceInlineCallAsEval(callee, call->args_, caller_dimensions_);
         }
       }
     }
@@ -1026,7 +1043,7 @@ class InlineCallsMutator : public IRMutator {
         if (auto call = As<Call>(ret->value_[0])) {
           if (auto callee = LookupInlineCallee(call)) {
             call_dump_vars = call->GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
-            spliced = SpliceInlineCallAsReturn(callee, call->args_, ret->span_);
+            spliced = SpliceInlineCallAsReturn(callee, call->args_, ret->span_, caller_dimensions_);
           }
         }
       }
@@ -1051,11 +1068,11 @@ class InlineCallsMutator : public IRMutator {
                                             const VarPtr& lhs, const Span& span) {
     if (InlineReturnsTuple(callee)) {
       std::vector<ExprPtr> sub;
-      auto stmts = SpliceInlineCallAsTupleSub(callee, args, sub);
+      auto stmts = SpliceInlineCallAsTupleSub(callee, args, sub, caller_dimensions_);
       tuple_subs_[lhs.get()] = std::move(sub);
       return stmts;
     }
-    return SpliceInlineCallAsAssign(callee, args, lhs, span);
+    return SpliceInlineCallAsAssign(callee, args, lhs, span, caller_dimensions_);
   }
 
   FunctionPtr LookupInlineCallee(const CallPtr& call) const {
@@ -1068,6 +1085,7 @@ class InlineCallsMutator : public IRMutator {
 
  private:
   const std::unordered_map<std::string, FunctionPtr>& inline_fns_;
+  std::unordered_set<const Var*> caller_dimensions_;
   bool changed_ = false;
   // LHS Var → return values, populated by SpliceAssignCallSite for multi-return
   // call sites. Subsequent TupleGetItemExpr uses of the Var are substituted
@@ -1158,7 +1176,7 @@ Pass InlineFunctions() {
       }
 
       for (auto& [name, fn] : current) {
-        InlineCallsMutator mutator(latest_inline);
+        InlineCallsMutator mutator(latest_inline, fn);
         auto new_body = mutator.VisitStmt(fn->body_);
         if (mutator.Changed()) {
           auto updated = MutableCopy(fn);
