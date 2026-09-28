@@ -18,6 +18,7 @@ from _orchestration_codegen_common import _generate_orch_code, _out_of_scope_ten
 from pypto import backend, ir, passes
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+from pypto.runtime import RunConfig
 
 
 def _compile(program, auto_deps):
@@ -251,6 +252,54 @@ def test_composite_positive_bound_survives_late_simplify(auto_deps):
     assert "if (" in code
     # The author guard suffices; no generated launch-count guard is needed.
     assert "_nonempty" not in ir.python_print(result)
+
+
+@pytest.mark.parametrize("conditional", [False, True])
+def test_nested_inline_conditional_output_keeps_dynamic_shape(conditional, tmp_path):
+    """Nested inline allocation and padding must retain the output's actual shape."""
+    n_dim = pl.dynamic("n_dim")
+
+    @pl.jit.inline
+    def pad(ids: pl.Tensor[[n_dim], pl.INT32], out: pl.Tensor[[n_dim, 16], pl.FP32]):
+        n = pl.tensor.dim(ids, 0)
+        with pl.spmd(n, name_hint="pad_output_init") as tid:
+            bi = pl.tile.get_block_idx()
+            if conditional:
+                if pl.read(ids, [bi]) < 0:
+                    out[bi : bi + 1, :] = pl.full([1, 16], dtype=pl.FP32, value=0.0)
+            else:
+                out[bi : bi + 1, :] = pl.full([1, 16], dtype=pl.FP32, value=0.0)
+        _fence = pl.system.task_dummy(deps=[tid])
+        return out
+
+    @pl.jit.inline
+    def allocate(ids: pl.Tensor[[n_dim], pl.INT32], positions: pl.Tensor[[n_dim], pl.INT32]):
+        rows = pl.tensor.dim(positions, 0)
+        out = pl.create_tensor([rows, 16], dtype=pl.FP32)
+        out = pad(ids, out)
+        return out
+
+    @pl.jit
+    def main(ids: pl.Tensor[[n_dim], pl.INT32], positions: pl.Tensor[[n_dim], pl.INT32]):
+        return allocate(ids, positions)
+
+    # Text roundtrip normalizes redundant pre-SSA aliases in the nested inline
+    # body. Keep every pass's property checks and lossless binary roundtrip.
+    def check_binary_roundtrip(_pass, intermediate):
+        ir.assert_structural_equal(
+            intermediate, ir.deserialize(ir.serialize(intermediate)), enable_auto_mapping=True
+        )
+
+    with passes.PassContext(
+        [
+            passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER),
+            passes.CallbackInstrument(after_pass=check_binary_roundtrip),
+        ]
+    ):
+        compiled = main.compile(
+            config=RunConfig(codegen_only=True, save_kernels=True, save_kernels_dir=str(tmp_path))
+        )
+    assert compiled is not None
 
 
 if __name__ == "__main__":

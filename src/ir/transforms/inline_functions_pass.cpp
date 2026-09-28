@@ -25,6 +25,7 @@
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memref.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
@@ -32,8 +33,10 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
@@ -116,21 +119,29 @@ void DetectInlineCycles(const std::unordered_map<std::string, FunctionPtr>& inli
 
 // Collects Vars whose binding sites must be alpha-renamed at each splice.
 //
-// We deliberately omit `iter_args_` of For/While loops: the base IRMutator
-// already mints fresh IterArg instances per visit (see mutator.cpp:581 / 664).
-// Including them here would seed `rename_map_` with entries the base mutator
-// later overwrites/erases, leading to inconsistent def-use after the splice.
+// Keep IterArgs separately so their fresh seeds preserve the node kind and
+// initial value. Types in the loop body may reference them before DeepClone
+// visits the loop, so they must participate in the same substitution map.
 class DefVarCollector : public IRVisitor {
  public:
   std::unordered_set<const Var*> defs;
+  std::unordered_map<const Var*, IterArgPtr> iter_args;
+  std::unordered_map<const Var*, bool> inferred_def_types;
 
   void VisitStmt_(const AssignStmtPtr& op) override {
-    if (op->var_) defs.insert(op->var_.get());
+    if (op->var_) {
+      defs.insert(op->var_.get());
+      // A descriptor differing from the original RHS contains author-supplied
+      // metadata (for example an explicit view on an alias). Preserve it.
+      inferred_def_types.emplace(op->var_.get(),
+                                 structural_equal(op->var_->GetType(), op->value_->GetType()));
+    }
     IRVisitor::VisitStmt_(op);
   }
 
   void VisitStmt_(const ForStmtPtr& op) override {
     if (op->loop_var_) defs.insert(op->loop_var_.get());
+    for (const auto& arg : op->iter_args_) iter_args[arg.get()] = arg;
     for (const auto& v : op->return_vars_) {
       if (v) defs.insert(v.get());
     }
@@ -138,6 +149,7 @@ class DefVarCollector : public IRVisitor {
   }
 
   void VisitStmt_(const WhileStmtPtr& op) override {
+    for (const auto& arg : op->iter_args_) iter_args[arg.get()] = arg;
     for (const auto& v : op->return_vars_) {
       if (v) defs.insert(v.get());
     }
@@ -239,6 +251,93 @@ struct SplicedInlineBody {
   bool has_return;                     // Whether the body ended with a ReturnStmt
 };
 
+// DeepClone returns seeded Vars verbatim, including their original types.
+// Resolve embedded dimensions in fresh locals before handing the seed to
+// DeepClone. Parameter replacements are caller expressions;
+// return them verbatim: descending into them could specialize a caller Var's type and
+// disconnect it from its definition. DeepClone preserves the same boundary
+// when substituting parameters in the body and in Call/Submit result types.
+class InlineTypeRemapper : public IRMutator {
+ public:
+  InlineTypeRemapper(const std::unordered_map<const Var*, ExprPtr>& seed,
+                     std::unordered_map<const Var*, ExprPtr> caller_subs)
+      : caller_subs_(std::move(caller_subs)) {
+    for (const auto& [var, value] : seed) var_remap_[var] = value;
+  }
+
+  ExprPtr VisitExpr_(const VarPtr& op) override {
+    auto it = caller_subs_.find(op.get());
+    if (it != caller_subs_.end()) return it->second;
+    return IRMutator::VisitExpr_(op);
+  }
+
+ private:
+  std::unordered_map<const Var*, ExprPtr> caller_subs_;
+};
+
+// A substituted tensor handle can have a different descriptor from its formal
+// parameter. Derive writeback result types from their actual destinations,
+// instead of globally binding a symbol shared by several params. Other calls
+// may carry an explicit descriptor that cannot be reconstructed from operands.
+class InlineResultTypeRemapper : public IRMutator {
+ public:
+  explicit InlineResultTypeRemapper(std::unordered_set<const Var*> locals) : locals_(std::move(locals)) {}
+
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    auto call = As<Call>(IRMutator::VisitExpr_(op));
+    if (As<GlobalVar>(call->op_) || !(As<ShapedType>(call->GetType()) || As<TupleType>(call->GetType())))
+      return call;
+    auto& registry = OpRegistry::GetInstance();
+    const auto& entry = registry.GetEntry(call->op_->name_);
+    if (!entry.GetOutputReusesInputArg() || entry.RequiresExplicitType()) return call;
+    auto inferred = registry.Create(call->op_->name_, call->args_, call->kwargs_, call->span_)->GetType();
+    auto type = PreserveStorage(inferred, call->GetType());
+    if (structural_equal(type, call->GetType())) return call;
+    return std::make_shared<Call>(call->op_, call->args_, call->kwargs_, call->attrs_, std::move(type),
+                                  call->span_);
+  }
+
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    auto value = VisitExpr(op->value_);
+    auto var = std::dynamic_pointer_cast<const Var>(VisitExpr(op->var_));
+    // Pre-SSA Vars keep the descriptor of their first definition. Later
+    // writebacks may refine valid_shape; ConvertToSSA uses each RHS type for
+    // those versions. Preserve caller-owned handles at every rebinding.
+    if (locals_.count(op->var_.get()) && initialized_.insert(op->var_.get()).second &&
+        (As<ShapedType>(value->GetType()) || As<TupleType>(value->GetType())) &&
+        !structural_equal(var->GetType(), value->GetType())) {
+      var = std::make_shared<Var>(var->name_hint_, PreserveStorage(value->GetType(), var->GetType()),
+                                  var->span_);
+      var_remap_[op->var_.get()] = var;
+    }
+    if (var == op->var_ && value == op->value_) return op;
+    return std::make_shared<AssignStmt>(var, value, op->span_);
+  }
+
+ private:
+  // Deducers infer value metadata; retain explicit allocation annotations that
+  // are additional information supplied by the author.
+  static TypePtr PreserveStorage(const TypePtr& inferred, const TypePtr& original) {
+    auto memref = GetTypeMemRef(inferred);
+    bool changed = false;
+    if (!memref && GetTypeMemRef(original)) {
+      memref = GetTypeMemRef(original);
+      changed = true;
+    }
+    std::optional<MemorySpace> memory_space;
+    auto tile = As<TileType>(inferred);
+    auto original_tile = As<TileType>(original);
+    if (tile && original_tile && !tile->memory_space_ && original_tile->memory_space_) {
+      memory_space = original_tile->memory_space_;
+      changed = true;
+    }
+    return changed ? CloneTypeWithMemRef(inferred, memref, memory_space) : inferred;
+  }
+
+  std::unordered_set<const Var*> locals_;
+  std::unordered_set<const Var*> initialized_;
+};
+
 // Steps 1-3 of an inline splice — call-site-form-agnostic. Used by every
 // SpliceInlineCall* helper.
 //
@@ -332,10 +431,26 @@ SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<E
     }
     seed[param.get()] = actual;
   }
+  auto caller_subs = seed;
+  std::vector<const Var*> locals;
   for (const Var* v : def_collector.defs) {
     if (seed.count(v) > 0) continue;  // param — already seeded with actual arg
     auto fresh = std::make_shared<Var>(FreshName(v->name_hint_), v->GetType(), v->span_);
     seed[v] = fresh;
+    locals.push_back(v);
+  }
+  for (const auto& [v, arg] : def_collector.iter_args) {
+    seed[v] =
+        std::make_shared<IterArg>(FreshName(arg->name_hint_), arg->GetType(), arg->initValue_, arg->span_);
+    locals.push_back(v);
+  }
+
+  InlineTypeRemapper type_remapper(seed, std::move(caller_subs));
+  for (const Var* v : locals) {
+    // Parameters retain their actual expressions; only fresh local types need
+    // repair. Resolve the entire seed before cloning so all uses share exactly
+    // the same fresh dimension Vars, regardless of definition traversal order.
+    seed[v] = type_remapper.VisitExpr(seed.at(v));
   }
 
   // 2. Deep-clone the body with substitutions applied. DeepClone visits
@@ -345,6 +460,15 @@ SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<E
   //    misses a binding kind, DeepClone still produces a fresh Var rather
   //    than leaving the callee's original Var leaking into the caller.
   auto [renamed_body, _unused] = DeepClone(callee->body_, seed, /*clone_def_vars=*/true);
+  std::unordered_set<const Var*> fresh_locals;
+  for (const Var* v : locals) {
+    auto it = def_collector.inferred_def_types.find(v);
+    if (it != def_collector.inferred_def_types.end() && it->second) {
+      fresh_locals.insert(AsVarLike(seed.at(v)).get());
+    }
+  }
+  InlineResultTypeRemapper result_types(std::move(fresh_locals));
+  renamed_body = result_types.VisitStmt(renamed_body);
 
   // 3. Walk renamed_body and separate trailing ReturnStmt from the rest.
   std::vector<StmtPtr> spliced = std::move(arg_bindings);  // must precede the body
