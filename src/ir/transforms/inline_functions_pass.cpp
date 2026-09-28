@@ -37,6 +37,7 @@
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 
 namespace pypto {
 namespace ir {
@@ -111,15 +112,10 @@ void DetectInlineCycles(const std::unordered_map<std::string, FunctionPtr>& inli
 }
 
 // =============================================================================
-// Collect all defining Vars in a function body (excludes the function's params)
+// Collect defining Vars to detect parameter rebinding
 // =============================================================================
 
-// Collects Vars whose binding sites must be alpha-renamed at each splice.
-//
-// We deliberately omit `iter_args_` of For/While loops: the base IRMutator
-// already mints fresh IterArg instances per visit (see mutator.cpp:581 / 664).
-// Including them here would seed `rename_map_` with entries the base mutator
-// later overwrites/erases, leading to inconsistent def-use after the splice.
+// IterArgs are distinct bindings, not reassignments of function parameters.
 class DefVarCollector : public IRVisitor {
  public:
   std::unordered_set<const Var*> defs;
@@ -242,10 +238,11 @@ struct SplicedInlineBody {
 // Steps 1-3 of an inline splice — call-site-form-agnostic. Used by every
 // SpliceInlineCall* helper.
 //
-//   1. Build the substitution seed: params → actual args, locally-defined
-//      Vars → fresh `_inlineN` Vars. An actual arg that cannot be substituted
-//      verbatim is first bound to a fresh Var at the call site.
-//   2. DeepClone the callee body with that seed. The clone uses the same
+//   1. Build the substitution seed: type variables → actual dimensions and
+//      params → actual args. An actual arg that cannot be substituted verbatim
+//      is first bound to a fresh Var at the call site.
+//   2. DeepClone the callee body, alpha-renaming locals and remapping their
+//      types with that seed. The clone uses the same
 //      substitution at use-sites and def-sites, so a rebinding of a param
 //      (`out = pl.assemble(out, ...)`) collapses to `actual = pl.assemble(
 //      actual, ...)` whenever the actual arg is a Var.
@@ -285,12 +282,9 @@ SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<E
   //          outlined kernel.
   //      Read-only scalar and constant args stay substituted, so shape
   //      expressions that read a param keep folding to the caller's value.
-  //    - Each locally-defined Var → a fresh Var with a `_inlineN` name so
-  //      multi-call-site expansions of the same callee remain
-  //      distinguishable in IR dumps. DeepClone uses the seeded fresh Var
-  //      verbatim; only Vars NOT in the seed receive an auto-cloned copy
-  //      with their original name_hint as a safety fallback.
-  std::unordered_map<const Var*, ExprPtr> seed;
+  //    - Dynamic dimensions in parameter types → actual argument dimensions,
+  //      using the same binding rules as cross-function return-type deduction.
+  auto seed = DeduceCallTypeBindings(callee->params_, args);
   std::vector<StmtPtr> arg_bindings;
   for (size_t i = 0; i < callee->params_.size(); ++i) {
     const VarPtr& param = callee->params_[i];
@@ -332,19 +326,12 @@ SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<E
     }
     seed[param.get()] = actual;
   }
-  for (const Var* v : def_collector.defs) {
-    if (seed.count(v) > 0) continue;  // param — already seeded with actual arg
-    auto fresh = std::make_shared<Var>(FreshName(v->name_hint_), v->GetType(), v->span_);
-    seed[v] = fresh;
-  }
 
-  // 2. Deep-clone the body with substitutions applied. DeepClone visits
-  //    every DefField Var via the same VisitExpr_(VarPtr) pathway as
-  //    use-sites, so the seed map covers both — no separate def-site map
-  //    is needed. clone_def_vars=true is a safety net: if DefVarCollector
-  //    misses a binding kind, DeepClone still produces a fresh Var rather
-  //    than leaving the callee's original Var leaking into the caller.
-  auto [renamed_body, _unused] = DeepClone(callee->body_, seed, /*clone_def_vars=*/true);
+  // 2. Let DeepClone create fresh locals so its existing type remapping also
+  //    substitutes dynamic dimensions and references to other cloned locals.
+  //    Pre-seeding fresh Vars would bypass that remapping: seeded replacements
+  //    are intentionally used verbatim to preserve the caller's arguments.
+  auto [renamed_body, _unused] = DeepClone(callee->body_, seed, /*clone_def_vars=*/true, FreshName);
 
   // 3. Walk renamed_body and separate trailing ReturnStmt from the rest.
   std::vector<StmtPtr> spliced = std::move(arg_bindings);  // must precede the body

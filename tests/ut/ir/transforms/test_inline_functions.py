@@ -1947,6 +1947,180 @@ class TestInlineFunctionsSubmitCallSite:
         )
 
 
+class TestInlineFunctionsDynamicShapes:
+    def test_void_inline_call_preserves_logical_and_padded_arguments(self):
+        """Inline helpers may use one placeholder for logical and padded buffers."""
+        rows = pl.dynamic("CALLEE_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, logical: pl.Tensor[[rows, 4], pl.FP32], padded: pl.Tensor[[rows, 4], pl.FP32]):
+                n = pl.tensor.dim(logical, 0)
+                _value = pl.tensor.read(padded, [n, 0])
+
+            @pl.function
+            def main(self, logical: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                self.fill(logical, padded)
+                return padded
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, logical: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                n = pl.tensor.dim(logical, 0)
+                _value = pl.tensor.read(padded, [n, 0])
+                return padded
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        passes.convert_to_ssa()(after)
+
+    def test_shared_shape_symbols_preserve_caller_arguments(self):
+        """Specialize callee locals without rewriting an argument's shared shape symbol."""
+        rows = pl.dynamic("CALLEE_ROWS")
+        shared = pl.dynamic("SHARED_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def double(self, x: pl.Tensor[[rows, 4], pl.FP32], marker: pl.Tensor[[shared, 4], pl.FP32]):
+                y = pl.add(x, x)
+                return y
+
+            @pl.function
+            def main(self, a: pl.Tensor[[shared + 4, 4], pl.FP32], b: pl.Tensor[[16, 4], pl.FP32]):
+                return self.double(a, b)
+
+        after = passes.inline_functions()(Before)
+        main = after.get_function("main")
+        assert main is not None
+        assert isinstance(main.body, ir.SeqStmts)
+        assign = main.body.stmts[0]
+        assert isinstance(assign, ir.AssignStmt)
+        assert isinstance(assign.var.type, ir.TensorType)
+        assert isinstance(main.params[0].type, ir.TensorType)
+        ir.assert_structural_equal(assign.var.type, main.params[0].type)
+        assert isinstance(assign.value, ir.Call)
+        assert assign.value.args[0] is main.params[0]
+        passes.convert_to_ssa()(after)
+
+    def test_local_extent_through_loop_carried_tensor(self):
+        """Callee-only dimensions must be bound to the caller's runtime extent (#2936)."""
+        rows = pl.dynamic("CALLEE_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, out: pl.Tensor[[rows, 4], pl.FP32], src: pl.Tensor[[4, 4], pl.FP32]):
+                for i in pl.range(2):
+                    updated = pl.tensor.assemble(out, src, [0, 0])
+                    out = updated
+                return out
+
+            @pl.function
+            def main(self, n: pl.Scalar[pl.INDEX], src: pl.Tensor[[4, 4], pl.FP32]):
+                extent = n + 4
+                out = pl.create_tensor([extent, 4], pl.FP32)
+                result = self.fill(out, src)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, n: pl.Scalar[pl.INDEX], src: pl.Tensor[[4, 4], pl.FP32]):
+                extent = n + 4
+                out = pl.create_tensor([extent, 4], pl.FP32)
+                for i in pl.range(2):
+                    updated = pl.tensor.assemble(out, src, [0, 0])
+                    out = updated
+                result = out
+                return result
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        passes.convert_to_ssa()(after)
+
+    def test_void_helper_specializes_submit_result_and_rebinds_output(self):
+        """A void inline wrapper must specialize Submit locals and preserve the output binding."""
+        rows = pl.dynamic("CALLEE_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def store(
+                self, src: pl.Tensor[[4, 4], pl.FP32], out: pl.Out[pl.Tensor[[rows, 4], pl.FP32]]
+            ) -> pl.Tensor[[rows, 4], pl.FP32]:
+                out = pl.tensor.assemble(out, src, [0, 0])
+                return out
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, out: pl.Tensor[[rows, 4], pl.FP32], src: pl.Tensor[[4, 4], pl.FP32]):
+                with pl.manual_scope():
+                    updated, tid = pl.submit(self.store, src, out)
+                    out = updated
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, n: pl.Scalar[pl.INDEX], src: pl.Tensor[[4, 4], pl.FP32]):
+                extent = n + 4
+                out = pl.create_tensor([extent, 4], pl.FP32)
+                self.fill(out, src)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def store(
+                self, src: pl.Tensor[[4, 4], pl.FP32], out: pl.Out[pl.Tensor[[rows, 4], pl.FP32]]
+            ) -> pl.Tensor[[rows, 4], pl.FP32]:
+                out = pl.tensor.assemble(out, src, [0, 0])
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, n: pl.Scalar[pl.INDEX], src: pl.Tensor[[4, 4], pl.FP32]):
+                extent = n + 4
+                out = pl.create_tensor([extent, 4], pl.FP32)
+                with pl.manual_scope():
+                    updated, tid = pl.submit(self.store, src, out)
+                    out = updated
+                return out
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        passes.convert_to_ssa()(after)
+
+    def test_each_call_binds_its_own_static_extent(self):
+        """A shared inline helper must specialize local types independently at each call."""
+        rows = pl.dynamic("CALLEE_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def double(self, x: pl.Tensor[[rows, 4], pl.FP32]):
+                y = pl.add(x, x)
+                return y
+
+            @pl.function
+            def main(self, a: pl.Tensor[[8, 4], pl.FP32], b: pl.Tensor[[16, 4], pl.FP32]):
+                first = self.double(a)
+                second = self.double(b)
+                return first, second
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, a: pl.Tensor[[8, 4], pl.FP32], b: pl.Tensor[[16, 4], pl.FP32]):
+                y0 = pl.add(a, a)
+                first = y0
+                y1 = pl.add(b, b)
+                second = y1
+                return first, second
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        passes.convert_to_ssa()(after)
+
+
 class TestInlineFunctionsReservedDelimiter:
     """A local whose name ends in `_` must not fuse with the `_inlineN` suffix.
 
