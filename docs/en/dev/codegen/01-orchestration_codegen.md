@@ -729,10 +729,7 @@ initialized Tensor carries/phis declared directly in the body when their
 initializer is valid in the enclosing scope. Copies of those hoisted handles
 at the original body level reuse the enclosing name; copies inside nested loops
 remain snapshots. Branch assignments and task submissions stay in place, and
-AUTO buffer allocations remain inside their scheduling scope. A Tensor backed by
-a source local to a closed AUTO runtime scope cannot be consumed afterward: codegen
-rejects that use with a diagnostic to allocate the buffer outside `pl.scope()`.
-Creating another local alias would not extend the allocation lifetime.
+AUTO buffer allocations remain inside their scheduling scope.
 
 ### Array carry for `pl.parallel` TaskId iter_args
 
