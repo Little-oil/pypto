@@ -582,6 +582,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return CodegenBase::TryGetVarName(expr);
   }
   [[nodiscard]] std::string GenerateExprString(const ExprPtr& expr) const override {
+    ValidateValueUse(expr, expr->span_);
     if (auto var = AsVarLike(expr); var && graph_scalar_params_.count(var.get())) {
       auto scalar_type = As<ScalarType>(var->GetType());
       INTERNAL_CHECK_SPAN(scalar_type, expr->span_) << "Internal error: Graph scalar must have ScalarType";
@@ -848,6 +849,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
       // ``pl.range(..., init_values=(0,))`` writes the literal directly. Both
       // are legal IR, so emit the init expression instead of demanding an
       // identifier. Only the ArrayType copy-in below genuinely needs a name.
+      ValidateValueUse(iter_arg->initValue_, for_stmt->span_);
       const std::string init_emit_name = TryGetVarName(iter_arg->initValue_);
       const bool init_is_var = !init_emit_name.empty();
       // Function tensor params get rewritten to `ext_<name>` in the emitted C++,
@@ -1198,6 +1200,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
                        (scope->manual_ ? "SIMPLER_SCOPE(ScopeMode::MANUAL) {\n" : "SIMPLER_SCOPE() {\n"));
     Active().AppendRaw(body_emitter.GetCode());
     Active().AppendRaw(parent_indent + "}\n");
+
+    if (!scope->manual_) closed_auto_scope_names_.insert(local_names.begin(), local_names.end());
 
     // Restore the outer scheduling bindings. A binding minted inside the block
     // that names a scope-local C++ identifier (e.g. ``TaskId prev =
@@ -1747,6 +1751,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
       // translate it here. Safe for non-params (returns input unchanged).
       value_expr = GetExternalTensorName(value_expr);
       auto yield_var = AsVarLike(yield_stmt->value_[i]);
+      ValidateValueUse(rv, yield_stmt->span_);
       std::string lhs_name = GetVarName(rv);
       // Skip self-assigns. Pointer identity catches the trivial-yield case;
       // the name-equality check catches ArrayType iter_args where the body's
@@ -1988,6 +1993,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   ParamEntry BuildOneArgParam(const CallPtr& call, const std::string& callee_name,
                               const std::vector<ArgDirection>& call_arg_directions, size_t arg_idx) {
     const auto& arg = call->args_[arg_idx];
+    ValidateValueUse(arg, call->span_);
     std::string var_name = TryGetVarName(arg);
     if (!var_name.empty()) {
       if (IsA<CommCtxType>(arg->GetType())) {
@@ -2254,6 +2260,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
 
   void GenerateTensorOpCode(const CallPtr& call, const std::string& result_var, const VarPtr& assign_var) {
+    for (const auto& arg : call->args_) ValidateValueUse(arg, call->span_);
     const std::string& op_name = call->op_->name_;
 
     auto& registry = OrchestrationOpRegistry::GetInstance();
@@ -2471,6 +2478,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
       size_t outer_idx = it->second;
       size_t dir_idx = kNoDir;
       ExprPtr outer_arg = resolve_outer_arg(outer_idx, &dir_idx);
+      ValidateValueUse(outer_arg, outer_arg->span_);
       std::string var_name = TryGetVarName(outer_arg);
 
       if (!var_name.empty()) {
@@ -2729,6 +2737,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         << "Submit dispatch-predicate operand has rank " << indices.size()
         << ", exceeding the runtime's maximum of " << kRuntimeMaxTensorDims
         << " indices (CorePredicateOperand::indices is a fixed-size array)";
+    ValidateValueUse(operand, read->span_);
     const std::string var_name = TryGetVarName(operand);
     CHECK_SPAN(!var_name.empty(), operand->span_)
         << "Submit dispatch-predicate operand must be a named tensor (a function parameter or a variable "
@@ -3784,6 +3793,19 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
   }
 
+  /// Validate an operand at a code-emission site, never while reserving or
+  /// querying a definition's name. All Tensor use paths share this check;
+  /// unrelated value types retain their existing validation.
+  void ValidateValueUse(const ExprPtr& value, const Span& use_span) const {
+    auto var = AsVarLike(value);
+    if (!var || !AsTensorTypeLike(var->GetType())) return;
+    auto it = emit_name_map_.find(var.get());
+    if (it == emit_name_map_.end()) return;
+    CHECK_SPAN(closed_auto_scope_names_.count(it->second) == 0, use_span)
+        << "Tensor '" << var->name_hint_ << "' is used after its AUTO runtime scope has closed. "
+        << "Allocate the tensor in an enclosing scope, or move this use inside its pl.scope().";
+  }
+
   /// True when ``name`` (a tensor emit name) is valid in the C++ scope that
   /// encloses the active runtime scope — i.e. a runtime-scope output may safely
   /// remap to it / a hoisted decl may reference it. A name is scope-local iff it
@@ -4538,6 +4560,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::vector<std::string>* scope_hoist_sink_ = nullptr;
   bool scope_hoist_allocations_ = false;
   int scope_hoist_indent_level_ = 0;
+  // Hoisted names are removed from each local set before its AUTO scope closes.
+  std::unordered_set<std::string> closed_auto_scope_names_;
   std::set<std::string>* scope_local_names_ = nullptr;
   std::set<std::string>* enclosing_scope_local_names_ = nullptr;
   /// Original body indent for each hoisted carry/phi. Copies in nested loop

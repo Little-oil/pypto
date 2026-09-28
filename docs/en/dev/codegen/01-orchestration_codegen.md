@@ -731,6 +731,19 @@ at the original body level reuse the enclosing name; copies inside nested loops
 remain snapshots. Branch assignments and task submissions stay in place, and
 AUTO buffer allocations remain inside their scheduling scope.
 
+**Validate uses separately from names.** `ValidateValueUse(value, use_span)` is
+the shared check for Tensor operands emitted by orchestration codegen: expression
+reads, task arguments, tensor operations, dispatch predicates, loop initialization,
+and loop writeback. It resolves existing SSA aliases through `emit_name_map_` and
+rejects a name owned by a closed AUTO scope, reporting the use site's span. The
+scope's existing local-name set supplies this information; hoisted names are
+removed before closure and remain usable. Allocate buffers in an enclosing scope
+when later tasks need them, or keep their consumers inside the allocating scope.
+
+`GetVarName()`, `TryGetVarName()`, and name reservation remain independent of this
+validation. A fresh SSA definition can therefore reuse the source spelling of a
+closed local and receive a new, unique C++ name without being mistaken for a read.
+
 ### Array carry for `pl.parallel` TaskId iter_args
 
 A `pl.parallel(N)` ForStmt whose iter_arg threads a TaskId companion is
