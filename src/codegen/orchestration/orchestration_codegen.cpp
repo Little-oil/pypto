@@ -571,7 +571,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::string GetVarName(const VarPtr& var) const override {
     auto it = emit_name_map_.find(var.get());
     const std::string name = it != emit_name_map_.end() ? it->second : GetSSABaseName(var->name_hint_);
-    CHECK_SPAN(!AsTensorTypeLike(var->GetType()) || closed_auto_scope_names_.count(name) == 0, var->span_)
+    // Before ReserveVarEmitName, a fresh SSA definition may share the base
+    // spelling of a closed local. Only an existing binding denotes a use of
+    // that emitted name; the fresh definition will receive a unique name.
+    CHECK_SPAN(it == emit_name_map_.end() || !AsTensorTypeLike(var->GetType()) ||
+                   closed_auto_scope_names_.count(name) == 0,
+               var->span_)
         << "Tensor '" << var->name_hint_
         << "' references storage or a handle from a closed AUTO runtime scope. "
         << "Allocate the tensor outside pl.scope() when it is consumed after that scope.";

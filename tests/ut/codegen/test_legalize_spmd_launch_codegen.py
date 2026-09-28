@@ -291,3 +291,27 @@ def test_explicit_auto_scope_caller_allocated_output(local_buffer):
     else:
         _, code = _compile(Program, False)
         assert not _out_of_scope_tensor_refs(code), code
+
+
+def test_explicit_auto_scopes_can_reuse_tensor_source_name():
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+        def main(self, a: pl.Tensor[[16, 16], pl.FP32]) -> pl.Tensor[[16, 16], pl.FP32]:
+            with pl.scope():
+                scratch = pl.create_tensor([16, 16], dtype=pl.FP32)
+                for bi in pl.spmd(1):
+                    scratch[0:16, 0:16] = pl.add(a, 1.0)
+                for bj in pl.spmd(1):
+                    a[0:16, 0:16] = pl.add(scratch, 1.0)
+            with pl.scope():
+                scratch = pl.create_tensor([16, 16], dtype=pl.FP32)
+                for bk in pl.spmd(1):
+                    scratch[0:16, 0:16] = pl.add(a, 1.0)
+                for bl in pl.spmd(1):
+                    a[0:16, 0:16] = pl.add(scratch, 1.0)
+            return a
+
+    _, code = _compile(Program, False)
+    assert code.count("alloc_tensors(") == 2, code
+    assert not _out_of_scope_tensor_refs(code), code
