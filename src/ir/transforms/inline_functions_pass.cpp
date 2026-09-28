@@ -285,8 +285,9 @@ class InlineResultTypeRemapper : public IRMutator {
 
   ExprPtr VisitExpr_(const CallPtr& op) override {
     auto call = As<Call>(IRMutator::VisitExpr_(op));
-    if (As<GlobalVar>(call->op_) || !(As<ShapedType>(call->GetType()) || As<TupleType>(call->GetType())))
+    if (As<GlobalVar>(call->op_) || !(As<ShapedType>(call->GetType()) || As<TupleType>(call->GetType()))) {
       return call;
+    }
     auto& registry = OpRegistry::GetInstance();
     const auto& entry = registry.GetEntry(call->op_->name_);
     if (!entry.GetOutputReusesInputArg() || entry.RequiresExplicitType()) return call;
