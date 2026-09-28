@@ -28,6 +28,14 @@ def _compile(program, auto_deps):
     return result, _generate_orch_code(result)
 
 
+@pytest.mark.parametrize("inside_scope", [False, True])
+def test_scope_detector_checks_tensor_assignment_targets(inside_scope):
+    assignment = "carry = input;"
+    code = "Tensor input;\nSIMPLER_SCOPE() {\nTensor carry = input;\n"
+    code += assignment + "\n}\n" if inside_scope else "}\n" + assignment + "\n"
+    assert _out_of_scope_tensor_refs(code) == ([] if inside_scope else ["carry"])
+
+
 @pytest.mark.parametrize("auto_deps", [False, True])
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_dynamic_launch_inside_explicit_scope_loop_carry(auto_deps, dynamic):
@@ -247,3 +255,39 @@ def test_composite_positive_bound_survives_late_simplify(auto_deps):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("local_buffer", [False, True])
+def test_explicit_auto_scope_caller_allocated_output(local_buffer):
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def fill(self, out: pl.Out[pl.Tensor[[16], pl.FP32]]) -> pl.Tensor[[16], pl.FP32]:
+            return pl.store(pl.tile.full([16], pl.FP32, 1.0), [0], out)
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def consume(
+            self, x: pl.Tensor[[16], pl.FP32], out: pl.Out[pl.Tensor[[16], pl.FP32]]
+        ) -> pl.Tensor[[16], pl.FP32]:
+            return pl.store(pl.load(x, [0], [16]), [0], out)
+
+        @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+        def main(
+            self, a: pl.Tensor[[16], pl.FP32], out: pl.Tensor[[16], pl.FP32]
+        ) -> pl.Tensor[[16], pl.FP32]:
+            with pl.scope():
+                if local_buffer:
+                    scratch = pl.create_tensor([16], dtype=pl.FP32)
+                else:
+                    scratch = a
+                result = self.fill(scratch)
+            with pl.scope():
+                out = self.consume(result, out)
+            return out
+
+    if local_buffer:
+        with pytest.raises(ValueError, match="closed AUTO runtime scope.*Allocate the tensor outside"):
+            _compile(Program, False)
+    else:
+        _, code = _compile(Program, False)
+        assert not _out_of_scope_tensor_refs(code), code

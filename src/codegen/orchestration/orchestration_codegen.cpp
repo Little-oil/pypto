@@ -570,10 +570,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
   std::string GetVarName(const VarPtr& var) const override {
     auto it = emit_name_map_.find(var.get());
-    if (it != emit_name_map_.end()) {
-      return it->second;
-    }
-    return GetSSABaseName(var->name_hint_);
+    const std::string name = it != emit_name_map_.end() ? it->second : GetSSABaseName(var->name_hint_);
+    CHECK_SPAN(!AsTensorTypeLike(var->GetType()) || closed_auto_scope_names_.count(name) == 0, var->span_)
+        << "Tensor '" << var->name_hint_
+        << "' references storage or a handle from a closed AUTO runtime scope. "
+        << "Allocate the tensor outside pl.scope() when it is consumed after that scope.";
+    return name;
   }
   [[nodiscard]] std::string TryGetVarName(const ir::ExprPtr& expr) const override {
     if (auto var = AsVarLike(expr)) {
@@ -1198,6 +1200,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
                        (scope->manual_ ? "SIMPLER_SCOPE(ScopeMode::MANUAL) {\n" : "SIMPLER_SCOPE() {\n"));
     Active().AppendRaw(body_emitter.GetCode());
     Active().AppendRaw(parent_indent + "}\n");
+
+    if (!scope->manual_) closed_auto_scope_names_.insert(local_names.begin(), local_names.end());
 
     // Restore the outer scheduling bindings. A binding minted inside the block
     // that names a scope-local C++ identifier (e.g. ``TaskId prev =
@@ -3762,12 +3766,10 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // name, with no manual-scope-internal identifier to fall out of C++ scope
     // (issue #1697).
     //
-    // The source must be valid in C++ scope at every use of the result. Outside
-    // a manual scope that always holds — the result is consumed in the same
-    // lexical scope as the source, or escapes via a phi (handled below). Inside
-    // a manual scope the source must additionally be enclosing-scope-valid, so a
-    // reader placed after the block still resolves it (``IsEnclosingScopeValid``;
-    // this additional restriction applies only inside a manual region).
+    // AUTO scopes may remap to local sources for in-scope consumers. A later
+    // use after that source's scope closes is rejected by GetVarName: emitting
+    // a local alias instead would not extend the source's lifetime. MANUAL
+    // scopes additionally require enclosing-valid sources for this remap.
     //
     // A phi reassignment (``mutable_alias``) is excluded: it rebinds an lvalue
     // the enclosing if/loop owns, so remapping it would erase the merge point and
@@ -4528,6 +4530,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::vector<std::string>* scope_hoist_sink_ = nullptr;
   bool scope_hoist_allocations_ = false;
   int scope_hoist_indent_level_ = 0;
+  // Names from closed AUTO blocks cannot back Tensor uses after the block.
+  // Hoisted declarations are removed from local_names before recording them.
+  std::unordered_set<std::string> closed_auto_scope_names_;
   std::set<std::string>* scope_local_names_ = nullptr;
   std::set<std::string>* enclosing_scope_local_names_ = nullptr;
   /// Original body indent for each hoisted carry/phi. Copies in nested loop
