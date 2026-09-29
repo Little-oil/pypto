@@ -9,9 +9,42 @@
 
 """Tensor use validation across explicit AUTO runtime scopes."""
 
+import re
+
 import pypto.language as pl
 import pytest
 from _orchestration_codegen_common import _generate_orch_full_pipeline, _out_of_scope_tensor_refs
+
+
+def test_nested_scope_tensor_carry_snapshot_survives_scope_exit():
+    """An escaping carry copy remains a snapshot, with its declaration outside the scope."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def consume(
+            self, x: pl.Tensor[[16], pl.FP32], out: pl.Out[pl.Tensor[[16], pl.FP32]]
+        ) -> pl.Tensor[[16], pl.FP32]:
+            return pl.store(pl.load(x, [0], [16]), [0], out)
+
+        @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+        def main(self, x: pl.Tensor[[16], pl.FP32], out: pl.Tensor[[16], pl.FP32]):
+            acc = pl.create_tensor([16], dtype=pl.FP32)
+            with pl.scope():
+                for i, (carry,) in pl.range(2, init_values=(acc,)):
+                    with pl.manual_scope():
+                        snap = carry
+                    fresh = pl.create_tensor([16], dtype=pl.FP32)
+                    next_acc = self.consume(x, fresh)
+                    out = self.consume(snap, out)
+                    result = pl.yield_(next_acc)
+                acc = result
+            return out
+
+    code = _generate_orch_full_pipeline(Program)
+    assert not _out_of_scope_tensor_refs(code), code
+    assert re.search(r"Tensor\s+snap\s*=\s*\w+;", code), code
+    assert "add_input(snap)" in code, code
 
 
 @pytest.mark.parametrize("inout", [False, True])

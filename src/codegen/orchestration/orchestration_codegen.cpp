@@ -1622,6 +1622,17 @@ class OrchestrationStmtCodegen : public CodegenBase {
           emit_name_map_[assign->var_.get()] = value_expr;
           return;
         }
+        // A nested runtime scope must keep a carry snapshot distinct, but its
+        // C++ declaration must survive for readers after that scope. Reuse the
+        // carry hoist and capture the value at the original assignment site;
+        // initializing only before the scope would miss updates in its body.
+        if (cpp_type == "Tensor" && hoisted != hoisted_carry_body_indents_.end() &&
+            scope_hoist_sink_ != nullptr && IsAtRuntimeScopeBodyIndent() &&
+            IsEnclosingScopeValid(value_expr) && !IsMutableTensorNameInCurrentScope(var_name)) {
+          EmitMutableTensorCarryDecl(var_name, value_expr);
+          EmitIndentedLine(var_name + " = " + value_expr + ";");
+          return;
+        }
       }
       EmitIndentedLine(cpp_type + " " + var_name + " = " + value_expr + ";");
 

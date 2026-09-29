@@ -208,6 +208,11 @@ IR 层，只服务于在该属性建立**之前**运行的那些 pass。
 的源——见下文*跨作用域张量与 `manual_scope`*）保留声明路径；绑定到
 `task_<n>_outs.get_ref(k)` 的运行时分配输出同样保留其 `const ChipTensor&` 绑定。
 
+在嵌套 runtime scope 中复制已提升的 tensor carry 时,副本仍是独立快照。
+如果源在该 scope 外仍有效,codegen 复用 `EmitMutableTensorCarryDecl` 提升副本声明,
+并把赋值保留在原位置。后续读取既能访问该快照,又不会误读 carry 更新后的值;
+此操作只移动声明,不移动 tensor 分配。
+
 ### 核心类型推断
 
 代码生成器根据被调用函数的 `MemorySpace` 决定提交到 AIC（CUBE）还是 AIV（VECTOR）：

@@ -215,6 +215,12 @@ see *Cross-scope tensors and `manual_scope`* below) keeps the decl path. A
 runtime-allocated output bound to `task_<n>_outs.get_ref(k)` likewise keeps its
 `const ChipTensor&` binding.
 
+Copies of hoisted tensor carries inside a nested runtime scope remain distinct
+snapshots. When the source is valid outside that scope, codegen hoists the copy's
+declaration with `EmitMutableTensorCarryDecl` and keeps its assignment at the
+original position. Later readers can name the snapshot without observing a
+subsequent carry update; no tensor allocation moves with the declaration.
+
 ### Core Type Inference
 
 The codegen determines whether to submit to AIC (CUBE) or AIV (VECTOR) based on the callee's `MemorySpace`:
