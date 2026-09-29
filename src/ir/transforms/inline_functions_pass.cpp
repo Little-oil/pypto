@@ -554,8 +554,8 @@ SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<E
   // DeepClone's returned map contains fresh definitions only, not seeded
   // caller bindings. Preserve those identities even when a writeback refines
   // the RHS view; subsequent caller uses must still observe the rebinding.
-  for (const auto& [original, actual] : seed) {
-    if (auto var = AsVarLike(actual)) preserved_vars.insert(var.get());
+  for (const auto& param : callee->params_) {
+    if (auto var = AsVarLike(seed.at(param.get()))) preserved_vars.insert(var.get());
   }
   for (const auto& [original, cloned] : cloned_vars) {
     auto inferred = def_collector.inferred_def_types.find(original);
