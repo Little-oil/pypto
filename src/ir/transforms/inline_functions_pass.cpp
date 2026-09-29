@@ -268,8 +268,9 @@ class InlineTypeSpecializer : public IRMutator {
       // Static operations untouched by substitution retain their descriptors.
       // Writebacks and dynamic results need operand-specific specialization.
       if (call == op && !entry.GetOutputReusesInputArg() &&
-          var_collectors::CollectTypeVars(call->GetType()).empty())
+          var_collectors::CollectTypeVars(call->GetType()).empty()) {
         return call;
+      }
       type = registry.Create(call->op_->name_, call->args_, call->kwargs_, call->span_)->GetType();
     }
     if (type) type = PreserveStorage(type, call->GetType());
@@ -359,7 +360,9 @@ class InlineTypeSpecializer : public IRMutator {
     auto returns = callee->return_types_;
     if (returns.empty() && !submit) {
       auto body = callee->body_;
-      if (auto seq = As<SeqStmts>(body); seq && !seq->stmts_.empty()) body = seq->stmts_.back();
+      if (auto seq = As<SeqStmts>(body); seq && !seq->stmts_.empty()) {
+        body = seq->stmts_.back();
+      }
       if (auto ret = As<ReturnStmt>(body)) {
         for (const auto& value : ret->value_) returns.push_back(value->GetType());
       }
