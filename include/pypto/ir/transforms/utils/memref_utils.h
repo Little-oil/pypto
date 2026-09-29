@@ -83,6 +83,27 @@ inline TypePtr CloneTypeWithMemRef(const TypePtr& type, const std::optional<MemR
   return type;
 }
 
+/// Keep newly inferred shape / dtype / view metadata, filling only missing storage metadata.
+/// Op type deduction may omit a declared MemRef or tile memory space. For a
+/// re-deduced assignment, carry them from the assigned Var's type: ConvertToSSA
+/// records allocation metadata there, not on the RHS Call.
+inline TypePtr WithCarriedMemRef(const TypePtr& deduced, const TypePtr& original) {
+  auto memref = GetTypeMemRef(deduced);
+  bool changed = false;
+  if (!memref && GetTypeMemRef(original)) {
+    memref = GetTypeMemRef(original);
+    changed = true;
+  }
+  std::optional<MemorySpace> memory_space;
+  auto tile = As<TileType>(deduced);
+  auto original_tile = As<TileType>(original);
+  if (tile && original_tile && !tile->memory_space_ && original_tile->memory_space_) {
+    memory_space = original_tile->memory_space_;
+    changed = true;
+  }
+  return changed ? CloneTypeWithMemRef(deduced, memref, memory_space) : deduced;
+}
+
 /// Select assignment metadata consistently in inlining and SSA conversion.
 inline TypePtr GetAuthoritativeAssignmentType(const TypePtr& lhs_type, const ExprPtr& value) {
   auto value_type = value ? value->GetType() : nullptr;

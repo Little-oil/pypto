@@ -118,45 +118,6 @@ void DetectInlineCycles(const std::unordered_map<std::string, FunctionPtr>& inli
 }
 
 // =============================================================================
-// Collect defining Vars to detect parameter rebinding
-// =============================================================================
-
-// IterArgs are distinct bindings, not reassignments of function parameters.
-class DefVarCollector : public IRVisitor {
- public:
-  std::unordered_set<const Var*> defs;
-
-  void VisitStmt_(const AssignStmtPtr& op) override {
-    if (op->var_) {
-      defs.insert(op->var_.get());
-    }
-    IRVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const ForStmtPtr& op) override {
-    if (op->loop_var_) defs.insert(op->loop_var_.get());
-    for (const auto& v : op->return_vars_) {
-      if (v) defs.insert(v.get());
-    }
-    IRVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const WhileStmtPtr& op) override {
-    for (const auto& v : op->return_vars_) {
-      if (v) defs.insert(v.get());
-    }
-    IRVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const IfStmtPtr& op) override {
-    for (const auto& v : op->return_vars_) {
-      if (v) defs.insert(v.get());
-    }
-    IRVisitor::VisitStmt_(op);
-  }
-};
-
-// =============================================================================
 // Splice an inline call site
 // =============================================================================
 
@@ -666,7 +627,7 @@ class InlineCallsMutator : public IRMutator {
       }
       type = registry.Create(call->op_->name_, call->args_, call->kwargs_, call->span_)->GetType();
     }
-    if (type) type = PreserveStorage(type, call->GetType());
+    if (type) type = WithCarriedMemRef(type, call->GetType());
     if (!type || structural_equal(type, call->GetType())) return call;
     return std::make_shared<Call>(call->op_, call->args_, call->kwargs_, call->attrs_, type, call->span_);
   }
@@ -701,7 +662,7 @@ class InlineCallsMutator : public IRMutator {
     auto vars = result->return_vars_;
     bool changed = false;
     for (size_t i = 0; i < vars.size() && i < yield->value_.size(); ++i) {
-      auto type = PreserveStorage(yield->value_[i]->GetType(), vars[i]->GetType());
+      auto type = WithCarriedMemRef(yield->value_[i]->GetType(), vars[i]->GetType());
       auto var = Retype(op->return_vars_[i], vars[i], type);
       changed |= var.get() != vars[i].get();
       vars[i] = std::move(var);
@@ -802,23 +763,6 @@ class InlineCallsMutator : public IRMutator {
   }
 
  private:
-  static TypePtr PreserveStorage(const TypePtr& inferred, const TypePtr& original) {
-    auto memref = GetTypeMemRef(inferred);
-    bool changed = false;
-    if (!memref && GetTypeMemRef(original)) {
-      memref = GetTypeMemRef(original);
-      changed = true;
-    }
-    std::optional<MemorySpace> memory_space;
-    auto tile = As<TileType>(inferred);
-    auto original_tile = As<TileType>(original);
-    if (tile && original_tile && !tile->memory_space_ && original_tile->memory_space_) {
-      memory_space = original_tile->memory_space_;
-      changed = true;
-    }
-    return changed ? CloneTypeWithMemRef(inferred, memref, memory_space) : inferred;
-  }
-
   TypePtr DeduceDispatchType(const OpPtr& op, const std::vector<ExprPtr>& args, bool submit) {
     auto found = functions_.find(op->name_);
     if (found == functions_.end() || found->second->func_type_ == FunctionType::Inline) return nullptr;
@@ -868,7 +812,7 @@ class InlineCallsMutator : public IRMutator {
     auto vars = result->return_vars_;
     bool changed = false;
     for (size_t i = 0; i < vars.size() && i < result->iter_args_.size(); ++i) {
-      auto type = PreserveStorage(result->iter_args_[i]->GetType(), vars[i]->GetType());
+      auto type = WithCarriedMemRef(result->iter_args_[i]->GetType(), vars[i]->GetType());
       auto var = Retype(op->return_vars_[i], vars[i], type);
       changed |= var.get() != vars[i].get();
       vars[i] = std::move(var);
@@ -900,7 +844,7 @@ class InlineCallsMutator : public IRMutator {
         << " argument(s) but callee expects " << callee->params_.size()
         << " (parser/type-checker should have caught arity mismatch before InlineFunctions)";
 
-    DefVarCollector def_collector;
+    var_collectors::VarDefUseCollector def_collector;
     def_collector.VisitStmt(callee->body_);
 
     // 1. Build the seed substitution map for DeepClone:
@@ -938,7 +882,7 @@ class InlineCallsMutator : public IRMutator {
       const TypePtr actual_type = actual->GetType();
       // The same assignment targets IRMutator::VisitStmt_(AssignStmtPtr) accepts.
       const bool assignable = As<Var>(actual) || As<MemRef>(actual);
-      const bool rebound = def_collector.defs.count(param.get()) > 0;
+      const bool rebound = def_collector.var_defs.count(param.get()) > 0;
       const bool computed_shaped =
           As<Call>(actual) && actual_type && (AsTensorTypeLike(actual_type) || As<TileType>(actual_type));
       // Whether a rebinding of this param is pass-by-value, as in Python, and so
