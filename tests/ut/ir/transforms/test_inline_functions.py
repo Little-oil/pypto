@@ -2401,6 +2401,78 @@ class TestInlineFunctionsSubmitCallSite:
 
 
 class TestInlineFunctionsDynamicShapes:
+    def test_specialized_result_reaches_next_inline_call(self):
+        """The next inline call must receive its argument's refined view metadata."""
+        rows = pl.dynamic("FORMAL_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def refine(self, x: pl.Tensor[[rows, 4], pl.FP32]) -> pl.Tensor[[rows, 4], pl.FP32]:
+                refined = pl.tensor.set_validshape(x, 3, 4)
+                return refined
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def double(self, x: pl.Tensor[[rows, 4], pl.FP32]):
+                result = pl.add(x, x)
+                return result
+
+            @pl.function
+            def main(self, x: pl.Tensor[[8, 4], pl.FP32]):
+                first = self.refine(x)
+                second = self.double(first)
+                return pl.add(second, second)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, x: pl.Tensor[[8, 4], pl.FP32]):
+                refined = pl.tensor.set_validshape(x, 3, 4)
+                first = refined
+                result = pl.add(first, first)
+                second = result
+                return pl.add(second, second)
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
+    def test_nested_inline_tuple_results_keep_independent_shapes(self):
+        """Nested tuple substitutions and their caller uses share the updated types."""
+        rows = pl.dynamic("FORMAL_ROWS")
+        padded_rows = pl.dynamic("PADDED_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def pair(self, x: pl.Tensor[[rows, 4], pl.FP32], padded: pl.Tensor[[padded_rows, 4], pl.FP32]):
+                first = pl.add(x, x)
+                second = pl.add(padded, padded)
+                return first, second
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def forward(self, x: pl.Tensor[[rows, 4], pl.FP32], padded: pl.Tensor[[padded_rows, 4], pl.FP32]):
+                return self.pair(x, padded)
+
+            @pl.function
+            def main(self, x: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                a, b = self.forward(x, padded)
+                return pl.add(a, x), pl.add(b, padded)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, x: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                first = pl.add(x, x)
+                second = pl.add(padded, padded)
+                a = first
+                b = second
+                return pl.add(a, x), pl.add(b, padded)
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
     def test_inline_view_refinement_preserves_caller_rebinding(self):
         """A void helper must update the binding read after the inline call."""
 
