@@ -1174,6 +1174,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // out of this block does not make it visible outside its parent block.
     enclosing_scope_local_names_ = scope_local_names_;
     scope_local_names_ = &local_names;
+    tensor_hoist_frames_.push_back({scope.get(),
+                                    &hoisted,
+                                    &local_names,
+                                    enclosing_scope_local_names_,
+                                    parent_indent_level,
+                                    mutable_tensor_name_scopes_.size() - 1,
+                                    {}});
 
     CodeEmitter body_emitter;
     body_emitter.SetIndentLevel(parent_indent_level);
@@ -1184,6 +1191,10 @@ class OrchestrationStmtCodegen : public CodegenBase {
     if (scope->manual_) ++in_manual_scope_depth_;
     VisitStmt(scope->body_);
     if (scope->manual_) --in_manual_scope_depth_;
+    for (const auto& name : tensor_hoist_frames_.back().allocations) {
+      PropagateTensorFlag(name, &invalid_tensor_storage_);
+    }
+    tensor_hoist_frames_.pop_back();
     PopCppScope();
     active_emitter_ = saved_active;
 
@@ -1636,6 +1647,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
       }
       EmitIndentedLine(cpp_type + " " + var_name + " = " + value_expr + ";");
 
+      if (cpp_type == "Tensor" && AsVarLike(assign->value_)) RecordTensorSource(var_name, value_expr);
       RegisterMutableTensorName(cpp_type, var_name);
     }
   }
@@ -1762,7 +1774,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
       // translate it here. Safe for non-params (returns input unchanged).
       value_expr = GetExternalTensorName(value_expr);
       auto yield_var = AsVarLike(yield_stmt->value_[i]);
-      ValidateValueUse(rv, yield_stmt->span_);
+      // The destination must be in C++ scope, but this write does not read its
+      // old backing storage (including values recorded from the other branch).
+      ValidateValueUse(rv, yield_stmt->span_, /*read_storage=*/false);
       std::string lhs_name = GetVarName(rv);
       // Skip self-assigns. Pointer identity catches the trivial-yield case;
       // the name-equality check catches ArrayType iter_args where the body's
@@ -1785,6 +1799,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         EmitArrayCopyLoop(N, lhs_name, value_expr, "__yield_i");
         continue;
       }
+      if (AsTensorTypeLike(rv->GetType())) RecordTensorSource(lhs_name, value_expr);
       EmitIndentedLine(lhs_name + " = " + value_expr + ";");
     }
   }
@@ -2291,6 +2306,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
       emit_var = ReserveVarEmitName(assign_var.get());
     }
 
+    if (AsTensorTypeLike(call->GetType()) && !IsOp(call, "tensor.create")) {
+      for (const auto& arg : call->args_) {
+        if (AsTensorTypeLike(arg->GetType())) {
+          RecordTensorSource(emit_var, GetExternalTensorName(TryGetVarName(arg)));
+        }
+      }
+    }
     current_result_var_ = emit_var;
 
     std::string gen_code = (*codegen_func)(call, *this);
@@ -3378,6 +3400,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     EmitIndentedLine(alloc.str());
 
     for (size_t i = 0; i < emit_names.size(); i++) {
+      RecordTensorAllocation(emit_names[i]);
       EmitIndentedLine("const Tensor& " + emit_names[i] + " = " + alloc_var + ".get_ref(" +
                        std::to_string(i) + ");");
     }
@@ -3797,6 +3820,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
       return;
     }
 
+    RecordTensorSource(alias_name, out_name);
     if (mutable_alias) {
       EmitIndentedLine(alias_name + " = " + out_name + ";");
     } else {
@@ -3807,7 +3831,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// Validate an operand at a code-emission site, never while reserving or
   /// querying a definition's name. All Tensor use paths share this check;
   /// unrelated value types retain their existing validation.
-  void ValidateValueUse(const ExprPtr& value, const Span& use_span) const {
+  void ValidateValueUse(const ExprPtr& value, const Span& use_span, bool read_storage = true) const {
     auto var = AsVarLike(value);
     if (!var || !AsTensorTypeLike(var->GetType())) return;
     auto it = emit_name_map_.find(var.get());
@@ -3815,6 +3839,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
     CHECK_SPAN(closed_auto_scope_names_.count(it->second) == 0, use_span)
         << "Tensor '" << var->name_hint_ << "' is used after its AUTO runtime scope has closed. "
         << "Allocate the tensor in an enclosing scope, or move this use inside its pl.scope().";
+    CHECK_SPAN(!read_storage || auto_scope_carry_names_.count(it->second) == 0 ||
+                   invalid_tensor_storage_.count(it->second) == 0,
+               use_span)
+        << "Tensor '" << var->name_hint_ << "' may reference an allocation from a closed runtime scope. "
+        << "Allocate its backing buffer in an enclosing scope, or consume it inside its pl.scope().";
   }
 
   /// True when ``name`` (a tensor emit name) is valid in the C++ scope that
@@ -3843,17 +3872,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
   }
 
-  /// Register a hoisted loop carry's emit name as mutable in the scope that
-  /// ENCLOSES the current (runtime-scope body) C++ frame — the frame the hoisted
-  /// ``Tensor <carry> = <init>;`` decl lands in (issue #1713). The carry's
-  /// in-loop ``<carry> = ...;`` reassignments still resolve through that
-  /// enclosing frame, and a post-loop ``X = <carry>`` rebind reads the carry as
-  /// *not* mutable-in-current-scope (it is mutable one level out), so the rebind
-  /// may collapse onto it.
-  void RegisterMutableTensorNameInEnclosingScope(const std::string& emit_name) {
-    INTERNAL_CHECK(mutable_tensor_name_scopes_.size() >= 2)
-        << "Internal error: enclosing-scope carry hoist requires an enclosing C++ frame";
-    mutable_tensor_name_scopes_[mutable_tensor_name_scopes_.size() - 2].insert(emit_name);
+  bool IsMutableTensorName(const std::string& name) const {
+    return std::any_of(mutable_tensor_name_scopes_.begin(), mutable_tensor_name_scopes_.end(),
+                       [&](const auto& names) { return names.count(name) != 0; });
   }
 
   /// Hoist an initialized Tensor carry/phi from a runtime scope's direct body
@@ -3861,18 +3882,73 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// inside the block, while a subsequent loop yield can name the hoisted handle.
   /// Track the original body indent to preserve snapshots inside nested loops.
   void EmitMutableTensorCarryDecl(const std::string& name, const std::string& init_expr) {
+    RecordTensorSource(name, init_expr);
     if (scope_hoist_sink_ != nullptr && IsAtRuntimeScopeBodyIndent() && IsEnclosingScopeValid(init_expr)) {
-      scope_hoist_sink_->push_back(IndentAtLevel(scope_hoist_indent_level_) + "Tensor " + name + " = " +
-                                   init_expr + ";\n");
-      RegisterMutableTensorNameInEnclosingScope(name);
+      size_t target = tensor_hoist_frames_.size() - 1;
+      // Consecutive AUTO wrappers introduce no control flow. An immutable
+      // enclosing initializer can seed a descriptor outside all of them.
+      // Stop at control flow, MANUAL scopes, or a scope-local initializer;
+      // moving a mutable initializer could change the value being captured.
+      const bool mutable_init = IsMutableTensorName(init_expr);
+      while (target > 0 && !mutable_init) {
+        const auto& frame = tensor_hoist_frames_[target];
+        const auto& parent = tensor_hoist_frames_[target - 1];
+        if (frame.scope->manual_ || parent.scope->manual_ ||
+            frame.parent_indent != parent.parent_indent + 1 || parent.local_names->count(init_expr)) {
+          break;
+        }
+        --target;
+      }
+      const auto& frame = tensor_hoist_frames_[target];
+      if (!tensor_hoist_frames_.back().scope->manual_) {
+        PropagateTensorFlag(name, &auto_scope_carry_names_);
+      }
+      frame.sink->push_back(IndentAtLevel(frame.parent_indent) + "Tensor " + name + " = " + init_expr +
+                            ";\n");
+      mutable_tensor_name_scopes_[frame.parent_cpp_scope].insert(name);
       hoisted_carry_body_indents_[name] = scope_hoist_indent_level_ + 1;
-      if (scope_local_names_ != nullptr) scope_local_names_->erase(name);
-      if (enclosing_scope_local_names_ != nullptr) enclosing_scope_local_names_->insert(name);
+      scope_local_names_->erase(name);
+      if (frame.enclosing_local_names) frame.enclosing_local_names->insert(name);
     } else {
       EmitIndentedLine("Tensor " + name + " = " + init_expr + ";");
 
       RegisterMutableTensorName("Tensor", name);
     }
+  }
+
+  void RecordTensorAllocation(const std::string& name) {
+    if (tensor_hoist_frames_.empty()) return;
+    size_t owner = tensor_hoist_frames_.size() - 1;
+    // A MANUAL allocation batch is emitted in its enclosing scheduling scope.
+    const auto& frame = tensor_hoist_frames_[owner];
+    if (frame.scope->manual_ && Active().GetIndentLevel() == frame.parent_indent) {
+      if (owner == 0) return;
+      --owner;
+    }
+    tensor_hoist_frames_[owner].allocations.push_back(name);
+  }
+
+  // Descriptor copies do not retain allocation lifetime. Propagate invalidity
+  // once per name/edge when a scope closes, rather than traversing the whole
+  // source graph at every use. Union branch/loop sources conservatively.
+  void PropagateTensorFlag(const std::string& name, std::unordered_set<std::string>* names) {
+    std::vector<std::string> pending{name};
+    while (!pending.empty()) {
+      std::string current = std::move(pending.back());
+      pending.pop_back();
+      if (!names->insert(current).second) continue;
+      auto it = tensor_dependents_.find(current);
+      if (it != tensor_dependents_.end()) {
+        pending.insert(pending.end(), it->second.begin(), it->second.end());
+      }
+    }
+  }
+
+  void RecordTensorSource(const std::string& name, const std::string& source) {
+    if (name.empty() || source.empty() || name == source) return;
+    tensor_dependents_[source].insert(name);
+    if (invalid_tensor_storage_.count(source)) PropagateTensorFlag(name, &invalid_tensor_storage_);
+    if (auto_scope_carry_names_.count(source)) PropagateTensorFlag(name, &auto_scope_carry_names_);
   }
 
   bool IsMutableTensorNameInCurrentScope(const std::string& emit_name) const {
@@ -4230,6 +4306,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
       } else {
         // Runtime-allocated: BuildTaskParams synthesised an add_output for
         // this param at runtime output position (param_idx - original_arg_count).
+        RecordTensorAllocation(elem_name);
         size_t runtime_out_pos = param_idx - original_arg_count;
         std::string source =
             "task_" + std::to_string(task_idx) + "_outs.get_ref(" + std::to_string(runtime_out_pos) + ")";
@@ -4568,6 +4645,21 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// mode; buffer allocations move only out of MANUAL scopes. Local-name sets
   /// distinguish storage in this block from storage that outlives it, including
   /// declarations hoisted out of a nested scope into this scope's body.
+  struct TensorHoistFrame {
+    const RuntimeScopeStmt* scope;
+    std::vector<std::string>* sink;
+    std::set<std::string>* local_names;
+    std::set<std::string>* enclosing_local_names;
+    int parent_indent;
+    size_t parent_cpp_scope;
+    std::vector<std::string> allocations;
+  };
+  std::vector<TensorHoistFrame> tensor_hoist_frames_;
+  std::unordered_map<std::string, std::unordered_set<std::string>> tensor_dependents_;
+  std::unordered_set<std::string> invalid_tensor_storage_;
+  // Validate storage behind descriptors hoisted out of AUTO scopes and their
+  // aliases; retain the existing MANUAL-scope carry behavior.
+  std::unordered_set<std::string> auto_scope_carry_names_;
   std::vector<std::string>* scope_hoist_sink_ = nullptr;
   bool scope_hoist_allocations_ = false;
   int scope_hoist_indent_level_ = 0;

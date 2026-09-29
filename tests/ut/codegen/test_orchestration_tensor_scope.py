@@ -135,3 +135,77 @@ def test_sibling_scopes_can_reuse_tensor_source_name():
     code = _generate_orch_full_pipeline(Program)
     assert code.count("alloc_tensors(") == 2, code
     assert not _out_of_scope_tensor_refs(code), code
+
+
+def test_nested_auto_carry_cannot_escape_outer_allocation():
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+        def main(
+            self, a: pl.Tensor[[16, 16], pl.FP32], n: pl.Scalar[pl.INDEX]
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            with pl.scope():
+                scratch = pl.create_tensor([16, 16], dtype=pl.FP32)
+                with pl.scope():
+                    for layer in pl.range(2):
+                        for bi in pl.spmd(n):
+                            scratch = pl.assemble(scratch, pl.add(a, 1.0), [0, 0])
+            with pl.scope():
+                for bi in pl.spmd(1):
+                    a = pl.assemble(a, pl.add(scratch, 1.0), [0, 0])
+            return a
+
+    with pytest.raises(ValueError, match="used after its AUTO runtime scope has closed"):
+        _generate_orch_full_pipeline(Program)
+
+
+@pytest.mark.parametrize("use_view", [False, True])
+@pytest.mark.parametrize("use_loop", [False, True])
+def test_nested_auto_carry_cannot_hide_inner_allocation(use_view, use_loop):
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+        def main(
+            self, a: pl.Tensor[[16, 16], pl.FP32], n: pl.Scalar[pl.INDEX]
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            with pl.scope():
+                with pl.scope():
+                    scratch = pl.create_tensor([16, 16], dtype=pl.FP32)
+                    if use_view:
+                        scratch = pl.reshape(pl.reshape(scratch, [256]), [16, 16])
+                    if use_loop:
+                        for layer in pl.range(n):
+                            a = scratch
+                    elif n > 0:
+                        a = scratch
+            with pl.scope():
+                for bi in pl.spmd(1):
+                    a = pl.assemble(a, pl.add(a, 1.0), [0, 0])
+            return a
+
+    with pytest.raises(ValueError, match="allocation from a closed runtime scope"):
+        _generate_orch_full_pipeline(Program)
+
+
+@pytest.mark.parametrize("use_loop", [False, True])
+def test_single_auto_carry_cannot_hide_local_allocation(use_loop):
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+        def main(
+            self, a: pl.Tensor[[16, 16], pl.FP32], n: pl.Scalar[pl.INDEX]
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            with pl.scope():
+                scratch = pl.create_tensor([16, 16], dtype=pl.FP32)
+                if use_loop:
+                    for layer in pl.range(n):
+                        a = scratch
+                elif n > 0:
+                    a = scratch
+            with pl.scope():
+                for bi in pl.spmd(1):
+                    a = pl.assemble(a, pl.add(a, 1.0), [0, 0])
+            return a
+
+    with pytest.raises(ValueError, match="allocation from a closed runtime scope"):
+        _generate_orch_full_pipeline(Program)

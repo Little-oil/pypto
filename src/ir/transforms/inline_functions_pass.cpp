@@ -307,10 +307,10 @@ std::vector<StmtPtr> SpliceInlineCallAsAssign(const FunctionPtr& callee, Spliced
 // caller (the InlineCallsMutator) can substitute downstream
 // `TupleGetItemExpr(LHS, i)` uses with `values[i]` directly.
 //
-// Why no MakeTuple: orchestration codegen can't lower a MakeTuple expression,
-// and the parser-generated tuple-unpack pattern (`_tuple_tmp = call(); y_i =
-// _tuple_tmp[i]`) means every LHS use is a TupleGetItemExpr — substituting
-// makes the LHS unreferenced and the binding effectively dead.
+// The parser-generated tuple-unpack pattern (`_tuple_tmp = call(); y_i =
+// _tuple_tmp[i]`) needs no aggregate receiver: substitute its element uses.
+// A callee-local tuple may still need its definition to preserve body uses
+// and the values captured before later reassignments.
 std::vector<StmtPtr> SpliceInlineCallAsTupleSub(const FunctionPtr& callee, SplicedInlineBody body,
                                                 std::vector<ExprPtr>& out_substitution) {
   INTERNAL_CHECK_SPAN(body.has_return, callee->span_)
@@ -337,8 +337,17 @@ std::vector<StmtPtr> SpliceInlineCallAsTupleSub(const FunctionPtr& callee, Splic
       auto assign = As<AssignStmt>(body.stmts[i]);
       if (assign && assign->var_.get() == returned_var.get()) {
         if (auto tuple = As<MakeTuple>(assign->value_)) {
-          out_substitution = tuple->elements_;
-          body.stmts.erase(body.stmts.begin() + static_cast<std::ptrdiff_t>(i));
+          if (i + 1 == body.stmts.size()) {
+            out_substitution = tuple->elements_;
+            body.stmts.pop_back();
+          } else {
+            // Intervening statements may read this tuple or rebind its elements.
+            // Keep the definition and return its captured values, not later Vars.
+            for (size_t index = 0; index < tuple->elements_.size(); ++index) {
+              out_substitution.push_back(
+                  std::make_shared<TupleGetItemExpr>(returned_var, static_cast<int>(index), assign->span_));
+            }
+          }
           return std::move(body.stmts);
         }
       }
@@ -627,8 +636,10 @@ class InlineCallsMutator : public IRMutator {
       }
       type = registry.Create(call->op_->name_, call->args_, call->kwargs_, call->span_)->GetType();
     }
-    if (type) type = WithCarriedMemRef(type, call->GetType());
-    if (!type || structural_equal(type, call->GetType())) return call;
+    // Some ops infer UnknownType and rely on an explicit result annotation.
+    if (!type || As<UnknownType>(type)) return call;
+    type = WithCarriedMemRef(type, call->GetType());
+    if (structural_equal(type, call->GetType())) return call;
     return std::make_shared<Call>(call->op_, call->args_, call->kwargs_, call->attrs_, type, call->span_);
   }
 

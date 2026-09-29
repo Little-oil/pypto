@@ -20,7 +20,7 @@ as long as the LHS↔RHS Var mapping is consistent throughout)."""
 import pypto
 import pypto.language as pl
 import pytest
-from pypto import ir, passes
+from pypto import codegen, ir, passes
 from pypto.ir import OptimizationStrategy, PassManager
 from pypto.pypto_core import passes as core_passes
 from pypto.runtime import RunConfig
@@ -608,6 +608,35 @@ class TestInlineFunctionsNested:
 
 class TestInlineFunctionsDynamicTypes:
     """Inlined tensor types must reference the caller's values and dimensions."""
+
+    def test_dynamic_tpop_preserves_declared_result_type(self):
+        """Unknown op inference must retain the remapped explicit tile type."""
+        formal_rows = pl.dynamic("FORMAL_ROWS")
+        rows = pl.dynamic("ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def receive(self, shape_source: pl.Tile[[formal_rows, 16], pl.FP32]):
+                received: pl.Tile[[formal_rows, 16], pl.FP32] = pl.tile.tpop_from_aiv()
+                return received
+
+            @pl.function
+            def main(self, source: pl.Tile[[rows, 16], pl.FP32]):
+                result = self.receive(source)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, source: pl.Tile[[rows, 16], pl.FP32]):
+                received: pl.Tile[[rows, 16], pl.FP32] = pl.tile.tpop_from_aiv()
+                result = received
+                return result
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
 
     def test_alias_type_follows_rhs_through_ssa(self):
         """A stale LHS-only view cannot override the actual alias source."""
@@ -1357,6 +1386,38 @@ class TestInlineFunctionsInDefaultPipeline:
         After = pm.run_passes(P)
         names = [f.name for f in After.functions.values()]
         assert "helper" not in names
+
+    def test_live_returned_tuple_reaches_orchestration_codegen(self):
+        """Keeping a used tuple must preserve both its body write and returned operands."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(
+                self, x: pl.Tensor[[16], pl.FP32], out: pl.Out[pl.Tensor[[16], pl.FP32]]
+            ) -> pl.Tensor[[16], pl.FP32]:
+                return pl.store(pl.load(x, [0], [16]), [0], out)
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, x: pl.Tensor[[16], pl.FP32], out: pl.Tensor[[16], pl.FP32]):
+                tmp = (x, x)
+                out = self.consume(tmp[0], out)
+                return tmp
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self, x: pl.Tensor[[16], pl.FP32], out: pl.Out[pl.Tensor[[16], pl.FP32]]
+            ) -> pl.Tensor[[16], pl.FP32]:
+                a, b = self.helper(x, out)
+                out = self.consume(a, out)
+                out = self.consume(b, out)
+                return out
+
+        lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Program)
+        orch = next(f for f in lowered.functions.values() if f.func_type == ir.FunctionType.Orchestration)
+        generated = codegen.generate_orchestration(lowered, orch).code
+        assert generated.count(".add_input(ext_x)") == 3, generated
+        assert "FREE_VAR" not in generated
 
 
 class TestInlineFunctionsNestedCallSites:
@@ -2291,6 +2352,47 @@ class TestInlineReturnAndMultiReturn:
                 return y0, y1
 
         ir.assert_structural_equal(After, Expected)
+
+    @pytest.mark.parametrize("rebind_source", [False, True])
+    def test_returned_tuple_temporary_keeps_body_uses(self, rebind_source):
+        """A live tuple definition and its captured elements must survive inlining."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(
+                self,
+                x: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> tuple[pl.Tensor[[4], pl.FP32], pl.Tensor[[4], pl.FP32]]:
+                tmp = (x, x)
+                out = pl.tensor.assemble(out, tmp[0], [0])
+                if rebind_source:
+                    x = pl.add(x, x)
+                return tmp
+
+            @pl.function
+            def main(self, x: pl.Tensor[[4], pl.FP32], out: pl.Out[pl.Tensor[[4], pl.FP32]]):
+                a, b = self.helper(x, out)
+                return a, b, out
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, x: pl.Tensor[[4], pl.FP32], out: pl.Out[pl.Tensor[[4], pl.FP32]]):
+                tmp = (x, x)
+                out = pl.tensor.assemble(out, tmp[0], [0])
+                if rebind_source:
+                    x = pl.add(x, x)
+                a = tmp[0]
+                b = tmp[1]
+                return a, b, out
+
+        after = passes.inline_functions()(Before)
+        assert "FREE_VAR" not in after.as_python()
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
 
     def test_inline_with_bare_tensor_params_multi_return(self):
         """Bare `pl.Tensor` inline params (no `pl.Out` wrapper) splice the
