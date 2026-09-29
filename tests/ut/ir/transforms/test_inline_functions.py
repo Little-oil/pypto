@@ -2279,6 +2279,31 @@ class TestInlineFunctionsSubmitCallSite:
 
 
 class TestInlineFunctionsDynamicShapes:
+    def test_inline_view_refinement_preserves_caller_rebinding(self):
+        """A void helper must update the binding read after the inline call."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def refine(self, out: pl.Tensor[[8, 4], pl.FP32]):
+                out = pl.tensor.set_validshape(out, 3, 4)
+
+            @pl.function
+            def main(self, out: pl.Tensor[[8, 4], pl.FP32]):
+                self.refine(out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, out: pl.Tensor[[8, 4], pl.FP32]):
+                out = pl.tensor.set_validshape(out, 3, 4)
+                return out
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
     def test_conflicting_result_type_uses_operand_even_with_caller_dimension(self):
         """An unrelated caller signature dimension cannot mask a stale result extent."""
         rows = pl.dynamic("SHARED_ROWS")
