@@ -606,6 +606,337 @@ class TestInlineFunctionsNested:
         ir.assert_structural_equal(After, Expected)
 
 
+class TestInlineFunctionsDynamicTypes:
+    """Inlined tensor types must reference the caller's values and dimensions."""
+
+    def test_explicit_alias_view_is_preserved(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, source: pl.Tensor[[4, 8], pl.FP32]):
+                viewed: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[16, 1])] = source
+                _rows = pl.tensor.dim(viewed, 0)
+
+            @pl.function
+            def main(self, source: pl.Tensor[[4, 8], pl.FP32]):
+                self.helper(source)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, source: pl.Tensor[[4, 8], pl.FP32]):
+                viewed: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[16, 1])] = source
+                _rows = pl.tensor.dim(viewed, 0)
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+    def test_shared_formal_dimension_keeps_each_actual_tensor_shape(self):
+        formal_rows = pl.dynamic("formal_rows")
+        first_rows = pl.dynamic("first_rows")
+        second_rows = pl.dynamic("second_rows")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(
+                self,
+                first: pl.Tensor[[formal_rows, 16], pl.FP32],
+                second: pl.Tensor[[formal_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ):
+                first_update = pl.tensor.assemble(first, row, [0, 0])
+                first = first_update
+                second_update = pl.tensor.assemble(second, row, [0, 0])
+                second = second_update
+
+            @pl.function
+            def main(
+                self,
+                first: pl.Tensor[[first_rows, 16], pl.FP32],
+                second: pl.Tensor[[second_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ):
+                self.fill(first, second, row)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                first: pl.Tensor[[first_rows, 16], pl.FP32],
+                second: pl.Tensor[[second_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ):
+                first_update = pl.tensor.assemble(first, row, [0, 0])
+                first = first_update
+                second_update = pl.tensor.assemble(second, row, [0, 0])
+                second = second_update
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+    def test_computed_scalar_argument_preserves_caller_tensor_identity(self):
+        shared_rows = pl.dynamic("shared_rows")
+        caller_rows = pl.dynamic("caller_rows")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(
+                self,
+                out: pl.Tensor[[shared_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+                count: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[shared_rows, 16], pl.FP32]:
+                if count > 0:
+                    out = pl.tensor.assemble(out, row, [0, 0])
+                return out
+
+            @pl.function
+            def main(
+                self,
+                ids: pl.Tensor[[shared_rows], pl.INT32],
+                out: pl.Tensor[[caller_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ) -> pl.Tensor[[caller_rows, 16], pl.FP32]:
+                out = self.fill(out, row, pl.tensor.dim(ids, 0))
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                ids: pl.Tensor[[shared_rows], pl.INT32],
+                out: pl.Tensor[[caller_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ) -> pl.Tensor[[caller_rows, 16], pl.FP32]:
+                if pl.tensor.dim(ids, 0) > 0:
+                    out = pl.tensor.assemble(out, row, [0, 0])
+                return out
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+    def test_shape_expression_binding_preserves_caller_symbols(self):
+        shared_rows = pl.dynamic("shared_rows")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(
+                self,
+                out: pl.Tensor[[shared_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ):
+                updated = pl.tensor.assemble(out, row, [0, 0])
+                out = updated
+
+            @pl.function
+            def main(
+                self,
+                out: pl.Tensor[[shared_rows + 1, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ) -> pl.Tensor[[shared_rows + 1, 16], pl.FP32]:
+                self.fill(out, row)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                out: pl.Tensor[[shared_rows + 1, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+            ) -> pl.Tensor[[shared_rows + 1, 16], pl.FP32]:
+                updated = pl.tensor.assemble(out, row, [0, 0])
+                out = updated
+                return out
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+    @pytest.mark.parametrize("via_alias", [False, True])
+    def test_conditional_assemble_uses_actual_tensor_shape(self, via_alias):
+        formal_rows = pl.dynamic("formal_rows")
+        caller_rows = pl.dynamic("caller_rows")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(
+                self,
+                out: pl.Tensor[[formal_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+                active: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[formal_rows, 16], pl.FP32]:
+                if active > 0:
+                    if via_alias:
+                        updated = pl.tensor.assemble(out, row, [0, 0])
+                        out = updated
+                    else:
+                        out = pl.tensor.assemble(out, row, [0, 0])
+                return out
+
+            @pl.function
+            def main(
+                self,
+                out: pl.Tensor[[caller_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+                active: pl.Scalar[pl.INDEX],
+            ):
+                result = self.fill(out, row, active)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                out: pl.Tensor[[caller_rows, 16], pl.FP32],
+                row: pl.Tensor[[1, 16], pl.FP32],
+                active: pl.Scalar[pl.INDEX],
+            ):
+                if active > 0:
+                    if via_alias:
+                        updated = pl.tensor.assemble(out, row, [0, 0])
+                        out = updated
+                    else:
+                        out = pl.tensor.assemble(out, row, [0, 0])
+                result = out
+                return result
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+    def test_local_dimensions_and_valid_shapes_are_fresh_at_each_call_site(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, x: pl.Tensor[[16, 16], pl.FP32], n: pl.Scalar[pl.INDEX]):
+                rows = n + 1
+                out = pl.tensor.create([rows, 16], dtype=pl.FP32)
+                view = pl.tensor.slice(x, [8, 16], [0, 0], valid_shape=[rows, 16])
+                tile = pl.tile.load(view, [0, 0], [8, 16])
+                out = pl.tile.store(tile, [0, 0], out)
+                return out
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                first_rows: pl.Scalar[pl.INDEX],
+                second_rows: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                self.helper(x, first_rows)
+                self.helper(x, second_rows)
+                return x
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                first_rows: pl.Scalar[pl.INDEX],
+                second_rows: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                rows_first = first_rows + 1
+                out_first = pl.tensor.create([rows_first, 16], dtype=pl.FP32)
+                view_first = pl.tensor.slice(x, [8, 16], [0, 0], valid_shape=[rows_first, 16])
+                tile_first = pl.tile.load(view_first, [0, 0], [8, 16])
+                out_first = pl.tile.store(tile_first, [0, 0], out_first)
+                rows_second = second_rows + 1
+                out_second = pl.tensor.create([rows_second, 16], dtype=pl.FP32)
+                view_second = pl.tensor.slice(x, [8, 16], [0, 0], valid_shape=[rows_second, 16])
+                tile_second = pl.tile.load(view_second, [0, 0], [8, 16])
+                out_second = pl.tile.store(tile_second, [0, 0], out_second)
+                return x
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+    def test_for_loop_carried_dimensions_reference_fresh_iter_args(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, n: pl.Scalar[pl.INDEX]):
+                for i, (rows,) in pl.range(2, init_values=(n,)):
+                    _out = pl.tensor.create([rows, 16], dtype=pl.FP32)
+                    _done = pl.yield_(rows + 1)
+
+            @pl.function
+            def main(self, initial_rows: pl.Scalar[pl.INDEX]):
+                self.helper(initial_rows)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, initial_rows: pl.Scalar[pl.INDEX]):
+                for i, (rows,) in pl.range(2, init_values=(initial_rows,)):
+                    _out = pl.tensor.create([rows, 16], dtype=pl.FP32)
+                    _done = pl.yield_(rows + 1)
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+    def test_while_loop_carried_dimensions_reference_fresh_iter_args(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, n: pl.Scalar[pl.INDEX]):
+                for (rows,) in pl.while_(init_values=(n,)):
+                    pl.cond(rows < 16)
+                    _out = pl.tensor.create([rows, 16], dtype=pl.FP32)
+                    _done = pl.yield_(rows + 1)
+
+            @pl.function
+            def main(self, initial_rows: pl.Scalar[pl.INDEX]):
+                self.helper(initial_rows)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, initial_rows: pl.Scalar[pl.INDEX]):
+                for (rows,) in pl.while_(init_values=(initial_rows,)):
+                    pl.cond(rows < 16)
+                    _out = pl.tensor.create([rows, 16], dtype=pl.FP32)
+                    _done = pl.yield_(rows + 1)
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+    def test_inline_submit_preserves_task_result_and_dependencies(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, x: pl.Tensor[[16], pl.FP32]) -> pl.Tensor[[16], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, x: pl.Tensor[[16], pl.FP32], n: pl.Scalar[pl.INDEX]):
+                with pl.manual_scope():
+                    prior = pl.system.task_dummy(deps=[])
+                    out, tid = pl.spmd_submit(self.kernel, x, core_num=n, deps=[prior])
+                    _fence = pl.system.task_dummy(deps=[tid])
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[16], pl.FP32], blocks: pl.Scalar[pl.INDEX]):
+                result = self.helper(x, blocks)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, x: pl.Tensor[[16], pl.FP32]) -> pl.Tensor[[16], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[16], pl.FP32], blocks: pl.Scalar[pl.INDEX]):
+                with pl.manual_scope():
+                    prior = pl.system.task_dummy(deps=[])
+                    out, tid = pl.spmd_submit(self.kernel, x, core_num=blocks, deps=[prior])
+                    _fence = pl.system.task_dummy(deps=[tid])
+                result = out
+                return result
+
+        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+
+
 class TestInlineFunctionsCycles:
     """Cycle detection in the Inline → Inline call graph."""
 
@@ -1948,6 +2279,84 @@ class TestInlineFunctionsSubmitCallSite:
 
 
 class TestInlineFunctionsDynamicShapes:
+    def test_conflicting_result_type_uses_operand_even_with_caller_dimension(self):
+        """An unrelated caller signature dimension cannot mask a stale result extent."""
+        rows = pl.dynamic("SHARED_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, out: pl.Tensor[[rows, 4], pl.FP32], padded: pl.Tensor[[rows, 4], pl.FP32]):
+                updated = pl.add(out, out)
+                out = updated
+
+            @pl.function
+            def main(
+                self,
+                marker: pl.Tensor[[rows, 4], pl.FP32],
+                out: pl.Tensor[[8, 4], pl.FP32],
+                padded: pl.Tensor[[16, 4], pl.FP32],
+            ):
+                self.fill(out, padded)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                marker: pl.Tensor[[rows, 4], pl.FP32],
+                out: pl.Tensor[[8, 4], pl.FP32],
+                padded: pl.Tensor[[16, 4], pl.FP32],
+            ):
+                updated = pl.add(out, out)
+                out = updated
+                return out
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        passes.convert_to_ssa()(after)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
+
+    def test_conflicting_tensor_carries_follow_for_and_while_initializers(self):
+        """Both loop kinds specialize tensor carries and the results consumed after them."""
+        rows = pl.dynamic("FORMAL_ROWS")
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def fill(self, out: pl.Tensor[[rows, 4], pl.FP32], padded: pl.Tensor[[rows, 4], pl.FP32]):
+                for i, (carry,) in pl.range(2, init_values=(out,)):
+                    result = pl.yield_(pl.add(carry, carry))
+                out = pl.add(result, result)
+                for carry, count in pl.while_(init_values=(out, 0)):
+                    pl.cond(count < 2)
+                    result, _count = pl.yield_(pl.add(carry, carry), count + 1)
+                out = pl.add(result, result)
+
+            @pl.function
+            def main(self, out: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                self.fill(out, padded)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, out: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                for i, (carry,) in pl.range(2, init_values=(out,)):
+                    result = pl.yield_(pl.add(carry, carry))
+                out = pl.add(result, result)
+                for carry, count in pl.while_(init_values=(out, 0)):
+                    pl.cond(count < 2)
+                    result, _count = pl.yield_(pl.add(carry, carry), count + 1)
+                out = pl.add(result, result)
+                return out
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        passes.convert_to_ssa()(after)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
+
     def test_caller_signature_dimension_not_present_in_actual_arguments(self):
         """A signature dimension stays in scope when only static buffers reach the helper."""
         rows = pl.dynamic("SHARED_ROWS")
@@ -1974,7 +2383,7 @@ class TestInlineFunctionsDynamicShapes:
     @pytest.mark.parametrize("loop_carried", [False, True])
     @pytest.mark.parametrize("separate_symbols", [False, True])
     def test_logical_and_padded_local_types(self, loop_carried, separate_symbols):
-        """Local/loop types require distinct symbols for distinct argument extents."""
+        """Local/loop types follow their operands even when annotations share a symbol."""
         rows = pl.dynamic("CALLEE_ROWS")
         padded_rows = pl.dynamic("PADDED_ROWS") if separate_symbols else rows
 
@@ -1993,16 +2402,21 @@ class TestInlineFunctionsDynamicShapes:
                 self.fill(out, padded)
                 return out
 
-        if separate_symbols:
-            after = passes.inline_functions()(Before)
-            passes.convert_to_ssa()(after)
-            return
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, out: pl.Tensor[[8, 4], pl.FP32], padded: pl.Tensor[[16, 4], pl.FP32]):
+                if loop_carried:
+                    for i in pl.range(2):
+                        out = pl.add(out, out)
+                else:
+                    _updated = pl.add(padded, padded)
+                return out
 
-        with pytest.raises(
-            ValueError,
-            match="Cannot inline 'fill': type dimension 'CALLEE_ROWS'.*Use distinct dynamic symbols",
-        ):
-            passes.inline_functions()(Before)
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        passes.convert_to_ssa()(after)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
 
     def test_void_inline_call_preserves_logical_and_padded_arguments(self):
         """Inline helpers may use one placeholder for logical and padded buffers."""
@@ -2046,7 +2460,8 @@ class TestInlineFunctionsDynamicShapes:
 
             @pl.function
             def main(self, a: pl.Tensor[[shared + 4, 4], pl.FP32], b: pl.Tensor[[16, 4], pl.FP32]):
-                return self.double(a, b)
+                result = self.double(a, b)
+                return result
 
         after = passes.inline_functions()(Before)
         main = after.get_function("main")
@@ -2060,6 +2475,7 @@ class TestInlineFunctionsDynamicShapes:
         assert isinstance(assign.value, ir.Call)
         assert assign.value.args[0] is main.params[0]
         passes.convert_to_ssa()(after)
+        ir.assert_structural_equal(after, pl.parse_program(after.as_python()))
 
     def test_local_extent_through_loop_carried_tensor(self):
         """Callee-only dimensions must be bound to the caller's runtime extent (#2936)."""

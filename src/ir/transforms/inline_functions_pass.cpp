@@ -19,12 +19,14 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memref.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
@@ -32,8 +34,10 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
@@ -120,9 +124,14 @@ void DetectInlineCycles(const std::unordered_map<std::string, FunctionPtr>& inli
 class DefVarCollector : public IRVisitor {
  public:
   std::unordered_set<const Var*> defs;
+  std::unordered_map<const Var*, bool> inferred_def_types;
 
   void VisitStmt_(const AssignStmtPtr& op) override {
-    if (op->var_) defs.insert(op->var_.get());
+    if (op->var_) {
+      defs.insert(op->var_.get());
+      inferred_def_types.emplace(op->var_.get(),
+                                 structural_equal(op->var_->GetType(), op->value_->GetType()));
+    }
     IRVisitor::VisitStmt_(op);
   }
 
@@ -236,6 +245,177 @@ struct SplicedInlineBody {
   bool has_return;                     // Whether the body ended with a ReturnStmt
 };
 
+// A shared shape placeholder can describe different actual buffers in an inline
+// helper. Derive result types from the rewritten values, not that placeholder.
+// The base mutator propagates replacements through uses, attrs and type fields.
+using InlineFunctionMap = std::unordered_map<std::string, FunctionPtr>;
+
+class InlineTypeSpecializer : public IRMutator {
+ public:
+  InlineTypeSpecializer(const InlineFunctionMap& functions, std::unordered_set<const Var*> preserved_vars)
+      : preserved_vars_(std::move(preserved_vars)), functions_(functions) {}
+
+ protected:
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    auto call = As<Call>(IRMutator::VisitExpr_(op));
+    TypePtr type;
+    if (As<GlobalVar>(call->op_)) {
+      type = DeduceDispatchType(call->op_, call->args_, false);
+    } else {
+      auto& registry = OpRegistry::GetInstance();
+      const auto& entry = registry.GetEntry(call->op_->name_);
+      if (entry.RequiresExplicitType()) return call;
+      // Static operations untouched by substitution retain their descriptors.
+      // Writebacks and dynamic results need operand-specific specialization.
+      if (call == op && !entry.GetOutputReusesInputArg() &&
+          var_collectors::CollectTypeVars(call->GetType()).empty())
+        return call;
+      type = registry.Create(call->op_->name_, call->args_, call->kwargs_, call->span_)->GetType();
+    }
+    if (type) type = PreserveStorage(type, call->GetType());
+    if (!type || structural_equal(type, call->GetType())) return call;
+    return std::make_shared<Call>(call->op_, call->args_, call->kwargs_, call->attrs_, type, call->span_);
+  }
+
+  ExprPtr VisitExpr_(const SubmitPtr& op) override {
+    auto submit = As<Submit>(IRMutator::VisitExpr_(op));
+    auto type = DeduceDispatchType(submit->op_, submit->args_, true);
+    if (!type || structural_equal(type, submit->GetType())) return submit;
+    return std::make_shared<Submit>(submit->op_, submit->args_, submit->deps_, submit->kwargs_,
+                                    submit->attrs_, type, submit->span_, submit->core_num_,
+                                    submit->sync_start_, submit->allow_early_resolve_, submit->predicate_);
+  }
+
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    auto value = VisitExpr(op->value_);
+    auto var = As<Var>(VisitExpr(op->var_));
+    if (!var) return IRMutator::VisitStmt_(op);  // MemRef definitions retain their descriptors.
+    // Before SSA, one Var can be assigned repeatedly, including in different
+    // branches. Keep its binding identity once defined: a branch-local valid
+    // shape refinement must not redirect the other branch or the loop seed to
+    // a different Var. Fresh definitions still take their type from the RHS.
+    auto [definition, inserted] = definitions_.emplace(op->var_.get(), var);
+    if (inserted && !preserved_vars_.count(op->var_.get())) {
+      definition->second = Retype(op->var_, var, value->GetType());
+    }
+    var = definition->second;
+    if (var.get() == op->var_.get() && value.get() == op->value_.get()) return op;
+    return std::make_shared<AssignStmt>(var, value, op->span_);
+  }
+
+  ExprPtr VisitExpr_(const IterArgPtr& op) override {
+    auto arg = As<IterArg>(IRMutator::VisitExpr_(op));
+    auto type = arg->initValue_->GetType();
+    if (structural_equal(arg->GetType(), type)) return arg;
+    auto fresh = std::make_shared<IterArg>(arg->name_hint_, type, arg->initValue_, arg->span_);
+    retained_.push_back(arg);
+    var_remap_[op.get()] = fresh;
+    return fresh;
+  }
+
+  StmtPtr VisitStmt_(const ForStmtPtr& op) override { return RetypeLoop(op); }
+  StmtPtr VisitStmt_(const WhileStmtPtr& op) override { return RetypeLoop(op); }
+
+  StmtPtr VisitStmt_(const IfStmtPtr& op) override {
+    auto result = As<IfStmt>(IRMutator::VisitStmt_(op));
+    auto yield = transform_utils::GetLastYieldStmt(result->then_body_);
+    if (!yield && result->else_body_) yield = transform_utils::GetLastYieldStmt(*result->else_body_);
+    if (!yield) return result;
+    auto vars = result->return_vars_;
+    bool changed = false;
+    for (size_t i = 0; i < vars.size() && i < yield->value_.size(); ++i) {
+      auto var = Retype(op->return_vars_[i], vars[i], yield->value_[i]->GetType());
+      changed |= var.get() != vars[i].get();
+      vars[i] = std::move(var);
+    }
+    if (!changed) return result;
+    auto copy = MutableCopy(result);
+    copy->return_vars_ = std::move(vars);
+    return copy;
+  }
+
+ private:
+  static TypePtr PreserveStorage(const TypePtr& inferred, const TypePtr& original) {
+    auto memref = GetTypeMemRef(inferred);
+    bool changed = false;
+    if (!memref && GetTypeMemRef(original)) {
+      memref = GetTypeMemRef(original);
+      changed = true;
+    }
+    std::optional<MemorySpace> memory_space;
+    auto tile = As<TileType>(inferred);
+    auto original_tile = As<TileType>(original);
+    if (tile && original_tile && !tile->memory_space_ && original_tile->memory_space_) {
+      memory_space = original_tile->memory_space_;
+      changed = true;
+    }
+    return changed ? CloneTypeWithMemRef(inferred, memref, memory_space) : inferred;
+  }
+
+  TypePtr DeduceDispatchType(const OpPtr& op, const std::vector<ExprPtr>& args, bool submit) {
+    auto found = functions_.find(op->name_);
+    if (found == functions_.end() || found->second->func_type_ == FunctionType::Inline) return nullptr;
+    const auto& callee = found->second;
+    auto returns = callee->return_types_;
+    if (returns.empty() && !submit) {
+      auto body = callee->body_;
+      if (auto seq = As<SeqStmts>(body); seq && !seq->stmts_.empty()) body = seq->stmts_.back();
+      if (auto ret = As<ReturnStmt>(body)) {
+        for (const auto& value : ret->value_) returns.push_back(value->GetType());
+      }
+    }
+    auto params = callee->params_;
+    if (submit && args.size() < params.size()) {
+      // Submit may omit trailing Out buffers before its CommCtx suffix.
+      size_t contexts = 0;
+      while (contexts < params.size() && As<CommCtxType>(params[params.size() - contexts - 1]->GetType())) {
+        ++contexts;
+      }
+      INTERNAL_CHECK_SPAN(args.size() >= contexts, callee->span_) << "Invalid Submit context arguments";
+      params.erase(params.begin() + static_cast<std::ptrdiff_t>(args.size() - contexts),
+                   params.end() - static_cast<std::ptrdiff_t>(contexts));
+    }
+    returns = DeduceCallReturnType(params, args, returns);
+    if (submit) returns.push_back(std::make_shared<ScalarType>(DataType::TASK_ID));
+    if (returns.empty()) return nullptr;
+    if (!submit && returns.size() == 1) return returns.front();
+    return std::make_shared<TupleType>(std::move(returns));
+  }
+
+  VarPtr Retype(const VarPtr& original, const VarPtr& current, const TypePtr& type) {
+    if (preserved_vars_.count(original.get())) return current;
+    auto result_type = PreserveStorage(type, current->GetType());
+    if (structural_equal(current->GetType(), result_type)) return current;
+    auto fresh = std::make_shared<Var>(current->name_hint_, result_type, current->span_);
+    // Keep intermediate Vars alive while their raw pointers key var_remap_.
+    retained_.push_back(current);
+    var_remap_[original.get()] = fresh;
+    if (current.get() != original.get()) var_remap_[current.get()] = fresh;
+    return fresh;
+  }
+
+  template <typename LoopPtr>
+  StmtPtr RetypeLoop(const LoopPtr& op) {
+    auto result = std::static_pointer_cast<typename LoopPtr::element_type>(IRMutator::VisitStmt_(op));
+    auto vars = result->return_vars_;
+    bool changed = false;
+    for (size_t i = 0; i < vars.size() && i < result->iter_args_.size(); ++i) {
+      auto var = Retype(op->return_vars_[i], vars[i], result->iter_args_[i]->GetType());
+      changed |= var.get() != vars[i].get();
+      vars[i] = std::move(var);
+    }
+    if (!changed) return result;
+    auto copy = MutableCopy(result);
+    copy->return_vars_ = std::move(vars);
+    return copy;
+  }
+
+  std::vector<ExprPtr> retained_;
+  std::unordered_map<const Var*, VarPtr> definitions_;
+  std::unordered_set<const Var*> preserved_vars_;
+  const InlineFunctionMap& functions_;
+};
+
 // Conflicting argument extents may leave a callee dimension unbound. Reject it
 // only if it survives cloning; a helper using just the actual arguments remains
 // valid. Reuse the shared type-field walk for tensor, tile, tuple and view types.
@@ -282,6 +462,7 @@ class UnboundInlineDimensionChecker : public IRVisitor {
 //   3. Split the cloned body into pre-return statements and the trailing
 //      return value(s); reject any non-trailing return.
 SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
+                                  const InlineFunctionMap& functions,
                                   const std::unordered_set<const Var*>& caller_dimensions) {
   INTERNAL_CHECK_SPAN(callee->params_.size() == args.size(), callee->span_)
       << "Internal error: inline call to '" << callee->name_ << "' has " << args.size()
@@ -365,7 +546,15 @@ SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<E
   //    substitutes dynamic dimensions and references to other cloned locals.
   //    Pre-seeding fresh Vars would bypass that remapping: seeded replacements
   //    are intentionally used verbatim to preserve the caller's arguments.
-  auto [renamed_body, _unused] = DeepClone(callee->body_, seed, /*clone_def_vars=*/true, FreshName);
+  auto [renamed_body, cloned_vars] = DeepClone(callee->body_, seed, /*clone_def_vars=*/true, FreshName);
+  std::unordered_set<const Var*> preserved_vars;
+  for (const auto& [original, cloned] : cloned_vars) {
+    auto inferred = def_collector.inferred_def_types.find(original);
+    if (seed.count(original) || (inferred != def_collector.inferred_def_types.end() && !inferred->second)) {
+      preserved_vars.insert(cloned.get());
+    }
+  }
+  renamed_body = InlineTypeSpecializer(functions, std::move(preserved_vars)).VisitStmt(renamed_body);
 
   std::unordered_set<const Var*> unbound_dimensions;
   for (const auto& param : callee->params_) {
@@ -457,8 +646,9 @@ SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<E
 // EvalStmt the way a call-like value can — reject it loudly instead of deleting
 // the nested call with it.
 std::vector<StmtPtr> SpliceInlineCallAsEval(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
+                                            const InlineFunctionMap& functions,
                                             const std::unordered_set<const Var*>& caller_dimensions) {
-  auto body = CloneInlineBody(callee, args, caller_dimensions);
+  auto body = CloneInlineBody(callee, args, functions, caller_dimensions);
   for (const auto& value : body.return_values) {
     if (!value) continue;
     if (IsEffectfulCallLike(value)) {
@@ -483,8 +673,9 @@ std::vector<StmtPtr> SpliceInlineCallAsEval(const FunctionPtr& callee, const std
 // SpliceInlineCallAsTupleSub, which avoids the dead `LHS = MakeTuple(...)`.
 std::vector<StmtPtr> SpliceInlineCallAsAssign(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
                                               const VarPtr& lhs, const Span& call_site_span,
+                                              const InlineFunctionMap& functions,
                                               const std::unordered_set<const Var*>& caller_dimensions) {
-  auto body = CloneInlineBody(callee, args, caller_dimensions);
+  auto body = CloneInlineBody(callee, args, functions, caller_dimensions);
   INTERNAL_CHECK_SPAN(body.has_return, call_site_span)
       << "Internal error: inline function '" << callee->name_
       << "' is called for its value but has no return statement (parser should reject "
@@ -515,8 +706,9 @@ std::vector<StmtPtr> SpliceInlineCallAsAssign(const FunctionPtr& callee, const s
 // makes the LHS unreferenced and the binding effectively dead.
 std::vector<StmtPtr> SpliceInlineCallAsTupleSub(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
                                                 std::vector<ExprPtr>& out_substitution,
+                                                const InlineFunctionMap& functions,
                                                 const std::unordered_set<const Var*>& caller_dimensions) {
-  auto body = CloneInlineBody(callee, args, caller_dimensions);
+  auto body = CloneInlineBody(callee, args, functions, caller_dimensions);
   INTERNAL_CHECK_SPAN(body.has_return, callee->span_)
       << "Internal error: inline function '" << callee->name_
       << "' is called for its value but has no return statement (parser should reject "
@@ -559,9 +751,9 @@ std::vector<StmtPtr> SpliceInlineCallAsTupleSub(const FunctionPtr& callee, const
 // values directly. Single-return → ReturnStmt({v}); multi-return →
 // ReturnStmt({v0, v1, ...}). No MakeTuple, no temporary.
 std::vector<StmtPtr> SpliceInlineCallAsReturn(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
-                                              const Span& call_site_span,
+                                              const Span& call_site_span, const InlineFunctionMap& functions,
                                               const std::unordered_set<const Var*>& caller_dimensions) {
-  auto body = CloneInlineBody(callee, args, caller_dimensions);
+  auto body = CloneInlineBody(callee, args, functions, caller_dimensions);
   INTERNAL_CHECK_SPAN(body.has_return, call_site_span)
       << "Internal error: inline function '" << callee->name_
       << "' is used as a return value but has no return statement (parser should reject "
@@ -800,8 +992,8 @@ class NestedInlineCallHoister : public IRMutator {
 class InlineCallsMutator : public IRMutator {
  public:
   InlineCallsMutator(const std::unordered_map<std::string, FunctionPtr>& inline_fns,
-                     const FunctionPtr& caller)
-      : inline_fns_(inline_fns) {
+                     const FunctionPtr& caller, const InlineFunctionMap& functions)
+      : inline_fns_(inline_fns), functions_(functions) {
     // Signature dimensions are in scope throughout the caller, including when
     // a particular inline call receives only locally allocated buffers.
     for (const auto& param : caller->params_) {
@@ -1031,7 +1223,7 @@ class InlineCallsMutator : public IRMutator {
         if (auto assign = As<AssignStmt>(stmt)) {
           spliced = SpliceAssignCallSite(callee, call->args_, assign->var_, assign->span_);
         } else if (auto eval = As<EvalStmt>(stmt)) {
-          spliced = SpliceInlineCallAsEval(callee, call->args_, caller_dimensions_);
+          spliced = SpliceInlineCallAsEval(callee, call->args_, functions_, caller_dimensions_);
         }
       }
     }
@@ -1043,7 +1235,8 @@ class InlineCallsMutator : public IRMutator {
         if (auto call = As<Call>(ret->value_[0])) {
           if (auto callee = LookupInlineCallee(call)) {
             call_dump_vars = call->GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
-            spliced = SpliceInlineCallAsReturn(callee, call->args_, ret->span_, caller_dimensions_);
+            spliced =
+                SpliceInlineCallAsReturn(callee, call->args_, ret->span_, functions_, caller_dimensions_);
           }
         }
       }
@@ -1068,11 +1261,11 @@ class InlineCallsMutator : public IRMutator {
                                             const VarPtr& lhs, const Span& span) {
     if (InlineReturnsTuple(callee)) {
       std::vector<ExprPtr> sub;
-      auto stmts = SpliceInlineCallAsTupleSub(callee, args, sub, caller_dimensions_);
+      auto stmts = SpliceInlineCallAsTupleSub(callee, args, sub, functions_, caller_dimensions_);
       tuple_subs_[lhs.get()] = std::move(sub);
       return stmts;
     }
-    return SpliceInlineCallAsAssign(callee, args, lhs, span, caller_dimensions_);
+    return SpliceInlineCallAsAssign(callee, args, lhs, span, functions_, caller_dimensions_);
   }
 
   FunctionPtr LookupInlineCallee(const CallPtr& call) const {
@@ -1085,6 +1278,7 @@ class InlineCallsMutator : public IRMutator {
 
  private:
   const std::unordered_map<std::string, FunctionPtr>& inline_fns_;
+  const InlineFunctionMap& functions_;
   std::unordered_set<const Var*> caller_dimensions_;
   bool changed_ = false;
   // LHS Var → return values, populated by SpliceAssignCallSite for multi-return
@@ -1176,11 +1370,25 @@ Pass InlineFunctions() {
       }
 
       for (auto& [name, fn] : current) {
-        InlineCallsMutator mutator(latest_inline, fn);
+        DefVarCollector original_defs;
+        original_defs.VisitStmt(fn->body_);
+        InlineCallsMutator mutator(latest_inline, fn, current);
         auto new_body = mutator.VisitStmt(fn->body_);
         if (mutator.Changed()) {
           auto updated = MutableCopy(fn);
-          updated->body_ = new_body;
+          // A call receiver and its downstream users may still carry the
+          // pre-inline return type. Propagate the actual returned value's type.
+          std::unordered_set<const Var*> preserved_vars;
+          for (const auto& param : fn->params_) preserved_vars.insert(param.get());
+          DefVarCollector updated_defs;
+          updated_defs.VisitStmt(new_body);
+          for (const auto& [var, inferred] : updated_defs.inferred_def_types) {
+            auto original = original_defs.inferred_def_types.find(var);
+            if (!(original == original_defs.inferred_def_types.end() ? inferred : original->second)) {
+              preserved_vars.insert(var);
+            }
+          }
+          updated->body_ = InlineTypeSpecializer(current, std::move(preserved_vars)).VisitStmt(new_body);
           fn = updated;
           any_changed = true;
         }
