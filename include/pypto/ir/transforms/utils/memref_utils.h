@@ -83,6 +83,23 @@ inline TypePtr CloneTypeWithMemRef(const TypePtr& type, const std::optional<MemR
   return type;
 }
 
+/// Select assignment metadata consistently in inlining and SSA conversion.
+inline TypePtr GetAuthoritativeAssignmentType(const TypePtr& lhs_type, const ExprPtr& value) {
+  auto value_type = value ? value->GetType() : nullptr;
+  const bool rhs_carries_authoritative_metadata = AsVarLike(value) ||
+                                                  std::dynamic_pointer_cast<const ShapedType>(value_type) ||
+                                                  As<TupleType>(value_type);
+  auto chosen = value_type && !As<UnknownType>(value_type) && rhs_carries_authoritative_metadata ? value_type
+                                                                                                 : lhs_type;
+  // The RHS wins on shape / dtype / view metadata. Op type deduction does not
+  // produce a MemRef, so an LHS MemRef supplies additional allocation metadata
+  // (an author-declared allocation or a re-parsed post-allocation dump).
+  if (!GetTypeMemRef(chosen).has_value() && GetTypeMemRef(lhs_type).has_value()) {
+    chosen = CloneTypeWithMemRef(chosen, GetTypeMemRef(lhs_type));
+  }
+  return chosen;
+}
+
 template <typename RemapExprFn>
 inline std::vector<ExprPtr> RemapTypeExprVector(const std::vector<ExprPtr>& exprs,
                                                 const RemapExprFn& remap_expr, bool& changed) {

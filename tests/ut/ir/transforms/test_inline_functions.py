@@ -609,7 +609,9 @@ class TestInlineFunctionsNested:
 class TestInlineFunctionsDynamicTypes:
     """Inlined tensor types must reference the caller's values and dimensions."""
 
-    def test_explicit_alias_view_is_preserved(self):
+    def test_alias_type_follows_rhs_through_ssa(self):
+        """A stale LHS-only view cannot override the actual alias source."""
+
         @pl.program
         class Before:
             @pl.function(type=pl.FunctionType.Inline)
@@ -620,15 +622,135 @@ class TestInlineFunctionsDynamicTypes:
             @pl.function
             def main(self, source: pl.Tensor[[4, 8], pl.FP32]):
                 self.helper(source)
+                caller_alias: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[16, 1])] = source
+                _caller_rows = pl.tensor.dim(caller_alias, 0)
 
         @pl.program
         class Expected:
             @pl.function
             def main(self, source: pl.Tensor[[4, 8], pl.FP32]):
-                viewed: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[16, 1])] = source
+                viewed = source
+                _rows = pl.tensor.dim(viewed, 0)
+                caller_alias = source
+                _caller_rows = pl.tensor.dim(caller_alias, 0)
+
+        after = passes.inline_functions()(Before)
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.AssignTypeSymmetry)
+        for actual, expected in (
+            (after, Expected),
+            (passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected)),
+        ):
+            ir.assert_structural_equal(actual, expected)
+            assert not passes.PropertyVerifierRegistry.verify(props, actual)
+
+    def test_rhs_view_is_preserved_through_ssa(self):
+        """RHS view metadata survives inlining, including downstream aliases."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(
+                self,
+                source: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)],
+            ):
+                viewed: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[32, 1])] = source
                 _rows = pl.tensor.dim(viewed, 0)
 
-        ir.assert_structural_equal(passes.inline_functions()(Before), Expected)
+            @pl.function
+            def main(
+                self,
+                source: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)],
+            ):
+                self.helper(source)
+                caller_alias: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[32, 1])] = source
+                _caller_rows = pl.tensor.dim(caller_alias, 0)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                source: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)],
+            ):
+                viewed = source
+                _rows = pl.tensor.dim(viewed, 0)
+                caller_alias = source
+                _caller_rows = pl.tensor.dim(caller_alias, 0)
+
+        after = passes.inline_functions()(Before)
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.AssignTypeSymmetry)
+        for actual, expected in (
+            (after, Expected),
+            (passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected)),
+        ):
+            ir.assert_structural_equal(actual, expected)
+            assert not passes.PropertyVerifierRegistry.verify(props, actual)
+
+    def test_tile_alias_memory_space_follows_rhs(self):
+        """Assignment retyping must not reapply stale LHS storage metadata."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, source: pl.Tile[[4, 8], pl.FP32]):
+                _alias: pl.Tile[[4, 8], pl.FP32, pl.Mem.Vec] = source
+
+            @pl.function
+            def main(self, source: pl.Tile[[4, 8], pl.FP32]):
+                self.helper(source)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, source: pl.Tile[[4, 8], pl.FP32]):
+                _alias = source
+
+        after = passes.inline_functions()(Before)
+        ir.assert_structural_equal(after, Expected)
+        ir.assert_structural_equal(passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected))
+
+    def test_inline_alias_inherits_actual_memref(self):
+        """Structural type equality alone must not discard the RHS allocation."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Inline)
+            def helper(self, source: pl.Tile[[4, 8], pl.FP32, pl.Mem.Vec]):
+                _alias = source
+
+            @pl.function
+            def main(self, data: pl.Tensor[[4, 8], pl.FP32]):
+                source: pl.Tile[[4, 8], pl.FP32, pl.MemRef("scratch"), pl.Mem.Vec] = pl.load(
+                    data, [0, 0], [4, 8], target_memory=pl.Mem.Vec
+                )
+                self.helper(source)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, data: pl.Tensor[[4, 8], pl.FP32]):
+                source: pl.Tile[[4, 8], pl.FP32, pl.MemRef("scratch"), pl.Mem.Vec] = pl.load(
+                    data, [0, 0], [4, 8], target_memory=pl.Mem.Vec
+                )
+                _alias = source
+
+        after = passes.inline_functions()(Before)
+        for actual, expected in (
+            (after, Expected),
+            (passes.convert_to_ssa()(after), passes.convert_to_ssa()(Expected)),
+        ):
+            ir.assert_structural_equal(actual, expected)
+            main = next(iter(actual.functions.values()))
+            assert isinstance(main.body, ir.SeqStmts)
+            source, alias = main.body.stmts
+            assert isinstance(source, ir.AssignStmt)
+            assert isinstance(alias, ir.AssignStmt)
+            assert isinstance(source.var.type, ir.TileType)
+            assert isinstance(alias.var.type, ir.TileType)
+            assert source.var.type.memref is not None
+            assert alias.var.type.memref is source.var.type.memref
 
     def test_shared_formal_dimension_keeps_each_actual_tensor_shape(self):
         formal_rows = pl.dynamic("formal_rows")

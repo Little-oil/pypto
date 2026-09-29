@@ -124,13 +124,10 @@ void DetectInlineCycles(const std::unordered_map<std::string, FunctionPtr>& inli
 class DefVarCollector : public IRVisitor {
  public:
   std::unordered_set<const Var*> defs;
-  std::unordered_map<const Var*, bool> inferred_def_types;
 
   void VisitStmt_(const AssignStmtPtr& op) override {
     if (op->var_) {
       defs.insert(op->var_.get());
-      inferred_def_types.emplace(op->var_.get(),
-                                 structural_equal(op->var_->GetType(), op->value_->GetType()));
     }
     IRVisitor::VisitStmt_(op);
   }
@@ -294,10 +291,10 @@ class InlineTypeSpecializer : public IRMutator {
     // Before SSA, one Var can be assigned repeatedly, including in different
     // branches. Keep its binding identity once defined: a branch-local valid
     // shape refinement must not redirect the other branch or the loop seed to
-    // a different Var. Fresh definitions still take their type from the RHS.
+    // a different Var. Fresh definitions use the same type selection as SSA.
     auto [definition, inserted] = definitions_.emplace(op->var_.get(), var);
-    if (inserted && !preserved_vars_.count(op->var_.get())) {
-      definition->second = Retype(op->var_, var, value->GetType());
+    if (inserted) {
+      definition->second = Retype(op->var_, var, GetAuthoritativeAssignmentType(var->GetType(), value));
     }
     var = definition->second;
     if (var.get() == op->var_.get() && value.get() == op->value_.get()) return op;
@@ -325,7 +322,8 @@ class InlineTypeSpecializer : public IRMutator {
     auto vars = result->return_vars_;
     bool changed = false;
     for (size_t i = 0; i < vars.size() && i < yield->value_.size(); ++i) {
-      auto var = Retype(op->return_vars_[i], vars[i], yield->value_[i]->GetType());
+      auto type = PreserveStorage(yield->value_[i]->GetType(), vars[i]->GetType());
+      auto var = Retype(op->return_vars_[i], vars[i], type);
       changed |= var.get() != vars[i].get();
       vars[i] = std::move(var);
     }
@@ -387,9 +385,11 @@ class InlineTypeSpecializer : public IRMutator {
 
   VarPtr Retype(const VarPtr& original, const VarPtr& current, const TypePtr& type) {
     if (preserved_vars_.count(original.get())) return current;
-    auto result_type = PreserveStorage(type, current->GetType());
-    if (structural_equal(current->GetType(), result_type)) return current;
-    auto fresh = std::make_shared<Var>(current->name_hint_, result_type, current->span_);
+    if (structural_equal(current->GetType(), type) &&
+        GetTypeMemRef(current->GetType()) == GetTypeMemRef(type)) {
+      return current;
+    }
+    auto fresh = std::make_shared<Var>(current->name_hint_, type, current->span_);
     // Keep intermediate Vars alive while their raw pointers key var_remap_.
     retained_.push_back(current);
     var_remap_[original.get()] = fresh;
@@ -403,7 +403,8 @@ class InlineTypeSpecializer : public IRMutator {
     auto vars = result->return_vars_;
     bool changed = false;
     for (size_t i = 0; i < vars.size() && i < result->iter_args_.size(); ++i) {
-      auto var = Retype(op->return_vars_[i], vars[i], result->iter_args_[i]->GetType());
+      auto type = PreserveStorage(result->iter_args_[i]->GetType(), vars[i]->GetType());
+      auto var = Retype(op->return_vars_[i], vars[i], type);
       changed |= var.get() != vars[i].get();
       vars[i] = std::move(var);
     }
@@ -549,19 +550,12 @@ SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<E
   //    substitutes dynamic dimensions and references to other cloned locals.
   //    Pre-seeding fresh Vars would bypass that remapping: seeded replacements
   //    are intentionally used verbatim to preserve the caller's arguments.
-  auto [renamed_body, cloned_vars] = DeepClone(callee->body_, seed, /*clone_def_vars=*/true, FreshName);
+  auto renamed_body = DeepClone(callee->body_, seed, /*clone_def_vars=*/true, FreshName).cloned_body;
   std::unordered_set<const Var*> preserved_vars;
-  // DeepClone's returned map contains fresh definitions only, not seeded
-  // caller bindings. Preserve those identities even when a writeback refines
+  // Preserve seeded caller bindings even when a writeback refines
   // the RHS view; subsequent caller uses must still observe the rebinding.
   for (const auto& param : callee->params_) {
     if (auto var = AsVarLike(seed.at(param.get()))) preserved_vars.insert(var.get());
-  }
-  for (const auto& [original, cloned] : cloned_vars) {
-    auto inferred = def_collector.inferred_def_types.find(original);
-    if (inferred != def_collector.inferred_def_types.end() && !inferred->second) {
-      preserved_vars.insert(cloned.get());
-    }
   }
   renamed_body = InlineTypeSpecializer(functions, std::move(preserved_vars)).VisitStmt(renamed_body);
 
@@ -1379,8 +1373,6 @@ Pass InlineFunctions() {
       }
 
       for (auto& [name, fn] : current) {
-        DefVarCollector original_defs;
-        original_defs.VisitStmt(fn->body_);
         InlineCallsMutator mutator(latest_inline, fn, current);
         auto new_body = mutator.VisitStmt(fn->body_);
         if (mutator.Changed()) {
@@ -1389,14 +1381,6 @@ Pass InlineFunctions() {
           // pre-inline return type. Propagate the actual returned value's type.
           std::unordered_set<const Var*> preserved_vars;
           for (const auto& param : fn->params_) preserved_vars.insert(param.get());
-          DefVarCollector updated_defs;
-          updated_defs.VisitStmt(new_body);
-          for (const auto& [var, inferred] : updated_defs.inferred_def_types) {
-            auto original = original_defs.inferred_def_types.find(var);
-            if (!(original == original_defs.inferred_def_types.end() ? inferred : original->second)) {
-              preserved_vars.insert(var);
-            }
-          }
           updated->body_ = InlineTypeSpecializer(current, std::move(preserved_vars)).VisitStmt(new_body);
           fn = updated;
           any_changed = true;
