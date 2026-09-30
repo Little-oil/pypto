@@ -741,6 +741,8 @@ Consecutive nested AUTO scopes may hoist a descriptor through multiple wrappers
 when its initializer is immutable and visible outside each wrapper. Hoisting stops
 at a loop or branch boundary, a MANUAL scope, or a scope-local initializer. The
 original body level still controls SSA-copy collapse, preserving nested snapshots.
+Copies of immutable enclosing Tensors reuse their existing names in either scope
+mode, including aliases left after a single-iteration loop is simplified away.
 
 **Validate uses separately from names.** `ValidateValueUse(value, use_span)` is
 the shared check for Tensor operands emitted by orchestration codegen: expression
@@ -754,9 +756,17 @@ when later tasks need them, or keep their consumers inside the allocating scope.
 Descriptor copies and branch/loop yields also retain allocation-source edges.
 When a scope closes, codegen invalidates its allocations and propagates that state
 to dependent descriptors. Descriptors hoisted out of AUTO scopes and their aliases are checked against
-this state, so a hoisted descriptor cannot hide a reclaimed buffer. Each name and dependency edge is visited once per propagated flag. MANUAL
+this state, so a hoisted descriptor cannot hide a reclaimed buffer. Each value and dependency edge is visited once per propagated flag. MANUAL
 allocation batches belong to the enclosing scope where they are emitted; existing
 MANUAL carry behavior is unchanged.
+
+Source edges identify values rather than mutable C++ names. A loop carry has
+separate entry and exit values, so yielding a new buffer does not retroactively
+change an earlier snapshot. A known single iteration has no backedge; repeated
+or unknown iterations connect the exit to the next entry and recheck body reads
+affected by that connection. Zero iterations return only the initializer, and
+unknown trip counts also retain that zero-iteration path. Branch yields continue
+to merge their possible sources into the branch result.
 
 Yield writeback validates the destination's lexical scope without reading its old
 storage; allocation lifetime is checked on the yielded value and later reads.
