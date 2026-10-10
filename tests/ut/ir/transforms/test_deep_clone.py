@@ -91,6 +91,7 @@ class TestDeepCloneLoopCarries:
         replacement = seed if substitute else carry
         cloned, var_map = ir.deep_clone(body, var_map=[(carry, seed)] if substitute else [])
 
+        assert isinstance(cloned, ir.YieldStmt)
         assert all(value is replacement for value in cloned.value)
         assert not var_map
 
@@ -103,6 +104,8 @@ class TestDeepCloneLoopCarries:
 
         cloned, var_map = ir.deep_clone(ir.AssignStmt(tensor, tensor, span))
 
+        assert isinstance(cloned, ir.AssignStmt)
+        assert isinstance(cloned.var.type, ir.TensorType)
         assert cloned.var.type.shape[0] is carry
         assert all(original is not carry for original, _ in var_map)
 
@@ -124,11 +127,15 @@ class TestDeepCloneLoopCarries:
         cloned, var_map = ir.deep_clone(before)
 
         ir.assert_structural_equal(cloned, before)
+        assert isinstance(cloned, (ir.ForStmt, ir.WhileStmt))
         new_inner = cloned.iter_args[0]
         assert new_inner is not inner
         assert new_inner.initValue is outer
+        assert isinstance(cloned.body, ir.YieldStmt)
         assert cloned.body.value[0] is new_inner
         if loop_kind == "while":
+            assert isinstance(cloned, ir.WhileStmt)
+            assert isinstance(cloned.condition, ir.Lt)
             assert cloned.condition.left is new_inner
         assert any(original is inner and fresh is new_inner for original, fresh in var_map)
         assert all(original is not outer for original, _ in var_map)
