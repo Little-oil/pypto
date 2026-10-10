@@ -34,7 +34,6 @@
 #include "pypto/codegen/codegen_base.h"
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/codegen/pto/pto_type_utils.h"
-#include "pypto/core/dtype.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/type.h"
