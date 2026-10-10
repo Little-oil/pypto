@@ -134,7 +134,7 @@ def fp4x2_to_fp8(
 | ---- | ----- | ---- |
 | 手写 `pl.FP4E2M1X2` | ✅ | packed 路径的首选前端；**仅 ND** |
 | 无 PackFp4 的逻辑 `pl.FP4` | ⚠️ | Prefer Warning；A5 in-core 仍支持逻辑 FP4，并与 FP4E2M1X2 并存 |
-| GM ExpandPackedFp4\*（carrier→nibble） | ✅ | `make_tensor_view` / partition 末轴（ND） |
+| 打包 GM view 保留 carrier 单位 | ✅ | PTOAS v0.67 负责 DMA 转换（ND） |
 | UINT8 → FP4E2M1X2 UB alias | ✅ | 二维 packed row-major Vec；carrier shape 不变；仅 PYPTO / DSA_RP |
 | `FP4E2M1X2` ↔ BF16 cast | ✅ | 静默原生 hop；结果 stride 重建为连续 |
 | `FP4E2M1X2` → FP8\* cast | ⚠️ | Warning；更推荐 LUT / 主机 |
