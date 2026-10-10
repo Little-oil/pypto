@@ -102,11 +102,10 @@ class DeepCloneMutator : public IRMutator {
   }
 
   ExprPtr VisitExpr_(const IterArgPtr& op) override {
-    auto it = expr_map_.find(op.get());
     // A use of an enclosing loop's carry is external to this subtree, just
     // like an external Var. Cloning it here would create an unbound identity.
     // Local carries are registered at their loop's DefField before any uses.
-    return it != expr_map_.end() ? it->second : op;
+    return VisitExpr_(std::static_pointer_cast<const Var>(op));
   }
 
   ExprPtr VisitExpr_(const MemRefPtr& op) override {
@@ -233,8 +232,8 @@ class DeepCloneMutator : public IRMutator {
                                             [this](const ExprPtr& e) { return IRMutator::VisitExpr(e); });
   }
 
-  /// Use GetFieldDescriptors to find DefField VarPtr/vector<VarPtr> entries
-  /// and pre-register fresh copies in expr_map_.
+  /// Use GetFieldDescriptors to find DefField VarPtr, vector<VarPtr>, and
+  /// vector<IterArgPtr> entries and pre-register their clones in expr_map_.
   template <typename StmtType>
   void PreRegisterDefFields(const StmtType& stmt) {
     constexpr auto descriptors = StmtType::GetFieldDescriptors();
@@ -255,9 +254,6 @@ class DeepCloneMutator : public IRMutator {
       for (const auto& var : desc.Get(stmt)) {
         if (var) CloneVar(var);
       }
-    } else if constexpr (std::is_same_v<FieldType, IterArgPtr>) {
-      const auto& arg = desc.Get(stmt);
-      if (arg) CloneIterArg(arg);
     } else if constexpr (std::is_same_v<FieldType, std::vector<IterArgPtr>>) {
       for (const auto& arg : desc.Get(stmt)) {
         if (arg) CloneIterArg(arg);
