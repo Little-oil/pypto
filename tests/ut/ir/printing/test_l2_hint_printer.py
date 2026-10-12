@@ -7,9 +7,9 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Printer tests for the ``pl.set_cache_policy(...)`` scope declaration.
+"""Printer tests for the ``pl.set_l2_hint(...)`` scope declaration.
 
-The declaration rides on ``ScopeStmt.attrs['cache_policy_vars']`` and is
+The declaration rides on ``ScopeStmt.attrs['load_l2_hint_vars']`` and is
 surfaced as leading marker *statements* in the scope body rather than as a
 header kwarg the way ``no_dep_args=`` / ``dumps=`` do, because a statement is
 the DSL surface the parser accepts. These tests pin the emitted text and assert
@@ -24,14 +24,14 @@ distinct printer paths:
    printer would otherwise emit a ``pass`` filler and drop the marker.
 
 The parser-side counterpart (what is recovered onto which scope) lives in
-``tests/ut/ir/parser/test_cache_policy_roundtrip.py``.
+``tests/ut/ir/parser/test_l2_hint_roundtrip.py``.
 """
 
 import pypto.language as pl
 import pytest
 from pypto import ir
 
-BYPASS_MARKER = "pl.set_cache_policy(b, pl.CachePolicy.BYPASS)"
+BYPASS_MARKER = "pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)"
 
 
 def _at_scope_program():
@@ -47,7 +47,7 @@ def _at_scope_program():
             out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
         ) -> pl.Tensor[[256, 256], pl.FP32]:
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
-                pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+                pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
                 c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
                 out = pl.assemble(out, c, [0, 0])
             return out
@@ -67,7 +67,7 @@ def _spmd_for_program():
             out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
         ) -> pl.Tensor[[512, 128], pl.FP32]:
             for i in pl.spmd(4):
-                pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+                pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
                 offset = i * 128
                 tile_b: pl.Tile[[128, 128], pl.FP32] = pl.load(b, [offset, 0], [128, 128])
                 out = pl.store(tile_b, [offset, 0], out)
@@ -94,7 +94,7 @@ def _empty_spmd_body_program(*, declare: bool):
                 out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
             ) -> pl.Tensor[[512, 128], pl.FP32]:
                 for i in pl.spmd(4):
-                    pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+                    pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
                 return out
 
     else:
@@ -152,8 +152,8 @@ def test_print_at_scope_emits_marker_statement():
     assert marker_indent > header_indent, text
 
     # Never a header kwarg, and never the raw attr key.
-    assert "cache_policy" not in text.splitlines()[header], text
-    assert "cache_policy_vars" not in text, text
+    assert "load_l2_hint" not in text.splitlines()[header], text
+    assert "load_l2_hint_vars" not in text, text
 
 
 def test_roundtrip_at_scope():
@@ -238,15 +238,15 @@ def test_roundtrip_multiple_declarations_and_both_policies():
             out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
         ) -> pl.Tensor[[256, 256], pl.FP32]:
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
-                pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
-                pl.set_cache_policy(a, pl.CachePolicy.DEFAULT)
+                pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
+                pl.set_l2_hint(a, load=pl.LoadL2Hint.NormalFirstVictim)
                 c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
                 out = pl.assemble(out, c, [0, 0])
             return out
 
     text = _assert_print_parse_print_stable(Multi)
     first = _line_index(text, BYPASS_MARKER)
-    second = _line_index(text, "pl.set_cache_policy(a, pl.CachePolicy.DEFAULT)")
+    second = _line_index(text, "pl.set_l2_hint(a, load=pl.LoadL2Hint.NormalFirstVictim)")
     assert first >= 0, text
     assert second == first + 1, text
 
@@ -270,7 +270,7 @@ def test_declaration_written_late_prints_first():
         ) -> pl.Tensor[[256, 256], pl.FP32]:
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
                 c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
-                pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+                pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
                 out = pl.assemble(out, c, [0, 0])
             return out
 

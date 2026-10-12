@@ -22,7 +22,7 @@ __all__ = [
     "create",
     "no_dep",
     "dump_tag",
-    "set_cache_policy",
+    "set_l2_hint",
     "read",
     "write",
     "dim",
@@ -130,7 +130,7 @@ from pypto.ir.op import tensor_ops as _ir_ops
 from pypto.ir.utils import _normalize_expr, caller_warning_stacklevel, has_partial_valid_region
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
-from pypto.pypto_core.ir import AtomicType, CachePolicy, Expr, MemorySpace, PadValue, TensorLayout
+from pypto.pypto_core.ir import AtomicType, Expr, LoadL2Hint, MemorySpace, PadValue, StoreL2Hint, TensorLayout
 
 from ..typing import BoolLike, IntLike, Ptr, Scalar, Tensor, Tile, predicate_to_expr
 
@@ -359,69 +359,34 @@ def dump_tag(tensor: Tensor) -> Tensor:
     return tensor
 
 
-def set_cache_policy(tensor: Tensor, policy: CachePolicy) -> None:
-    """Declare the GM cache-access policy for every read of ``tensor`` in this scope.
+def set_l2_hint(
+    tensor: Tensor,
+    *,
+    load: LoadL2Hint | None = None,
+    store: StoreL2Hint | None = None,
+) -> None:
+    """Declare default L2 hints for accesses to a tensor in the enclosing scope.
 
-    The scope-level surface of the cache policy, for tensor programming — where
-    the GM reads are implicit and there is no ``pl.load`` call to annotate. The
-    per-access counterpart is the ``cache=`` kwarg on
-    [`pl.load`][pypto.language.tile.load], which names one read instead of all
-    of them. ``pl.slice`` deliberately takes no ``cache=``: a slice computes an
-    address descriptor, it moves no data.
+    Write this as a standalone statement directly inside ``pl.at`` or inline
+    ``pl.spmd``. Explicit ``l2_hint=`` on a load/store overrides the matching
+    declaration, including an explicit zero-valued normal hint. Tensor
+    operations inherit the hints on their generated transfers.
 
-    Write it as a **standalone statement directly inside** a ``pl.at(...)`` /
-    ``pl.spmd(...)`` scope body. Anywhere else — nested in an ``if`` / ``for``
-    inside the scope, or outside a scope altogether — the parser rejects it,
-    because the declaration attaches to the scope, and a conditionally-executed
-    declaration would be a promise the compiler cannot check.
-
-    Semantics:
-
-    * **A contract, not a hint.** ``CachePolicy.BYPASS`` asserts two things
-      about ``tensor``: that the kernel streams it with no reuse worth caching,
-      and that **nothing writes those bytes while the kernel runs**. Mixing a
-      cached write and a bypassing read of the same bytes is a coherency bug
-      the compiler cannot detect, so coherency is the author's contract. This
-      is why the policy is never a default and never inferred. Declaring
-      BYPASS on a tensor the scope itself writes is rejected at outlining.
-    * **Tracked by Var identity, never by name.** The declaration names the
-      binding live at the scope, so rebinding the name afterwards
-      (``b = self.foo(b)``) yields a new value the declaration does not cover.
-    * **Consumed at parse time.** It emits no IR statement of its own: the
-      parser records it on the enclosing scope, the scope outliner resolves it
-      to the outlined kernel's parameters, and ``ConvertTensorToTileOps`` turns
-      it into a ``cache`` kwarg on each ``tile.load`` that reads a declared
-      parameter.
-    * **Explicit wins.** An explicit ``pl.load(..., cache=...)`` overrides the
-      scope declaration for that one access, in both directions — so
-      ``cache=pl.CachePolicy.DEFAULT`` opts a single read back into the cache
-      inside a bypassing scope.
-
-    Requires PTOAS >= v0.64. **On A2/A3** a declared read compiles to a
-    ``cache_policy`` attribute on ``pto.tload`` plus the device's no-cache alias
-    offset, which the assembler adds to that one load's source address; the
-    offset comes from the driver through the dispatch payload, and a device that
-    reports no alias reports zero, leaving the read ordinary and correct. Other
-    architectures do not map GM twice — A5 expresses the policy on the load
-    instruction instead — and PTOAS lowers the bare attribute to an ordinary
-    load, so a declaration there is accepted and currently does nothing.
-    ``CachePolicy.DEFAULT`` emits nothing, so a read that declares no policy
-    generates exactly the code it did before.
+    A2/A3 nonallocating loads use the runtime's nocache address alias; the
+    three NotAlloc load modes share that implementation. A5 forwards each
+    mode to the ISA cache-control field. A nonallocating scope read may not
+    target a tensor the same scope writes. The caller must also prevent
+    concurrent cached writes to the same bytes outside the scope.
 
     Args:
-        tensor: The tensor whose reads the policy applies to. Must be a
-            ``Tensor`` value bound outside the scope and read inside it.
-        policy: ``CachePolicy.BYPASS`` to declare a streaming, non-cached read;
-            ``CachePolicy.DEFAULT`` for an ordinary cached read.
-
-    Returns:
-        Nothing. The marker is consumed at parse time and produces no value.
+        tensor: A tensor bound outside and accessed inside the scope.
+        load: Default hint for reads, or None to leave reads unspecified.
+        store: Default hint for writes, or None to leave writes unspecified.
 
     Example:
-        >>> with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
-        ...     pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
-        ...     c = pl.matmul(a, b, out_dtype=pl.FP32)
-        ...     out = pl.assemble(out, c, [0, 0])
+        >>> with pl.at(level=pl.Level.CORE_GROUP):
+        ...     pl.set_l2_hint(w, load=pl.LoadL2Hint.NotAllocClean)
+        ...     result = pl.matmul(x, w)
     """
 
 

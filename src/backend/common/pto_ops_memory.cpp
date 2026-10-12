@@ -111,14 +111,12 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   INTERNAL_CHECK_SPAN(!shapes_tuple->elements_.empty(), op->span_)
       << "tile.load shapes tuple must have at least one element";
 
-  // The declared GM cache-access policy (pypto #2680). PTOAS >= v0.64 carries a
-  // streaming read as a `cache_policy` attribute on `pto.tload` plus an optional
-  // byte `offset` it adds to that one load's source address. On a2a3 the offset
-  // is the driver-owned distance to the page's uncached alias, threaded in as a
-  // synthetic kernel parameter (see PTOCodegen::GetL2CacheOffsetArgSSA); the
-  // attribute alone declares the policy but moves no address. Both are attached
-  // below, alongside the MX layout attribute when it applies.
-  const auto policy = static_cast<ir::CachePolicy>(op->GetKwarg<int>("cache", 0));
+  const int hint = op->GetKwarg<int>("l2_hint", 0);
+  const bool alias_bypass =
+      ir::IsNotAllocLoadL2Hint(hint) && codegen.GetBackendHandler()->GetPtoTargetArch() == "a2a3";
+  // A2/A3 NotAlloc modes share the runtime's nocache address alias. Forwarding
+  // a NotAlloc ISA template as well would apply a second, uninitialized offset.
+  const bool emit_hint = op->HasKwarg("l2_hint") && !alias_bypass;
 
   std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
   std::string tile_buf = codegen.GetCurrentResultTarget();
@@ -174,10 +172,7 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   tload_line << tile_buf << " : " << tile_buf_type << ")";
 
   std::vector<std::string> attrs;
-  if (op->HasKwarg("l2_hint")) {
-    const int hint = op->GetKwarg<int>("l2_hint", 0);
-    CHECK_SPAN(hint < 4 || codegen.GetBackendHandler()->GetPtoTargetArch() != "a2a3", op->span_)
-        << "LoadL2Hint.NotAlloc* requires A5; use cache=CachePolicy.BYPASS on A2/A3";
+  if (emit_hint) {
     // Stock PTOAS preserves these comments. PyPTO finalization uses them to
     // select this transfer's ISA overload; PTOAS still sees the real load's
     // memory effects and pipe for planning and synchronization.
@@ -187,7 +182,7 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   if (is_mx_load) {
     attrs.push_back("layout = #pto.layout<" + pto_layout + ">");
   }
-  if (policy == ir::CachePolicy::kBypass) {
+  if (alias_bypass) {
     attrs.emplace_back("cache_policy = #pto.load_cache_policy<l2_bypass>");
   }
 
@@ -203,19 +198,17 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
     tload_line << "}";
   }
 
-  // The offset operand follows the attribute dict, and PTOAS applies it only to
-  // a load that also declared l2_bypass. It is empty on an architecture with no
-  // address alias to reach, which leaves the declaration carried by the
-  // attribute alone -- and PTOAS v0.64 lowers a bare attribute to an ordinary
-  // TLOAD, so that declaration costs nothing and does nothing.
-  if (policy == ir::CachePolicy::kBypass) {
+  // A2/A3 NotAlloc modes all use the runtime no-cache address alias. PTOAS
+  // applies this offset once; forwarding the ISA NotAlloc template as well
+  // would attempt a second offset via ISA's uninitialized global configuration.
+  if (alias_bypass) {
     const std::string l2_cache_offset = codegen.GetL2CacheOffsetArgSSA();
-    if (!l2_cache_offset.empty()) {
-      tload_line << " offset = " << l2_cache_offset << " : i64";
-    }
+    INTERNAL_CHECK_SPAN(!l2_cache_offset.empty(), op->span_)
+        << "Internal error: nonallocating A2/A3 load is missing its runtime L2 offset";
+    tload_line << " offset = " << l2_cache_offset << " : i64";
   }
   codegen.Emit(tload_line.str());
-  if (op->HasKwarg("l2_hint")) {
+  if (emit_hint) {
     codegen.Emit("emitc.verbatim \"// __pypto_l2_hint_end\"");
   }
 

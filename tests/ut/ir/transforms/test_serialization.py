@@ -1298,8 +1298,8 @@ class TestLeadingCommentsRoundTrip:
         assert ["body"] in _collect(func.body)
 
 
-class TestCachePolicyAttrSerialization:
-    """`.pto` round-trip for the two cache-policy carrier attrs (issue #2534).
+class TestLoadL2HintAttrSerialization:
+    """`.pto` round-trip for the two L2-hint carrier attrs (issue #2534).
 
     Both attrs live only between parse and ConvertTensorToTileOps, so a
     post-pipeline `.pto` never carries them -- but serializing a mid-pipeline
@@ -1318,7 +1318,7 @@ class TestCachePolicyAttrSerialization:
                 out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
             ) -> pl.Tensor[[256, 256], pl.FP32]:
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
-                    pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+                    pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
                     c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
                     out = pl.assemble(out, c, [0, 0])
                 return out
@@ -1339,7 +1339,7 @@ class TestCachePolicyAttrSerialization:
 
         mm = cast(ir.Program, restored).get_function("mm")
         assert mm is not None
-        assert dict(mm.attrs)["cache_policy"] == [(1, 1)]
+        assert dict(mm.attrs)["load_l2_hint"] == [(1, 5)]
 
 
 if __name__ == "__main__":

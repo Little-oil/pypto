@@ -100,7 +100,7 @@ bool SpmdInlineBodyPreservesAttrs(const InCoreScopeStmtPtr& incore) {
   // Only these attributes are reconstructed by the flattened SPMD spelling.
   // Keep the explicit InCore header for scoped metadata such as dump_vars.
   for (const auto& [key, value] : incore->attrs_) {
-    if (key != "slot_num" && key != kAttrCachePolicyVars) return false;
+    if (key != "slot_num" && key != kAttrLoadL2HintVars && key != kAttrStoreL2HintVars) return false;
   }
   return true;
 }
@@ -494,8 +494,8 @@ class IRPythonPrinter : public IRVisitor {
   // printers so the parser can recover the marker after a print/reparse roundtrip.
   bool PrintScopeNoDepsAttr(const ScopeStmtPtr& op);
 
-  // Surface ``ScopeStmt.attrs[kAttrCachePolicyVars]`` as leading marker
-  // STATEMENTS in the scope body — ``pl.set_cache_policy(t, pl.CachePolicy.X)``
+  // Surface ``ScopeStmt.attrs[kAttrLoadL2HintVars]`` as leading marker
+  // STATEMENTS in the scope body — ``pl.set_l2_hint(t, pl.LoadL2Hint.X)``
   // — and NOT as a header kwarg the way ``no_dep_args=`` / ``dumps=`` do,
   // because a statement is the DSL surface the parser accepts. The parser
   // hoists the markers back onto the scope attr wherever they appear in the
@@ -504,7 +504,7 @@ class IRPythonPrinter : public IRVisitor {
   // attr — in the Spmd inlining branches that is the nested InCore, not ``op``.
   // Returns true when something was printed, so a caller whose body may be
   // empty can tell whether a ``pass`` filler is still needed.
-  bool PrintScopeCachePolicyStmts(const ScopeStmtPtr& op);
+  bool PrintScopeL2HintStmts(const ScopeStmtPtr& op);
 
   // Emit ``deps=[t1, t2]`` if the scope carries ``kAttrManualDepEdges``; returns
   // true when something was printed. Mirrors PrintScopeNoDepsAttr — the parser
@@ -1014,7 +1014,7 @@ void IRPythonPrinter::PrintAttrValue(const std::any& value, const Span& span) {
     }
     stream_ << "]";
   } else if (t == typeid(std::vector<std::pair<int32_t, int>>)) {
-    // ``kAttrCachePolicyParams`` on an outlined Function: (param index, policy)
+    // ``kAttrLoadL2HintParams`` on an outlined Function: (param index, policy)
     // pairs. Printed as a list of tuples so a pass dump taken between
     // OutlineIncoreScopes and ConvertTensorToTileOps — the only window where
     // this attr exists — round-trips instead of aborting.
@@ -1026,9 +1026,9 @@ void IRPythonPrinter::PrintAttrValue(const std::any& value, const Span& span) {
     }
     stream_ << "]";
   } else if (t == typeid(std::vector<std::pair<VarPtr, int>>)) {
-    // ``kAttrCachePolicyVars``. On a ScopeStmt this attr is surfaced as
-    // ``pl.set_cache_policy(...)`` marker statements instead (see
-    // PrintScopeCachePolicyStmts); this arm is the generic-attr fallback, so a
+    // ``kAttrLoadL2HintVars``. On a ScopeStmt this attr is surfaced as
+    // ``pl.set_l2_hint(...)`` marker statements instead (see
+    // PrintScopeL2HintStmts); this arm is the generic-attr fallback, so a
     // dump never aborts on a carrier the scope printer did not claim.
     const auto& pairs = std::any_cast<std::vector<std::pair<VarPtr, int>>>(value);
     stream_ << "[";
@@ -2226,23 +2226,26 @@ bool IRPythonPrinter::PrintScopeDepsAttr(const ScopeStmtPtr& op) {
   return PrintScopeVarListKwarg(op, kAttrManualDepEdges, "deps");
 }
 
-// One ``<indent>pl.set_cache_policy(<tensor>, pl.CachePolicy.<NAME>)`` line per
+// One ``pl.set_l2_hint(tensor, load=...)`` or ``store=...`` line per
 // declaration. Callers invoke this after ``IncreaseIndent()`` and before the
 // body block, so the markers lead the scope body exactly as the parser expects
 // to find them. Null Vars are skipped for the same reason
 // ``PrintScopeVarListKwarg`` skips them: the rendered Python must stay valid.
-bool IRPythonPrinter::PrintScopeCachePolicyStmts(const ScopeStmtPtr& op) {
+bool IRPythonPrinter::PrintScopeL2HintStmts(const ScopeStmtPtr& op) {
   if (!op) return false;
   bool printed = false;
-  for (const auto& [k, v] : op->attrs_) {
-    if (k != kAttrCachePolicyVars) continue;
-    const auto* entries = std::any_cast<std::vector<std::pair<VarPtr, int>>>(&v);
+  for (const auto& [key, value] : op->attrs_) {
+    if (key != kAttrLoadL2HintVars && key != kAttrStoreL2HintVars) continue;
+    const auto* entries = std::any_cast<std::vector<std::pair<VarPtr, int>>>(&value);
     if (!entries) continue;
-    for (const auto& [var, policy] : *entries) {
+    const bool load = key == kAttrLoadL2HintVars;
+    for (const auto& [var, hint] : *entries) {
       if (!var) continue;
-      stream_ << GetIndent() << prefix_ << ".set_cache_policy(" << GetVarName(var.get()) << ", " << prefix_
-              << ".CachePolicy."
-              << AttrValueToEnumMember(CachePolicyToString(static_cast<CachePolicy>(policy))) << ")\n";
+      stream_ << GetIndent() << prefix_ << ".set_l2_hint(" << GetVarName(var.get())
+              << (load ? ", load=" : ", store=") << prefix_ << (load ? ".LoadL2Hint." : ".StoreL2Hint.")
+              << (load ? LoadL2HintToString(static_cast<LoadL2Hint>(hint))
+                       : StoreL2HintToString(static_cast<StoreL2Hint>(hint)))
+              << ")\n";
       printed = true;
     }
   }
@@ -2354,7 +2357,7 @@ void IRPythonPrinter::VisitStmt_(const HierarchyScopeStmtPtr& op) {
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
   IncreaseIndent();
-  PrintScopeCachePolicyStmts(op);
+  PrintScopeL2HintStmts(op);
   PrintStmtBlock(op->body_);
   DecreaseIndent();
 }
@@ -2379,7 +2382,7 @@ void IRPythonPrinter::VisitStmt_(const InCoreScopeStmtPtr& op) {
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
   IncreaseIndent();
-  PrintScopeCachePolicyStmts(op);
+  PrintScopeL2HintStmts(op);
   PrintStmtBlock(op->body_);
   DecreaseIndent();
 }
@@ -2447,14 +2450,14 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     stream_ << ":\n";
     IncreaseIndent();
     // The inlining branches below drop the nested ``pl.at(level=CORE_GROUP)``
-    // header, and a ``pl.set_cache_policy`` written inside the Spmd body
+    // header, and a ``pl.set_l2_hint`` written inside the Spmd body
     // attaches to that inner InCore scope — so its declarations must be printed
     // here, from ``incore``, or they are lost. When the carrier is spelled out
     // instead, the nested InCore prints its own markers and re-printing them
     // here would duplicate them.
-    PrintScopeCachePolicyStmts(op);
+    PrintScopeL2HintStmts(op);
     if (inlines_incore_body) {
-      PrintScopeCachePolicyStmts(incore);
+      PrintScopeL2HintStmts(incore);
     }
     if (!inlines_incore_body) {
       // Print the body as-is. Either inlining would lose the carrier — the parser
@@ -2507,7 +2510,7 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     IncreaseIndent();
     // The for-form drops the nested ``pl.at(level=CORE_GROUP)`` header, so the
     // inner InCore's declarations are printed here or they are lost.
-    const bool printed_cache_policy = PrintScopeCachePolicyStmts(incore);
+    const bool printed_l2_hint = PrintScopeL2HintStmts(incore);
     // Emit the InCore body skipping the get_block_idx binding we just
     // materialized as the loop variable. ShouldSuppressPlaceholder keeps the
     // ``with pl.at(...) as tid:`` round-trip working if such a scope ever
@@ -2519,7 +2522,7 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
         PrintStmtBlock(incore_seq->stmts_[i]);
         if (i + 1 < incore_seq->stmts_.size()) stream_ << "\n";
       }
-    } else if (!printed_cache_policy) {
+    } else if (!printed_l2_hint) {
       // Only a body with nothing left after the loop-var binding needs the
       // ``pass`` filler — the marker statements above already count as body
       // content, and printing ``pass`` after them is both redundant and (were

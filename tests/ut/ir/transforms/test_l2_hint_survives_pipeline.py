@@ -9,16 +9,16 @@
 
 """End-to-end guard: a declared GM cache policy survives the whole Default pipeline.
 
-``pl.set_cache_policy(b, pl.CachePolicy.BYPASS)`` changes carrier three times on
+``pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)`` changes carrier three times on
 its way to codegen::
 
-    scope attr ``cache_policy_vars``   (parse .. pass 8)
-      -> outlined function attr ``cache_policy``, param indices  (pass 8 .. pass 10)
-      -> ``tile.load`` kwarg ``cache``                            (pass 10 .. codegen)
+    scope attr ``load_l2_hint_vars``   (parse .. pass 8)
+      -> outlined function attr ``load_l2_hint``, param indices  (pass 8 .. pass 10)
+      -> ``tile.load`` kwarg ``l2_hint``                            (pass 10 .. codegen)
 
 The first two hops are unit-tested where they happen — ``test_outline_incore_scopes.py``
 and ``test_convert_tensor_to_tile_ops.py``. This file guards the long tail: the
-remaining ~37 passes must carry the ``cache`` kwarg through matmul tiling,
+remaining ~37 passes must carry the ``l2_hint`` kwarg through matmul tiling,
 memory planning, and signature rewriting without dropping or misplacing it. The
 kwarg rides the same channel ``target_memory`` does, which is what makes the
 guard cheap; it is also why a regression here would be silent — a dropped kwarg
@@ -31,7 +31,7 @@ from pypto import backend, ir
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
-_BYPASS = int(pl.CachePolicy.BYPASS)
+_BYPASS = int(pl.LoadL2Hint.NotAllocClean)
 
 
 @pytest.fixture(autouse=True)
@@ -93,7 +93,7 @@ def _demo_program(*, declare: bool) -> ir.Program:
                 out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
             ) -> pl.Tensor[[256, 256], pl.FP32]:
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
-                    pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+                    pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
                     c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
                     out = pl.assemble(out, c, [0, 0])
                 return out
@@ -122,7 +122,7 @@ def _run_default_pipeline(program: ir.Program) -> ir.Program:
 
 
 def test_cache_kwarg_reaches_the_end_of_the_pipeline():
-    """The declared tensor's GM read still carries ``cache`` after all 47 passes."""
+    """The declared tensor's GM read still carries ``l2_hint`` after all 47 passes."""
     after = _run_default_pipeline(_demo_program(declare=True))
     loads = _loads_by_source(after)
 
@@ -130,7 +130,7 @@ def test_cache_kwarg_reaches_the_end_of_the_pipeline():
     assert len(declared) == 1, f"expected one source named after 'b', got {sorted(loads)}"
     b_loads = loads[declared[0]]
     assert b_loads, "the declared tensor is never loaded — the guard would pass vacuously"
-    assert all(load.kwargs.get("cache") == _BYPASS for load in b_loads)
+    assert all(load.kwargs.get("l2_hint") == _BYPASS for load in b_loads)
 
 
 def test_only_the_declared_tensor_is_annotated():
@@ -141,7 +141,7 @@ def test_only_the_declared_tensor_is_annotated():
     undeclared = [name for name in loads if not name.startswith("b")]
     assert undeclared, "expected at least one load of an undeclared tensor"
     for name in undeclared:
-        assert all("cache" not in load.kwargs for load in loads[name]), f"'{name}' was annotated"
+        assert all("l2_hint" not in load.kwargs for load in loads[name]), f"'{name}' was annotated"
 
 
 def test_undeclared_program_carries_no_cache_kwarg():
@@ -151,7 +151,7 @@ def test_undeclared_program_carries_no_cache_kwarg():
 
     assert loads, "expected the pipeline to emit tile.loads"
     for calls in loads.values():
-        assert all("cache" not in load.kwargs for load in calls)
+        assert all("l2_hint" not in load.kwargs for load in calls)
 
 
 def test_no_carrier_attr_outlives_its_consumer():
@@ -167,8 +167,8 @@ def test_no_carrier_attr_outlives_its_consumer():
 
     for func in after.functions.values():
         attrs = dict(func.attrs)
-        assert "cache_policy" not in attrs, f"stale param indices on '{func.name}'"
-        assert "cache_policy_vars" not in attrs, f"stale scope declaration on '{func.name}'"
+        assert "load_l2_hint" not in attrs, f"stale param indices on '{func.name}'"
+        assert "load_l2_hint_vars" not in attrs, f"stale scope declaration on '{func.name}'"
 
 
 if __name__ == "__main__":

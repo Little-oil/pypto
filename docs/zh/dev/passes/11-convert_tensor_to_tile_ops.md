@@ -128,22 +128,16 @@ output[0:1, 0:32] = staged
 
 如果不适合使用单次批量存储，也可以对所有元素统一使用 `tensor.write`。
 
-### 缓存策略声明 → `tile.load` 的 `cache` kwarg
+### 作用域 L2 Hint → 搬运操作的 `l2_hint` Kwarg
 
-本 pass 是声明式 GM 缓存策略从元数据变成访问本身的地方。
-[`OutlineIncoreScopes`](09-outline_incore_scopes.md) 把这些声明留在 InCore 函数的
-`cache_policy` attr 上 —— `std::vector<std::pair<int32_t, int>>`（参数索引，
-`CachePolicy` 的 int 值）。阶段一在每个函数上把这些索引一次性还原为参数 `Var` 身份，
-随后为每条源实参属于列表中参数的 `tile.load` 加上 `{"cache", <policy>}`：包括它合成的
-入口 load、consumer-driven 的 Mat load、输入空间桥接（input-space bridge）load，以及
-body 中本就存在的任何 `tile.load`（用户手写的，或更早的 pass 产生的）。该 attr 在重建
-变换后的函数时被**擦除** —— 下游不允许看到它，因为只要后续 pass 增长参数列表，其中的
-参数索引就会失效。
+本 pass 消费 `load_l2_hint` 和 `store_l2_hint` 函数属性，将参数索引解析为 Var，
+并将精确的 ISA 编码写入 `tile.load` 和 `tile.store`。显式访问提示优先，包括编码为 0
+的 `NormalFirstVictim`；未指定的访问继承作用域 hint。
 
-优先级按单次访问判定：load 上已有的显式 `pl.load(..., cache=...)` kwarg 在两个方向上
-都优先于作用域声明，因此 `cache=pl.CachePolicy.DEFAULT` 可以在 bypass 作用域内把某一次
-读取单独放回缓存。从这里开始，该 kwarg 只是像 `target_memory` 一样随 op 穿过剩余的
-pass 抵达 codegen。参见 [GM 缓存访问策略](../language/05-cache-policy.md)。
+为计算输入生成的 load 继承 load hint；`tensor.assemble` 生成的 store 继承目标的
+store hint。所有 store 生成后再统一标注。现有 GM 别名分析通过目标重新绑定和循环携带
+传播声明；有歧义的别名仅在所有可能根一致时继承。两个函数属性均在后续 pass 修改参数
+列表前擦除。参见 [L2 缓存提示](../language/05-l2-hints.md)。
 
 ### 阶段二a：通过 Spmd/Group 包装函数转发新增 Out 参数
 

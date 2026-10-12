@@ -7,11 +7,11 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Parser round-trip tests for the ``pl.set_cache_policy(...)`` declaration.
+"""Parser round-trip tests for the ``pl.set_l2_hint(...)`` declaration.
 
-``pl.set_cache_policy(t, policy)`` emits no IR statement of its own: the parser
-hoists it onto the enclosing scope as ``attrs['cache_policy_vars']``, a list of
-``(Var, CachePolicy-as-int)`` pairs. These tests assert what a *reparse* of the
+``pl.set_l2_hint(t, load=...)`` emits no IR statement of its own: the parser
+hoists it onto the enclosing scope as ``attrs['load_l2_hint_vars']``, a list of
+``(Var, LoadL2Hint-as-int)`` pairs. These tests assert what a *reparse* of the
 printed program recovers — which scope carries the declaration, which tensor it
 names, and which policy — for the three shapes with distinct printer paths:
 
@@ -23,10 +23,10 @@ names, and which policy — for the three shapes with distinct printer paths:
 
 Each case also asserts the print -> parse -> print fixpoint. The printer-side
 counterpart (what text is emitted, and where) lives in
-``tests/ut/ir/printing/test_cache_policy_printer.py``.
+``tests/ut/ir/printing/test_l2_hint_printer.py``.
 
 Note these assert textual stability rather than
-``ir.assert_structural_equal``: the ``cache_policy_vars`` attr value type is not
+``ir.assert_structural_equal``: the ``load_l2_hint_vars`` attr value type is not
 yet handled by the structural comparator.
 """
 
@@ -35,14 +35,14 @@ import pytest
 from pypto import ir
 from pypto.language.parser.diagnostics import ParserSyntaxError
 
-BYPASS = int(ir.CachePolicy.BYPASS)
-DEFAULT = int(ir.CachePolicy.DEFAULT)
+BYPASS = int(ir.LoadL2Hint.NotAllocClean)
+DEFAULT = int(ir.LoadL2Hint.NormalFirstVictim)
 
-_CACHE_POLICY_VARS_ATTR = "cache_policy_vars"
+_LOAD_L2_HINT_VARS_ATTR = "load_l2_hint_vars"
 
 
 def _collect_decls(node) -> list[tuple[str, list[tuple[str, int]]]]:
-    """Walk an IR body and collect every scope carrying a cache-policy declaration.
+    """Walk an IR body and collect every scope carrying a L2-hint declaration.
 
     Returns ``(scope class name, [(tensor name, policy int), ...])`` per
     carrying scope, in traversal order, so a test can assert both *what* was
@@ -52,7 +52,7 @@ def _collect_decls(node) -> list[tuple[str, list[tuple[str, int]]]]:
 
     def walk(n) -> None:
         if isinstance(n, ir.ScopeStmt):
-            entries = dict(n.attrs).get(_CACHE_POLICY_VARS_ATTR)
+            entries = dict(n.attrs).get(_LOAD_L2_HINT_VARS_ATTR)
             if entries is not None:
                 found.append((type(n).__name__, [(var.name_hint, int(policy)) for var, policy in entries]))
         if isinstance(n, ir.SeqStmts):
@@ -101,7 +101,7 @@ def _at_scope_program():
             out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
         ) -> pl.Tensor[[256, 256], pl.FP32]:
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
-                pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+                pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
                 c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
                 out = pl.assemble(out, c, [0, 0])
             return out
@@ -134,7 +134,7 @@ def _spmd_for_program():
             out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
         ) -> pl.Tensor[[512, 128], pl.FP32]:
             for i in pl.spmd(4):
-                pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+                pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
                 offset = i * 128
                 tile_b: pl.Tile[[128, 128], pl.FP32] = pl.load(b, [offset, 0], [128, 128])
                 out = pl.store(tile_b, [offset, 0], out)
@@ -172,7 +172,7 @@ def _empty_spmd_body_program():
             out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
         ) -> pl.Tensor[[512, 128], pl.FP32]:
             for i in pl.spmd(4):
-                pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+                pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
             return out
 
     return EmptyBody
@@ -201,8 +201,8 @@ def test_roundtrip_preserves_both_policies_and_their_order():
             out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
         ) -> pl.Tensor[[256, 256], pl.FP32]:
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
-                pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
-                pl.set_cache_policy(a, pl.CachePolicy.DEFAULT)
+                pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
+                pl.set_l2_hint(a, load=pl.LoadL2Hint.NormalFirstVictim)
                 c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
                 out = pl.assemble(out, c, [0, 0])
             return out
@@ -226,7 +226,7 @@ def test_roundtrip_normalises_position_of_a_late_declaration():
         ) -> pl.Tensor[[256, 256], pl.FP32]:
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
                 c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
-                pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+                pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
                 out = pl.assemble(out, c, [0, 0])
             return out
 
@@ -234,7 +234,7 @@ def test_roundtrip_normalises_position_of_a_late_declaration():
 
 
 def test_parse_accepts_the_submodule_spelling_and_normalises_it():
-    """``pl.tensor.set_cache_policy`` parses too, and prints as ``pl.set_cache_policy``.
+    """``pl.tensor.set_l2_hint`` parses too, and prints as ``pl.set_l2_hint``.
 
     The marker function lives in ``tensor_ops``, so both spellings reach the
     parser; normalising on print keeps the round-trip a fixpoint from either.
@@ -249,7 +249,7 @@ class Alt:
     def main(self, a: pl.Tensor[[256, 128], pl.FP32], b: pl.Tensor[[128, 256], pl.FP32],
              out: pl.Out[pl.Tensor[[256, 256], pl.FP32]]) -> pl.Tensor[[256, 256], pl.FP32]:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
-            pl.tensor.set_cache_policy(b, pl.CachePolicy.BYPASS)
+            pl.tensor.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
             c: pl.Tensor[[256, 256], pl.FP32] = pl.tensor.matmul(a, b, out_dtype=pl.FP32)
             out: pl.Tensor[[256, 256], pl.FP32] = pl.tensor.assemble(out, c, [0, 0])
         return out
@@ -258,8 +258,8 @@ class Alt:
     assert _program_decls(prog) == [("InCoreScopeStmt", [("b", BYPASS)])]
 
     text = ir.python_print(prog)
-    assert "pl.set_cache_policy(b, pl.CachePolicy.BYPASS)" in text, text
-    assert "pl.tensor.set_cache_policy(" not in text, text
+    assert "pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)" in text, text
+    assert "pl.tensor.set_l2_hint(" not in text, text
     assert _program_decls(_reparse(prog)) == _program_decls(prog)
 
 
@@ -275,8 +275,8 @@ def test_repeating_the_same_policy_for_one_tensor_is_accepted():
             out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
         ) -> pl.Tensor[[64, 64], pl.FP32]:
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="k"):
-                pl.set_cache_policy(a, pl.CachePolicy.BYPASS)
-                pl.set_cache_policy(a, pl.CachePolicy.BYPASS)
+                pl.set_l2_hint(a, load=pl.LoadL2Hint.NotAllocClean)
+                pl.set_l2_hint(a, load=pl.LoadL2Hint.NotAllocClean)
                 t: pl.Tile[[64, 64], pl.FP32] = pl.load(a, [0, 0], [64, 64])
                 out = pl.store(t, [0, 0], out)
             return out
@@ -292,7 +292,7 @@ def test_conflicting_policies_for_one_tensor_are_rejected():
     also asserts the coherency contract the second statement retracts — so the
     parser rejects it instead of picking a winner.
     """
-    with pytest.raises(ParserSyntaxError, match="conflicting policies"):
+    with pytest.raises(ParserSyntaxError, match="conflicting load hints"):
 
         @pl.program
         class Prog:
@@ -303,8 +303,8 @@ def test_conflicting_policies_for_one_tensor_are_rejected():
                 out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="k"):
-                    pl.set_cache_policy(a, pl.CachePolicy.BYPASS)
-                    pl.set_cache_policy(a, pl.CachePolicy.DEFAULT)
+                    pl.set_l2_hint(a, load=pl.LoadL2Hint.NotAllocClean)
+                    pl.set_l2_hint(a, load=pl.LoadL2Hint.NormalFirstVictim)
                     t: pl.Tile[[64, 64], pl.FP32] = pl.load(a, [0, 0], [64, 64])
                     out = pl.store(t, [0, 0], out)
                 return out
@@ -330,6 +330,121 @@ def test_l2_hint_roundtrip(load_hint, store_hint):
     assert f"l2_hint=pl.StoreL2Hint.{store_hint.name}" in text
     ir.assert_structural_equal(Hinted, _reparse(Hinted))
     ir.assert_structural_equal(Hinted, ir.deserialize(ir.serialize(Hinted)))
+
+
+@pytest.mark.parametrize("load_hint", list(pl.LoadL2Hint))
+@pytest.mark.parametrize("store_hint", list(pl.StoreL2Hint))
+def test_scope_both_directions_roundtrip_and_serialize(load_hint, store_hint):
+    source = f"""
+@pl.program
+class HintedScope:
+    @pl.function
+    def main(self, x: pl.Tensor[[32, 32], pl.FP32],
+             out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]) -> pl.Tensor[[32, 32], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP):
+            pl.set_l2_hint(x, load=pl.LoadL2Hint.{load_hint.name})
+            pl.set_l2_hint(out, store=pl.StoreL2Hint.{store_hint.name})
+            t = pl.load(x, [0, 0], [32, 32])
+            out = pl.store(t, [0, 0], out)
+        return out
+"""
+    program = pl.parse_program(source)
+    ir.assert_structural_equal(program, _reparse(program))
+    ir.assert_structural_equal(program, ir.deserialize(ir.serialize(program)))
+    text = ir.python_print(program)
+    assert f"load=pl.LoadL2Hint.{load_hint.name}" in text
+    assert f"store=pl.StoreL2Hint.{store_hint.name}" in text
+
+
+def test_combined_scope_declaration_normalizes_and_deduplicates_directions():
+    @pl.program
+    class Both:
+        @pl.function
+        def main(self, x: pl.InOut[pl.Tensor[[32, 32], pl.FP32]]) -> pl.Tensor[[32, 32], pl.FP32]:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                pl.set_l2_hint(x, load=pl.LoadL2Hint.NormalPersistent, store=pl.StoreL2Hint.NotAllocClean)
+                pl.set_l2_hint(x, store=pl.StoreL2Hint.NotAllocClean)
+                t = pl.load(x, [0, 0], [32, 32])
+                x = pl.store(t, [0, 0], x)
+            return x
+
+    text = ir.python_print(Both)
+    assert text.count("pl.set_l2_hint(") == 2
+    ir.assert_structural_equal(Both, _reparse(Both))
+
+
+@pytest.mark.parametrize(
+    "declaration, diagnostic",
+    [
+        ("pl.set_l2_hint(x)", "takes one tensor"),
+        ("pl.set_l2_hint(x, pl.LoadL2Hint.NormalPersistent)", "takes one tensor"),
+        ("pl.set_l2_hint(x, store=pl.LoadL2Hint.NormalPersistent)", "Expected pl.StoreL2Hint"),
+        ("pl.set_l2_hint(x, load=pl.StoreL2Hint.NormalPersistent)", "Expected pl.LoadL2Hint"),
+        ("pl.set_l2_hint(x, unknown=pl.LoadL2Hint.NormalPersistent)", "invalid or repeated"),
+        ("pl.set_l2_hint(x, load=2)", "Expected pl.LoadL2Hint"),
+        (
+            "pl.set_l2_hint(x, store=pl.StoreL2Hint.NormalPersistent)\n"
+            "            pl.set_l2_hint(x, store=pl.StoreL2Hint.NormalFirstVictim)",
+            "conflicting store hints",
+        ),
+    ],
+)
+def test_scope_rejects_invalid_l2_declarations(declaration, diagnostic):
+    source = f"""
+@pl.program
+class Invalid:
+    @pl.function
+    def main(self, x: pl.Tensor[[32, 32], pl.FP32],
+             out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]) -> pl.Tensor[[32, 32], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP):
+            {declaration}
+            t = pl.load(x, [0, 0], [32, 32])
+            out = pl.store(t, [0, 0], out)
+        return out
+"""
+    with pytest.raises(ParserSyntaxError, match=diagnostic):
+        pl.parse_program(source)
+
+
+@pytest.mark.parametrize("direction, hint, invalid", [("load", 5, 3), ("store", 4, 5)])
+def test_deserialize_rejects_invalid_direction_specific_scope_encoding(direction, hint, invalid):
+    enum_name = "LoadL2Hint" if direction == "load" else "StoreL2Hint"
+    source = f"""
+@pl.program
+class Declared:
+    @pl.function
+    def main(self, x: pl.Tensor[[32, 32], pl.FP32],
+             out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]) -> pl.Tensor[[32, 32], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP):
+            pl.set_l2_hint({"x" if direction == "load" else "out"}, {direction}=pl.{enum_name}.NotAllocClean)
+            t = pl.load(x, [0, 0], [32, 32])
+            out = pl.store(t, [0, 0], out)
+        return out
+"""
+    payload = ir.serialize(pl.parse_program(source))
+    encoded = b"\xa6policy" + bytes([hint])
+    assert payload.count(encoded) == 1
+    malformed = payload.replace(encoded, b"\xa6policy" + bytes([invalid]))
+    with pytest.raises(ValueError, match=f"invalid {direction} encoding"):
+        ir.deserialize(malformed)
+
+
+@pytest.mark.parametrize("load_hint", [None, pl.LoadL2Hint.NormalPersistent])
+def test_scope_optional_closure_direction_preserves_other_hint(load_hint):
+    @pl.program
+    class Optional:
+        @pl.function
+        def main(self, x: pl.InOut[pl.Tensor[[32, 32], pl.FP32]]) -> pl.Tensor[[32, 32], pl.FP32]:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                pl.set_l2_hint(x, load=load_hint, store=pl.StoreL2Hint.NormalFirstVictim)
+                t = pl.load(x, [0, 0], [32, 32])
+                x = pl.store(t, [0, 0], x)
+            return x
+
+    text = ir.python_print(Optional)
+    assert "store=pl.StoreL2Hint.NormalFirstVictim" in text
+    assert ("load=pl.LoadL2Hint.NormalPersistent" in text) == (load_hint is not None)
+    ir.assert_structural_equal(Optional, _reparse(Optional))
 
 
 if __name__ == "__main__":

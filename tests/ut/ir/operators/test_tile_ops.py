@@ -9254,11 +9254,13 @@ def test_store_rejects_load_l2_hint_enum():
         pl.store(src, [0, 0], dst, l2_hint=cast(Any, pl.LoadL2Hint.NotAllocKeep))
 
 
-@pytest.mark.parametrize("cache", [ir.CachePolicy.DEFAULT, ir.CachePolicy.BYPASS])
-def test_load_rejects_cache_and_l2_hint_together(cache):
+def test_removed_cache_policy_api_is_not_exposed():
+    assert not hasattr(pl, "CachePolicy")
+    assert not hasattr(pl, "set_cache_policy")
+    assert not hasattr(ir, "CachePolicy")
     src = ir.Var("src", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown())
-    with pytest.raises(ValueError, match="cannot specify both cache and l2_hint"):
-        tile.load(src, [0, 0], [32, 32], cache=int(cache), l2_hint=0)
+    with pytest.raises(TypeError, match="cache"):
+        cast(Any, tile.load)(src, [0, 0], [32, 32], cache=1)
 
 
 if __name__ == "__main__":

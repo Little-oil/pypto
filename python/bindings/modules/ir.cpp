@@ -205,8 +205,8 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
           vars.push_back(nb::cast<VarPtr>(elem));
         }
         kwargs.emplace_back(key, std::move(vars));
-      } else if (key == kAttrCachePolicyParams) {
-        // ``cache_policy`` on an outlined Function: (param index, policy) pairs,
+      } else if (key == kAttrLoadL2HintParams || key == kAttrStoreL2HintParams) {
+        // Direction-specific L2 hints on a Function: (param index, encoding) pairs,
         // reconstructed from a printed pass dump by ast_parser._parse_attr_pair.
         std::vector<std::pair<int32_t, int>> decls;
         for (auto elem : seq) {
@@ -233,8 +233,8 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
           decls.emplace_back(static_cast<int32_t>(idx), nb::cast<int>(policy_obj));
         }
         kwargs.emplace_back(key, std::move(decls));
-      } else if (key == kAttrCachePolicyVars) {
-        // ``pl.set_cache_policy(t, policy)`` scope attr, written by the DSL
+      } else if (key == kAttrLoadL2HintVars || key == kAttrStoreL2HintVars) {
+        // ``pl.set_l2_hint(t, load=..., store=...)`` scope attr, written by the DSL
         // parser: a list of ``(Var, int)`` pairs. Keyed rather than sniffed for
         // the same reason as the arms above — a bare pair list says nothing
         // about which half is the reference.
@@ -490,17 +490,6 @@ void BindIR(nb::module_& m) {
       .value("NormalLastVictim", StoreL2Hint::NormalLastVictim)
       .value("NormalPersistent", StoreL2Hint::NormalPersistent)
       .value("NotAllocClean", StoreL2Hint::NotAllocClean);
-
-  // CachePolicy enum - declared GM cache-access policy for a tensor read.
-  // nb::is_arithmetic like AtomicType: the policy rides the `tile.load` "cache"
-  // kwarg as a plain `int`, so the DSL needs `int(policy)` to work.
-  nb::enum_<CachePolicy>(ir, "CachePolicy", nb::is_arithmetic(),
-                         "GM cache-access policy declared for a tensor read")
-      .value("DEFAULT", CachePolicy::kDefault, "Ordinary cached GM access")
-      .value("BYPASS", CachePolicy::kBypass,
-             "Streaming access declared to bypass the cache: asserts this tensor has no reuse "
-             "worth caching and that nothing writes those bytes while the kernel runs")
-      .export_values();
 
   // TensorView - struct for tensor view information - must be before TensorType
   nb::class_<TensorView>(ir, "TensorView",
@@ -1406,8 +1395,8 @@ void BindIR(nb::module_& m) {
         }
         result[key.c_str()] = lst;
       } else if (value.type() == typeid(std::vector<std::pair<VarPtr, int>>)) {
-        // Used by ScopeStmt attrs["cache_policy_vars"] — the parse-time
-        // ``pl.set_cache_policy`` declarations, as ``list[tuple[Var, int]]``.
+        // Used by ScopeStmt attrs["load_l2_hint_vars"] — the parse-time
+        // ``pl.set_l2_hint`` declarations, as ``list[tuple[Var, int]]``.
         const auto& decls =
             AnyCast<std::vector<std::pair<VarPtr, int>>>(value, "converting to Python: " + key);
         nb::list lst;
@@ -1416,7 +1405,7 @@ void BindIR(nb::module_& m) {
         }
         result[key.c_str()] = lst;
       } else if (value.type() == typeid(std::vector<std::pair<int32_t, int>>)) {
-        // Used by Function attrs["cache_policy"] — the same declarations after
+        // Used by Function attrs["load_l2_hint"] — the same declarations after
         // the scope outliner resolved them to param indices, as
         // ``list[tuple[int, int]]``.
         const auto& decls =

@@ -75,7 +75,7 @@ class OrderedSyntheticArgsProgram:
         session = pl.prefetch.session(ctx)
         pl.prefetch.wait(evt, session)
         row = pl.tile.get_block_idx()
-        tile = pl.load(x, [row, 0], [1, 128], cache=pl.CachePolicy.BYPASS)
+        tile = pl.load(x, [row, 0], [1, 128], l2_hint=pl.LoadL2Hint.NotAllocClean)
         return pl.store(tile, [row, 0], out)
 
 

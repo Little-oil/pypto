@@ -7,40 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Codegen behaviour of the declared GM cache-access policy (pypto #2534, #2680).
-
-PTOAS >= v0.64 carries a streaming GM read as a ``cache_policy`` attribute on
-``pto.tload`` plus an optional byte ``offset`` it adds to that one load's source
-address. On a2a3 the uncached mapping of a page is reached by address alias, so
-the attribute alone declares the policy and moves nothing: the offset is what
-makes the load bypass. That distance is a per-device value only the driver
-knows, so it is threaded in as the synthetic ``%__pypto_l2_cache_offset``
-parameter the kernel wrapper fills from ``get_l2_cache_offset(args)``.
-
-The contract asserted here has four sides:
-
-1. **A declared read carries the attribute** — once per emitted load, since the
-   hint belongs to the instruction rather than to the tensor (an unrolled loop
-   emits the same load many times, and each one must carry it).
-2. **An undeclared read carries nothing.** ``CachePolicy.DEFAULT`` emits no
-   attribute at all, so a kernel that states no policy keeps the PTO form it had
-   before the feature existed. That is also what makes the emitted dict the
-   *only* difference between the two otherwise identical kernels below.
-3. **The per-access surface still wins.** An explicit
-   ``cache=CachePolicy.DEFAULT`` inside a bypassing scope re-caches that one
-   read, which is observable in the emitted MLIR for the first time — while
-   BYPASS was a no-op, the documented precedence could only be checked on the IR
-   (``tests/ut/ir/transforms/test_convert_tensor_to_tile_ops.py``).
-4. **The device offset reaches every declared load, from one parameter.** The
-   value cannot change during a dispatch, so it is read once at kernel entry and
-   passed down; a kernel with no declared read gains no parameter. An
-   architecture that does not map GM twice — a5 — emits the attribute and no
-   offset, and the declaration has no effect there.
-
-Most tests stop at emitted MLIR. The L2-hint integration cases also run the
-installed stock PTOAS and PyPTO finalization, checking the actual ISA calls
-under both memory planners and inside structured control flow.
-"""
+"""L2 hints reach ISA calls; A2/A3 NotAlloc loads use the runtime address alias."""
 
 import pypto.language as pl
 import pytest
@@ -100,7 +67,7 @@ class DeclaredBypass:
         out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
     ) -> pl.Tensor[[M, N], pl.FP32]:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
-            pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+            pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
             c: pl.Tensor[[M, N], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
             out = pl.assemble(out, c, [0, 0])
         return out
@@ -135,8 +102,8 @@ class TwoDeclaredTensors:
         out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
     ) -> pl.Tensor[[M, N], pl.FP32]:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm2"):
-            pl.set_cache_policy(a, pl.CachePolicy.BYPASS)
-            pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+            pl.set_l2_hint(a, load=pl.LoadL2Hint.NotAllocClean)
+            pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
             c: pl.Tensor[[M, N], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
             out = pl.assemble(out, c, [0, 0])
         return out
@@ -144,7 +111,7 @@ class TwoDeclaredTensors:
 
 @pl.program
 class TwoBypassingLoadsOfOneTensor:
-    """Two `pl.load(..., cache=BYPASS)` reads of ONE tensor — two hinted loads."""
+    """Two `pl.load(..., l2_hint=NotAllocClean)` reads of ONE tensor — two hinted loads."""
 
     @pl.function(type=pl.FunctionType.InCore)
     def kernel(
@@ -152,8 +119,12 @@ class TwoBypassingLoadsOfOneTensor:
         x: pl.Tensor[[ROWS, COLS], pl.FP32],
         out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
     ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
-        top: pl.Tile[[16, COLS], pl.FP32] = pl.load(x, [0, 0], [16, COLS], cache=pl.CachePolicy.BYPASS)
-        bottom: pl.Tile[[16, COLS], pl.FP32] = pl.load(x, [16, 0], [16, COLS], cache=pl.CachePolicy.BYPASS)
+        top: pl.Tile[[16, COLS], pl.FP32] = pl.load(
+            x, [0, 0], [16, COLS], l2_hint=pl.LoadL2Hint.NotAllocClean
+        )
+        bottom: pl.Tile[[16, COLS], pl.FP32] = pl.load(
+            x, [16, 0], [16, COLS], l2_hint=pl.LoadL2Hint.NotAllocClean
+        )
         out_0: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.store(top, [0, 0], out)
         out_1: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.store(bottom, [16, 0], out_0)
         return out_1
@@ -163,7 +134,7 @@ class TwoBypassingLoadsOfOneTensor:
 class ReCachedSingleLoad:
     """A declared parameter with one access explicitly opted back into the cache.
 
-    The declaration is written the way pass 9 leaves it — ``cache_policy`` on the
+    The declaration is written the way pass 9 leaves it — ``load_l2_hint`` on the
     outlined kernel, ``(param index, policy)`` — because the override has to be
     stated at the access, and a hand-written InCore kernel is where an access is
     spelled out. See the pass-level pair in
@@ -176,10 +147,12 @@ class ReCachedSingleLoad:
         x: pl.Tensor[[ROWS, COLS], pl.FP32],
         out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
     ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
-        # (param index, policy-as-int); 1 is CachePolicy.BYPASS. The parser takes
+        # (param index, policy-as-int); 5 is LoadL2Hint.NotAllocClean. The parser takes
         # integer literals here only, which is also how pass 9 writes the attr.
-        pl.func_attr({"cache_policy": [(0, 1)]})
-        t: pl.Tile[[16, COLS], pl.FP32] = pl.load(x, [0, 0], [16, COLS], cache=pl.CachePolicy.DEFAULT)
+        pl.func_attr({"load_l2_hint": [(0, 5)]})
+        t: pl.Tile[[16, COLS], pl.FP32] = pl.load(
+            x, [0, 0], [16, COLS], l2_hint=pl.LoadL2Hint.NormalFirstVictim
+        )
         return pl.store(t, [0, 0], out)
 
 
@@ -257,7 +230,7 @@ def test_declared_tensor_load_carries_the_bypass_attribute():
 
 
 def test_the_declaration_adds_only_the_attribute_offset_and_parameter():
-    """`pl.set_cache_policy(b, BYPASS)` adds an annotated load and nothing else.
+    """`pl.set_l2_hint(b, load=NotAllocClean)` adds an annotated load and nothing else.
 
     No extra operation, no extra view, no reordering: stripping the attribute,
     the offset operand and the parameter that feeds it from the declared
@@ -287,7 +260,7 @@ def test_every_emitted_load_of_a_declared_tensor_is_hinted():
     The hint belongs to the instruction, not to the tensor: the old diagnostic
     was deliberately once-per-tensor, but an L2 hint that lands on only the
     first of two loads would leave the second one allocating in L2. This kernel
-    reads `x` twice with ``cache=BYPASS``; both emitted loads must carry it.
+    reads `x` twice with ``l2_hint=NotAllocClean``; both emitted loads must carry it.
     """
     mlir = _incore_mlir(TwoBypassingLoadsOfOneTensor)
     loads = _tload_lines(mlir)
@@ -336,21 +309,13 @@ def test_one_parameter_serves_every_declared_load():
     assert _signature_line(mlir).count(f"{OFFSET_PARAM}: i64") == 1, _signature_line(mlir)
 
 
-def test_a5_declares_the_policy_without_an_address_offset():
-    """A5 does not map GM twice, so there is no alias for an offset to reach.
-
-    Its runtime exposes no ``get_l2_cache_offset`` either, so emitting the
-    parameter would produce a kernel wrapper that cannot compile. PTOAS v0.64
-    lowers the bare attribute to an ordinary load, so the declaration is
-    accepted there and does nothing — which is a property of the target, not a
-    missing operand.
-    """
+def test_a5_not_alloc_hint_uses_isa_without_an_address_offset():
     backend.reset_for_testing()
     backend.set_backend_type(BackendType.Ascend950)
     mlir = _incore_mlir(TwoBypassingLoadsOfOneTensor)
-
-    assert _hinted_tloads(mlir), f"a5 must still carry the declaration:\n{mlir}"
-    assert OFFSET_PARAM not in mlir, f"a5 must take no address offset:\n{mlir}"
+    assert mlir.count("__pypto_l2_hint_begin load NotAllocClean") == 2
+    assert BYPASS_ATTR not in mlir
+    assert OFFSET_PARAM not in mlir
 
 
 # ---------------------------------------------------------------------------
@@ -359,15 +324,15 @@ def test_a5_declares_the_policy_without_an_address_offset():
 
 
 def test_undeclared_kernel_emits_no_cache_attribute():
-    """`CachePolicy.DEFAULT` emits nothing, so unrelated kernels are unchanged."""
+    """`LoadL2Hint.NormalFirstVictim` emits nothing, so unrelated kernels are unchanged."""
     mlir = _incore_mlir(PlainMatmul)
 
     assert _tload_lines(mlir), f"reference kernel emitted no pto.tload:\n{mlir}"
-    assert "cache_policy" not in mlir, f"an undeclared kernel must emit no cache attribute:\n{mlir}"
+    assert BYPASS_ATTR not in mlir, f"an undeclared kernel must emit no cache attribute:\n{mlir}"
 
 
 def test_explicit_default_load_beats_the_declaration_and_emits_no_attribute():
-    """An explicit ``cache=CachePolicy.DEFAULT`` re-caches that one read.
+    """An explicit ``l2_hint=LoadL2Hint.NormalFirstVictim`` re-caches that one read.
 
     The documented precedence — the per-access kwarg wins over the scope
     declaration, in both directions — becomes observable in codegen only now
@@ -376,7 +341,7 @@ def test_explicit_default_load_beats_the_declaration_and_emits_no_attribute():
     mlir = _incore_mlir(ReCachedSingleLoad)
 
     assert _tload_lines(mlir), f"kernel emitted no pto.tload:\n{mlir}"
-    assert "cache_policy" not in mlir, f"the re-cached access must carry no hint:\n{mlir}"
+    assert BYPASS_ATTR not in mlir, f"the re-cached access must carry no hint:\n{mlir}"
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +403,7 @@ def test_explicit_hint_overrides_scope_cache_declaration():
         def kernel(
             self, x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]
         ) -> pl.Tensor[[32, 32], pl.FP32]:
-            pl.func_attr({"cache_policy": [(0, 1)]})
+            pl.func_attr({"load_l2_hint": [(0, 5)]})
             t = pl.load(x, [0, 0], [32, 32], l2_hint=pl.LoadL2Hint.NormalFirstVictim)
             return pl.store(t, [0, 0], out)
 
@@ -451,7 +416,7 @@ def test_explicit_hint_overrides_scope_cache_declaration():
 @pytest.mark.parametrize(
     "hint", [pl.LoadL2Hint.NotAllocKeep, pl.LoadL2Hint.NotAllocClean, pl.LoadL2Hint.NotAllocDrop]
 )
-def test_a2a3_not_alloc_hint_requires_runtime_bypass(hint):
+def test_a2a3_not_alloc_hint_uses_runtime_bypass(hint):
     @pl.program
     class HintedLoad:
         @pl.function(type=pl.FunctionType.InCore)
@@ -461,8 +426,10 @@ def test_a2a3_not_alloc_hint_requires_runtime_bypass(hint):
             t = pl.load(x, [0, 0], [32, 32], l2_hint=hint)
             return pl.store(t, [0, 0], out)
 
-    with pytest.raises(ValueError, match="use cache=CachePolicy.BYPASS"):
-        _incore_mlir(HintedLoad)
+    mlir = _incore_mlir(HintedLoad)
+    assert BYPASS_ATTR in mlir
+    assert OFFSET_OPERAND in mlir
+    assert "__pypto_l2_hint_begin load NotAlloc" not in mlir
 
 
 @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])
@@ -605,6 +572,54 @@ def test_store_l2_hint_preserves_phase_with_stock_ptoas(tmp_path, planner):
     store = next(line for line in cpp.splitlines() if "TSTORE<" in line)
     assert "TSTORE<pto::TStoreL2Hint::NormalPersistent, STPhase::Final>" in store
     assert "__pypto_l2_hint" not in cpp
+
+
+@pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])
+@pytest.mark.parametrize("target", [BackendType.Ascend910B, BackendType.Ascend950])
+@pytest.mark.parametrize(
+    "hint", [pl.LoadL2Hint.NotAllocKeep, pl.LoadL2Hint.NotAllocClean, pl.LoadL2Hint.NotAllocDrop]
+)
+def test_scope_hints_reach_stock_ptoas_and_runtime_offset(tmp_path, planner, target, hint):
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is not available")
+
+    @pl.program
+    class ScopeHints:
+        @pl.function
+        def main(
+            self, x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]
+        ) -> pl.Tensor[[32, 32], pl.FP32]:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                pl.set_l2_hint(x, load=hint)
+                pl.set_l2_hint(out, store=pl.StoreL2Hint.NotAllocClean)
+                value = pl.add(x, 2.0)
+                out = pl.assemble(out, value, [0, 0])
+            return out
+
+    backend.reset_for_testing()
+    backend.set_backend_type(target)
+    with passes.PassContext([], memory_planner=planner):
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(ScopeHints)
+    functions = [f for f in optimized.functions.values() if f.func_type != pl.FunctionType.Orchestration]
+    assert len(functions) == 1
+    module = ir.Program(functions, "scope_hints", optimized.span)
+    mlir = codegen.PTOCodegen().generate(module, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS)
+    cpp = pto_backend._compile_pto_module(mlir, "scope_hints", str(tmp_path), planner)
+    assert "TSTORE<pto::TStoreL2Hint::NotAllocClean>" in cpp
+    assert "__pypto_l2_hint" not in cpp
+    wrapper = pto_backend._generate_kernel_wrapper(functions[0], cpp)
+    if target == BackendType.Ascend910B:
+        assert "TLOAD(" in cpp
+        assert "TLoadL2Hint::NotAlloc" not in cpp
+        assert OFFSET_OPERAND in mlir
+        signature = next(line for line in cpp.splitlines() if line.startswith("AICORE void "))
+        offset_name = signature.rsplit("int64_t ", 1)[1].split(")", 1)[0]
+        assert cpp.count(f"+ {offset_name})") == 1, cpp
+        assert wrapper.count("get_l2_cache_offset(args)") == 1
+    else:
+        assert f"TLOAD<pto::TLoadL2Hint::{hint.name}>" in cpp
+        assert "__pypto_l2_cache_offset" not in cpp
+        assert "get_l2_cache_offset" not in wrapper
 
 
 if __name__ == "__main__":

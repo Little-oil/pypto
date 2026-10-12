@@ -888,8 +888,8 @@ msgpack::object FieldSerializerVisitor::VisitLeafField(
       idx_map["value"] = msgpack::object(idx_vec, zone_);
       kwargs_msgs.push_back(make_pair(key, msgpack::object(idx_map, zone_)));
     } else if (value.type() == typeid(std::vector<std::pair<VarPtr, int>>)) {
-      // kAttrCachePolicyVars — the (tensor Var, CachePolicy) pairs the DSL parser
-      // writes onto a ScopeStmt for `pl.set_cache_policy(t, policy)`. The Var half
+      // kAttrLoadL2HintVars — the (tensor Var, LoadL2Hint) pairs the DSL parser
+      // writes onto a ScopeStmt for `pl.set_l2_hint(t, load=hint)`. The Var half
       // rides the same node-reference machinery as the Var-list attrs above so it
       // round-trips by identity; the policy half is a plain int.
       const auto& entries = AnyCast<std::vector<std::pair<VarPtr, int>>>(value, "serializing kwarg: " + key);
@@ -906,7 +906,7 @@ msgpack::object FieldSerializerVisitor::VisitLeafField(
       pol_map["value"] = msgpack::object(entry_vec, zone_);
       kwargs_msgs.push_back(make_pair(key, msgpack::object(pol_map, zone_)));
     } else if (value.type() == typeid(std::vector<std::pair<int32_t, int>>)) {
-      // kAttrCachePolicyParams — the (param index, CachePolicy) pairs the outliner
+      // kAttrLoadL2HintParams — the (param index, LoadL2Hint) pairs the outliner
       // writes onto an outlined Function, consumed and erased by
       // ConvertTensorToTileOps. Both halves are plain ints.
       const auto& entries = AnyCast<std::vector<std::pair<int32_t, int>>>(value, "serializing kwarg: " + key);

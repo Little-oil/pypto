@@ -177,63 +177,29 @@ check(scaled, sized)
 
 **怎么确认：** 新一份 `scope_stats.jsonl` 的元数据行显示新尺寸，而原来顶在容量上的那个峰值不再顶着。
 
-## 让流式操作数绕过缓存
+## 为流式输入选择 L2 Hint
 
-并不是内核读到的每个缓冲区都值得占用缓存。一个每个字节只被读一次的权重矩阵不可能命中缓存，
-却仍会冲刷末级缓存（last-level cache），把真正会被重复读取的那一小块激活工作集挤出去。
-两个操作数、一个缓存、相反的诉求。
-
-编译器无法区分它们 —— 复用（reuse）对它并不可靠可见，而猜错的代价是几个百分点的性能悄悄
-劣化，而不是一个报错。所以由你来声明：
+对复用很少的输入，可请求不分配缓存的 load，避免挤出热点数据。隐式访问通过张量声明
+默认提示：
 
 ```python
 with pl.at(level=pl.Level.CORE_GROUP):
-    pl.set_cache_policy(weights, pl.CachePolicy.BYPASS)
-    # 本作用域内对 `weights` 的每次读取都被声明为流式；
-    # 激活值仍走默认的带缓存路径。
+    pl.set_l2_hint(weights, load=pl.LoadL2Hint.NotAllocClean)
+    pl.set_l2_hint(out, store=pl.StoreL2Hint.NormalLastVictim)
     acc = pl.matmul(activations, weights, out_dtype=pl.FP32)
+    out = pl.assemble(out, acc, [0, 0])
 ```
 
-`pl.set_cache_policy` 是写在 `pl.at(level=pl.Level.CORE_GROUP, ...)` 或
-`pl.spmd(...)` 作用域体**顶层**的独立语句 —— 位于该 body 自身的语句之中即可，不必是第一行。
-它覆盖该作用域内对这个张量的每一次读取，因此张量层代码在访问点上无需任何改动 —— 这一点很
-关键，因为那些读取是隐式的：`pl.matmul`、`pl.assemble` 和下标切片都会发出 load，却没有可供
-标注的调用点。
+Tile 编程可直接在 `pl.load` / `pl.store` 上指定 `l2_hint`。显式 hint 覆盖对应方向的
+作用域声明，包括编码为 0 的 `NormalFirstVictim`。load 和 store 的枚举不同。
 
-写在非 `CORE_GROUP` 的 `pl.at` 作用域上的声明可以解析并被携带，但目前没有任何环节会把它下降
-到 load，因此不产生效果 —— 那些作用域不会变成设备侧 kernel。
+A5 将精确的 ISA hint 传给 `l2CacheCtl`。A2/A3 的所有 load `NotAlloc*` 名称均使用运行时
+nocache 地址别名，Keep/Clean/Drop 行为相同；其 normal 和 store hint 无独立硬件效果。
+应避免对通过 uncached 别名读取的字节进行并发的带缓存写入。对作用域会写入的张量声明
+NotAlloc load 会被拒绝。缓存行为和性能取决于设备与工作负载。
 
-当你写的是 tile 层代码、已经显式写出了 load 时，就标在那里：
-
-```python
-tile = pl.load(weights, [n0, k0], [256, 512], cache=pl.CachePolicy.BYPASS)
-```
-
-load 上显式的 `cache=` 永远优先于作用域声明，两个方向都成立 —— 所以在一个整体绕过缓存的
-作用域里，`cache=pl.CachePolicy.DEFAULT` 可以把某一次访问单独放回缓存路径。
-
-**代价：** 正确性由你保证。`BYPASS` 断言了两件事：这个张量没有值得缓存的复用，**并且**内核
-运行期间没有任何一方写这些字节。对同一段字节混用带缓存的写和绕过缓存的读是一致性
-（coherency）缺陷 —— 这正是它绝不作为默认、也绝不由编译器推断的原因。编译器会拒绝它能看见的
-那种情况（在作用域会写入的张量上声明 `BYPASS` 是错误），但无法证明一般情形。
-
-**要求 PTOAS >= v0.64，且只在 a2a3 上真正生效。** 在 a2a3 上，`BYPASS` 读取会编译成
-对该页 uncached 别名的访问，别名距离取自驱动为这块设备报告的值；若设备不提供该别名，
-驱动返回 0，读取退化为普通的带缓存访问，结果依然正确。a5 不做双重映射，声明在那里会被
-接受但当前不改变任何东西。未作声明的读取在所有目标上都逐字节不受影响。
-
-### 显式 L2 hint
-
-`pl.LoadL2Hint` 和 `pl.StoreL2Hint` 为 `pl.load` 和 `pl.store` 的 `l2_hint=`
-参数提供 PTO-ISA hint 枚举。例如，`pl.LoadL2Hint.NormalLastVictim` 请求降低
-缓存行的淘汰优先级。load 与 store 的编码不同，必须使用对应操作的枚举。
-
-PyPTO 在最终处理生成的 C++ 时，将这些 hint 传递给 PTO-ISA 模板参数。
-该路径使用现有 PTOAS v0.65，无需修改汇编器；同步分析和内存规划仍使用普通的
-搬运操作。
-精细化硬件行为需要 A5；A2/A3 的 bypass load 应使用 `CachePolicy.BYPASS`。
-架构限制、优先级与完整 hint 表见
-[GM 缓存策略](../../dev/language/05-cache-policy.md)。
+该实现使用现有 PTOAS v0.65。编码、作用域限制、编译链路和从已删除的 `CachePolicy`
+接口迁移的方式见 [L2 缓存提示](../../dev/language/05-l2-hints.md)。
 
 ## 参见
 

@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""A declared ``CachePolicy.BYPASS`` read returns the same bytes on device.
+"""A declared ``LoadL2Hint.NotAllocClean`` read returns the same bytes on device.
 
 The bypass is an *address* change on a2a3: the load is issued against the
 uncached alias of the page, ``addr + get_l2_cache_offset(args)``. That makes the
@@ -29,9 +29,10 @@ reproduce the product by accident to pass.
 
 Explicit L2 hints are covered separately by exact elementwise addition: every
 load/store hint pair runs with both memory planners, including zero-valued hints
-and a loop containing an ordinary load beside the hinted load. Nonallocating
-load hints require A5. These cases check correctness, not cache-hit rates or
-performance; codegen unit tests separately verify the emitted ISA arguments.
+and a loop containing an ordinary load beside the hinted load. A2/A3
+nonallocating loads use runtime address aliases; A5 uses ISA hints. These cases
+check correctness, not cache-hit rates or performance; codegen unit tests
+separately verify the emitted ISA arguments.
 """
 
 import pypto.language as pl
@@ -51,7 +52,7 @@ def _bypass_load_kernel(
 ) -> pl.Tensor[[M, N], pl.FP32]:
     """Tile programming: the weight's one read declares the policy."""
     xt = pl.load(x, [0, 0], [M, K], target_memory=pl.Mem.Mat)
-    wt = pl.load(w, [0, 0], [N, K], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.BYPASS)
+    wt = pl.load(w, [0, 0], [N, K], target_memory=pl.Mem.Mat, l2_hint=pl.LoadL2Hint.NotAllocClean)
     return pl.store(pl.matmul(xt, pl.tile.transpose_view(wt)), [0, 0], out)
 
 
@@ -72,7 +73,7 @@ def bypass_scope(
 ) -> pl.Tensor[[M, N], pl.FP32]:
     """Tensor programming: every read of ``w`` in the scope declares the policy."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
-        pl.set_cache_policy(w, pl.CachePolicy.BYPASS)
+        pl.set_l2_hint(w, load=pl.LoadL2Hint.NotAllocClean)
         c: pl.Tensor[[M, N], pl.FP32] = pl.matmul(x, w, out_dtype=pl.FP32)
         out = pl.assemble(out, c, [0, 0])
     return out
@@ -174,7 +175,6 @@ def test_l2_hints_preserve_results(case_run):
     case_run.assert_passed()
 
 
-@pytest.mark.platforms("a5", "a5sim")
 @st.cases(
     *[
         _l2_hint_case(load_hint, store_hint, planner)
@@ -188,7 +188,48 @@ def test_l2_hints_preserve_results(case_run):
     ]
 )
 def test_l2_not_alloc_hints_preserve_results(case_run):
-    """A5-only nonallocating loads must read the right bytes for every store hint."""
+    """Nonallocating loads must read the right bytes for every store hint."""
+    case_run.assert_passed()
+
+
+def _scope_l2_hint_case(store_hint, planner):
+    @pl.jit
+    def scope_add(
+        x: pl.Tensor[[32, 32], pl.FP32],
+        y: pl.Tensor[[32, 32], pl.FP32],
+        out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    ) -> pl.Tensor[[32, 32], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP):
+            pl.set_l2_hint(x, load=pl.LoadL2Hint.NotAllocKeep)
+            pl.set_l2_hint(out, store=store_hint)
+            out = pl.assemble(out, pl.add(x, y), [0, 0])
+            out = pl.assemble(out, pl.add(x, 2.0), [0, 0])
+        return out
+
+    x = (torch.arange(32 * 32).reshape(32, 32) % 127 - 63).float()
+    y = torch.full_like(x, 7.0)
+    return st.case(
+        scope_add,
+        x,
+        y,
+        torch.full_like(x, float("nan")),
+        name=f"scope_l2_{store_hint.name}_{planner.name}",
+        golden=lambda tensors: tensors["x"] + 2.0,
+        rtol=0.0,
+        atol=0.0,
+        memory_planner=planner,
+    )
+
+
+@st.cases(
+    *[
+        _scope_l2_hint_case(store_hint, planner)
+        for store_hint in pl.StoreL2Hint
+        for planner in (MemoryPlanner.PYPTO, MemoryPlanner.PTOAS)
+    ]
+)
+def test_scope_l2_hints_preserve_implicit_transfers(case_run):
+    """Scope hints on generated transfers survive successive output rebindings."""
     case_run.assert_passed()
 
 

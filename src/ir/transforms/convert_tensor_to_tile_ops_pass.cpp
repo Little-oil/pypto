@@ -248,97 +248,58 @@ bool IsPassthroughTensorOp(const CallPtr& call) {
   return IsOp(call, "tensor.dim") || IsOp(call, "tensor.view");
 }
 
-/// Declared GM cache policy per source tensor, keyed by the param Var the
-/// declaration resolved to. ``CachePolicy`` stored as ``int``, the type the
-/// ``tile.load`` ``cache`` kwarg is registered with.
-using CachePolicyByParam = std::unordered_map<const Var*, int>;
+/// Exact ISA encodings keyed by the tensor binding carrying a scope hint.
+using L2HintByVar = std::unordered_map<const Var*, int>;
 
-/**
- * @brief Resolve an InCore function's ``cache_policy`` attr to its param Vars.
- *
- * ``OutlineIncoreScopes`` (pass 9) records ``pl.set_cache_policy`` declarations
- * as (param index, policy) pairs, because at that point the param Vars are
- * freshly minted. Here the indices are turned back into Var identities — the
- * form every load site below matches its source arg against — and the attr is
- * erased on the way out (see ``EraseCachePolicyAttr``): param indices are only
- * valid across passes 9..11, since later passes both append to and prepend onto
- * param lists.
- */
-CachePolicyByParam BuildCachePolicyByParam(const FunctionPtr& func) {
-  CachePolicyByParam policies;
-  auto indices = func->GetAttr<std::vector<std::pair<int32_t, int>>>(kAttrCachePolicyParams);
-  policies.reserve(indices.size());
-  for (const auto& [idx, policy] : indices) {
-    INTERNAL_CHECK_SPAN(idx >= 0 && static_cast<size_t>(idx) < func->params_.size(), func->span_)
-        << "Internal error: cache_policy param index " << idx << " out of range for function '" << func->name_
-        << "' with " << func->params_.size() << " param(s)";
-    // insert_or_assign, not emplace: a tensor declared twice takes its last
-    // declaration, deterministically (the attr is sorted by index).
-    policies.insert_or_assign(func->params_[static_cast<size_t>(idx)].get(), policy);
+/// Outlining records parameter indices; resolve them before later passes change
+/// the parameter list. Load and store encodings are validated independently.
+L2HintByVar BuildL2HintsByParam(const FunctionPtr& func, const char* key) {
+  L2HintByVar hints;
+  auto indices = func->GetAttr<std::vector<std::pair<int32_t, int>>>(key);
+  hints.reserve(indices.size());
+  for (const auto& [idx, hint] : indices) {
+    CHECK_SPAN(idx >= 0 && static_cast<size_t>(idx) < func->params_.size(), func->span_)
+        << key << " parameter index " << idx << " out of range for function '" << func->name_ << "'";
+    CHECK_SPAN(std::string(key) == kAttrLoadL2HintParams ? IsValidLoadL2Hint(hint) : IsValidStoreL2Hint(hint),
+               func->span_)
+        << "Invalid " << key << " encoding " << hint;
+    auto [it, inserted] = hints.emplace(func->params_[static_cast<size_t>(idx)].get(), hint);
+    CHECK_SPAN(inserted || it->second == hint, func->span_)
+        << "Conflicting " << key << " declarations for parameter " << idx;
   }
-  return policies;
+  return hints;
 }
 
-/// Drop the consumed ``cache_policy`` attr. Nothing downstream may see it —
-/// its param indices go stale the moment a later pass grows the param list.
-std::vector<std::pair<std::string, std::any>> EraseCachePolicyAttr(
+/// Consume parameter-index metadata before later passes change the signature.
+std::vector<std::pair<std::string, std::any>> EraseL2HintAttrs(
     const std::vector<std::pair<std::string, std::any>>& attrs) {
   std::vector<std::pair<std::string, std::any>> kept;
   kept.reserve(attrs.size());
   for (const auto& kv : attrs) {
-    if (kv.first == kAttrCachePolicyParams) continue;
+    if (kv.first == kAttrLoadL2HintParams || kv.first == kAttrStoreL2HintParams) continue;
     kept.push_back(kv);
   }
   return kept;
 }
 
-/// Longest ``IterArg`` init chain followed when resolving a load source. Loop
-/// nesting is the real bound (single digits); this only stops malformed IR from
-/// spinning.
-constexpr int kMaxIterArgInitChain = 64;
-
 /**
- * @brief Resolve a load source to the function parameter it ultimately reads.
- *
- * A loop-carried tensor reaches its load as an ``IterArg``, not as the param
- * ``Var`` the declaration named -- ``IterArg`` is its own ``ObjectKind``, so
- * ``AsVarLike`` hands it back as itself and a param-keyed lookup misses. Follow
- * ``initValue_`` back to the root first, mirroring how
- * ``PTOCodegen::TryGetTensorView`` resolves the same shape. Returns the
- * innermost resolvable Var-like, which for a non-carried source is the source
- * itself.
- */
-VarPtr ResolveToRootParam(const ExprPtr& src) {
-  auto var = AsVarLike(src);
-  for (int depth = 0; var && depth < kMaxIterArgInitChain; ++depth) {
-    auto iter_arg = As<IterArg>(var);
-    if (!iter_arg) return var;
-    auto init = AsVarLike(iter_arg->initValue_);
-    if (!init) return var;
-    var = init;
-  }
-  return var;
-}
-
-/**
- * @brief Add the declared ``cache`` kwarg for a synthesised ``tile.load``.
+ * @brief Add a scope-declared hint unless the transfer has an explicit hint.
  *
  * No-op unless ``src`` is a param carrying a declaration. An explicit
- * ``cache=`` already in ``kwargs`` always wins (precedence: per-access kwarg,
- * then the scope declaration, then ``CachePolicy::kDefault``).
+ * ``l2_hint=`` already in ``kwargs`` always wins (precedence: per-access kwarg,
+ * then the scope declaration, then ``LoadL2Hint::NormalFirstVictim``).
  */
-void AppendCachePolicyKwarg(const ExprPtr& src, const CachePolicyByParam& policies,
-                            std::vector<std::pair<std::string, std::any>>* kwargs) {
+void AppendL2HintKwarg(const ExprPtr& src, const L2HintByVar& policies,
+                       std::vector<std::pair<std::string, std::any>>* kwargs) {
   if (policies.empty()) return;
-  auto var = ResolveToRootParam(src);
+  auto var = AsVarLike(src);
   if (!var) return;
   auto it = policies.find(var.get());
   if (it == policies.end()) return;
-  const bool stated_explicitly = std::any_of(kwargs->begin(), kwargs->end(), [](const auto& kv) {
-    return kv.first == "cache" || kv.first == "l2_hint";
-  });
+  const bool stated_explicitly =
+      std::any_of(kwargs->begin(), kwargs->end(), [](const auto& kv) { return kv.first == "l2_hint"; });
   if (stated_explicitly) return;
-  kwargs->emplace_back("cache", it->second);
+  kwargs->emplace_back("l2_hint", it->second);
 }
 
 /**
@@ -346,21 +307,40 @@ void AppendCachePolicyKwarg(const ExprPtr& src, const CachePolicyByParam& polici
  *
  * A hand-written (or earlier-pass) load of a declared tensor must honour the
  * declaration exactly as a synthesised one does, unless it states its own
- * ``cache=``. Returns nullptr when nothing changes, so callers keep their
+ * ``l2_hint=``. Returns nullptr when nothing changes, so callers keep their
  * copy-on-write short-circuit. Only ``Call`` is considered: a ``Submit``
  * launches a task through a ``GlobalVar`` callee and can never carry a tile op.
  */
-CallPtr StampCachePolicyOnLoad(const CallPtr& call, const CachePolicyByParam& policies) {
+CallPtr StampLoadL2HintOnLoad(const CallPtr& call, const L2HintByVar& policies) {
   if (policies.empty() || !IsOp(call, "tile.load") || call->args_.empty()) return nullptr;
   auto kwargs = call->kwargs_;
-  AppendCachePolicyKwarg(call->args_[0], policies, &kwargs);
+  AppendL2HintKwarg(call->args_[0], policies, &kwargs);
   // Unchanged when the source carries no declaration, or when the load already
-  // states its own ``cache=``.
+  // states its own ``l2_hint=``.
   if (kwargs.size() == call->kwargs_.size()) return nullptr;
   auto stamped = MutableCopy(call);
   stamped->kwargs_ = std::move(kwargs);
   return stamped;
 }
+
+class StoreHintStamper : public IRMutator {
+ public:
+  explicit StoreHintStamper(const L2HintByVar& hints) : hints_(hints) {}
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    auto visited = IRMutator::VisitExpr_(op);
+    auto call = As<Call>(visited);
+    if (!call || !IsOp(call, "tile.store") || call->args_.size() < 3) return visited;
+    auto kwargs = call->kwargs_;
+    AppendL2HintKwarg(call->args_[2], hints_, &kwargs);
+    if (kwargs.size() == call->kwargs_.size()) return visited;
+    auto copy = MutableCopy(call);
+    copy->kwargs_ = std::move(kwargs);
+    return copy;
+  }
+
+ private:
+  const L2HintByVar& hints_;
+};
 
 void CheckReinterpretViewIncoreLayout(const CallPtr& call) {
   if (!IsOp(call, "tensor.reinterpret_view")) return;
@@ -1077,12 +1057,12 @@ class TensorToTileMutator : public TypePropagatingMutator {
  public:
   TensorToTileMutator(const OpConversionRegistry& conv_registry, const OpRegistry& op_registry,
                       const ConsumerSpaceCollector& consumer_collector,
-                      const TensorConversionAnalysis& tile_values, CachePolicyByParam cache_policies)
+                      const TensorConversionAnalysis& tile_values, L2HintByVar load_hints)
       : conv_registry_(conv_registry),
         op_registry_(op_registry),
         consumer_collector_(consumer_collector),
         tile_values_(tile_values),
-        cache_policies_(std::move(cache_policies)) {}
+        load_hints_(std::move(load_hints)) {}
 
   /// A cached load is a compute operand, never an SSA replacement for its GM
   /// source. Only parameters proven unwritten throughout the function enter
@@ -1126,7 +1106,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
     return SeqStmts::Flatten(std::move(stmts), op->span_);
   }
 
-  /// Honour a ``pl.set_cache_policy`` declaration on a ``tile.load`` that was
+  /// Honour a ``pl.set_l2_hint`` declaration on a ``tile.load`` that was
   /// already in the body (user-written, or produced by an earlier pass) rather
   /// than synthesised here. Hooked on the generic Call visit so the loads a
   /// converter emits in its own prologue are covered too.
@@ -1136,8 +1116,9 @@ class TensorToTileMutator : public TypePropagatingMutator {
     auto visited = IRMutator::VisitExpr_(op);
     auto call = As<Call>(visited);
     if (!call) return visited;
-    auto stamped = StampCachePolicyOnLoad(call, cache_policies_);
-    return stamped ? ExprPtr(stamped) : visited;
+    auto stamped = StampLoadL2HintOnLoad(call, load_hints_);
+    if (stamped) return stamped;
+    return visited;
   }
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
@@ -1342,7 +1323,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
     if (req && req->space == MemorySpace::Acc) req.reset();
     std::vector<std::pair<std::string, std::any>> kwargs;
     if (req) kwargs.emplace_back("target_memory", req->space);
-    AppendCachePolicyKwarg(source, cache_policies_, &kwargs);
+    AppendL2HintKwarg(source, load_hints_, &kwargs);
     ExprPtr shapes = valid;
     if (req && req->cube_m_align > 0) {
       auto boxed = BoxCubeMAxis(tensor_type->shape_, req->cube_m_align, req->cube_m_axis, span);
@@ -1479,7 +1460,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
     // The consumer-driven load is always natural; a transposed (b_trans/a_trans)
     // operand gets a zero-copy tile.transpose_view at the matmul site instead.
     std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", req.space}};
-    AppendCachePolicyKwarg(input, cache_policies_, &load_kwargs);
+    AppendL2HintKwarg(input, load_hints_, &load_kwargs);
     auto load_call = MarkCompilerMatBridge(
         op_registry_.Create("tile.load", {input, offset_arg, physical_shape_arg, valid_shape}, load_kwargs,
                             call->span_),
@@ -1554,7 +1535,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
       auto shapes =
           AreExprVectorsEqual(boxed, tensor_type->shape_) ? valid : MakeShapeTuple(boxed, call->span_);
       std::vector<std::pair<std::string, std::any>> load_kw = {{"target_memory", space}};
-      AppendCachePolicyKwarg(arg, cache_policies_, &load_kw);
+      AppendL2HintKwarg(arg, load_hints_, &load_kw);
       auto load = MarkCompilerMatBridge(
           op_registry_.Create("tile.load", {arg, offsets, shapes, valid}, load_kw, call->span_), space);
       std::string var_name;
@@ -1652,9 +1633,9 @@ class TensorToTileMutator : public TypePropagatingMutator {
   std::unordered_map<const Expr*, ExprPtr> preloaded_tiles_;
   ConversionContext conversion_context_;
   std::vector<bool> yield_tile_targets_;
-  /// Declared GM cache policies of this function's params (empty when the
-  /// function carries no ``pl.set_cache_policy`` declaration).
-  const CachePolicyByParam cache_policies_;
+  /// Declared GM load hints of this function's params (empty when the
+  /// function carries no ``pl.set_l2_hint`` declaration).
+  const L2HintByVar load_hints_;
 };
 
 bool ExprUsesVar(const ExprPtr& expr, const Var* target) {
@@ -2106,11 +2087,14 @@ ExprPtr ResultAliasedDestination(const CallPtr& call) {
   return nullptr;
 }
 
-void UpdateTensorAliasOrigin(const VarPtr& var, const ParamOrigins& origins, AliasOriginMap& origin_map) {
+void UpdateTensorAliasOrigin(const VarPtr& var, const ParamOrigins& origins, AliasOriginMap& origin_map,
+                             AliasOriginMap* all_origins) {
   if (AsTensorTypeLike(var->GetType()) && !origins.empty()) {
     origin_map[var.get()] = origins;
+    if (all_origins) (*all_origins)[var.get()] = origins;
   } else {
     origin_map.erase(var.get());
+    if (all_origins) all_origins->erase(var.get());
   }
 }
 
@@ -2239,15 +2223,18 @@ YieldAliasInfo MergeYieldInfos(const YieldAliasInfo& lhs, const YieldAliasInfo& 
 YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_map,
                                   std::vector<bool>& has_read, std::vector<bool>& has_write,
                                   std::vector<std::optional<Span>>& dma_store_spans,
-                                  std::vector<std::optional<Span>>& scalar_store_spans);
+                                  std::vector<std::optional<Span>>& scalar_store_spans,
+                                  AliasOriginMap* all_origins = nullptr);
 
 void BindLoopOrigins(const std::vector<IterArgPtr>& iter_args, const std::vector<ParamOrigins>& origins,
-                     AliasOriginMap& origin_map) {
+                     AliasOriginMap& origin_map, AliasOriginMap* all_origins) {
   for (size_t i = 0; i < iter_args.size(); ++i) {
     if (i < origins.size() && !origins[i].empty()) {
       origin_map[iter_args[i].get()] = origins[i];
+      if (all_origins) (*all_origins)[iter_args[i].get()] = origins[i];
     } else {
       origin_map.erase(iter_args[i].get());
+      if (all_origins) all_origins->erase(iter_args[i].get());
     }
   }
 }
@@ -2257,16 +2244,17 @@ std::vector<ParamOrigins> AnalyzeLoopCarriedOrigins(const StmtPtr& body,
                                                     const AliasOriginMap& origin_map,
                                                     std::vector<bool>& has_read, std::vector<bool>& has_write,
                                                     std::vector<std::optional<Span>>& dma_store_spans,
-                                                    std::vector<std::optional<Span>>& scalar_store_spans) {
+                                                    std::vector<std::optional<Span>>& scalar_store_spans,
+                                                    AliasOriginMap* all_origins) {
   std::vector<ParamOrigins> carried_origins(iter_args.size());
   for (size_t i = 0; i < iter_args.size(); ++i) {
     carried_origins[i] = GetAliasOrigins(iter_args[i]->initValue_, origin_map);
   }
 
   auto body_map = origin_map;
-  BindLoopOrigins(iter_args, carried_origins, body_map);
-  auto yield_info =
-      AnalyzeStmtAliases(body, body_map, has_read, has_write, dma_store_spans, scalar_store_spans);
+  BindLoopOrigins(iter_args, carried_origins, body_map, all_origins);
+  auto yield_info = AnalyzeStmtAliases(body, body_map, has_read, has_write, dma_store_spans,
+                                       scalar_store_spans, all_origins);
 
   bool origins_widened = false;
   if (yield_info.has_yield) {
@@ -2282,8 +2270,9 @@ std::vector<ParamOrigins> AnalyzeLoopCarriedOrigins(const StmtPtr& body,
   // fixed-point traversal of the loop body.
   if (origins_widened) {
     body_map = origin_map;
-    BindLoopOrigins(iter_args, carried_origins, body_map);
-    yield_info = AnalyzeStmtAliases(body, body_map, has_read, has_write, dma_store_spans, scalar_store_spans);
+    BindLoopOrigins(iter_args, carried_origins, body_map, all_origins);
+    yield_info = AnalyzeStmtAliases(body, body_map, has_read, has_write, dma_store_spans, scalar_store_spans,
+                                    all_origins);
     if (yield_info.has_yield) {
       for (size_t i = 0; i < carried_origins.size() && i < yield_info.origins.size(); ++i) {
         MergeOrigins(carried_origins[i], yield_info.origins[i]);
@@ -2296,11 +2285,12 @@ std::vector<ParamOrigins> AnalyzeLoopCarriedOrigins(const StmtPtr& body,
 YieldAliasInfo AnalyzeStmtSequenceAliases(const std::vector<StmtPtr>& stmts, AliasOriginMap& origin_map,
                                           std::vector<bool>& has_read, std::vector<bool>& has_write,
                                           std::vector<std::optional<Span>>& dma_store_spans,
-                                          std::vector<std::optional<Span>>& scalar_store_spans) {
+                                          std::vector<std::optional<Span>>& scalar_store_spans,
+                                          AliasOriginMap* all_origins = nullptr) {
   YieldAliasInfo last_yield;
   for (const auto& stmt : stmts) {
-    auto yield_info =
-        AnalyzeStmtAliases(stmt, origin_map, has_read, has_write, dma_store_spans, scalar_store_spans);
+    auto yield_info = AnalyzeStmtAliases(stmt, origin_map, has_read, has_write, dma_store_spans,
+                                         scalar_store_spans, all_origins);
     if (yield_info.has_yield) {
       last_yield = yield_info;
     }
@@ -2311,7 +2301,8 @@ YieldAliasInfo AnalyzeStmtSequenceAliases(const std::vector<StmtPtr>& stmts, Ali
 YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_map,
                                   std::vector<bool>& has_read, std::vector<bool>& has_write,
                                   std::vector<std::optional<Span>>& dma_store_spans,
-                                  std::vector<std::optional<Span>>& scalar_store_spans) {
+                                  std::vector<std::optional<Span>>& scalar_store_spans,
+                                  AliasOriginMap* all_origins) {
   if (!stmt) return {};
 
   if (auto assign = As<AssignStmt>(stmt)) {
@@ -2321,7 +2312,7 @@ YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_ma
 
     if (AsTensorTypeLike(assign->var_->GetType())) {
       auto origins = GetAliasOrigins(assign->value_, origin_map);
-      UpdateTensorAliasOrigin(assign->var_, origins, origin_map);
+      UpdateTensorAliasOrigin(assign->var_, origins, origin_map, all_origins);
     }
     return {};
   }
@@ -2335,12 +2326,12 @@ YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_ma
 
   if (auto seq = As<SeqStmts>(stmt)) {
     return AnalyzeStmtSequenceAliases(seq->stmts_, origin_map, has_read, has_write, dma_store_spans,
-                                      scalar_store_spans);
+                                      scalar_store_spans, all_origins);
   }
 
   if (auto scope = As<ScopeStmt>(stmt)) {
     return AnalyzeStmtAliases(scope->body_, origin_map, has_read, has_write, dma_store_spans,
-                              scalar_store_spans);
+                              scalar_store_spans, all_origins);
   }
 
   if (auto if_stmt = As<IfStmt>(stmt)) {
@@ -2349,12 +2340,12 @@ YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_ma
     }
     auto then_map = origin_map;
     auto then_yield = AnalyzeStmtAliases(if_stmt->then_body_, then_map, has_read, has_write, dma_store_spans,
-                                         scalar_store_spans);
+                                         scalar_store_spans, all_origins);
     YieldAliasInfo else_yield;
     if (auto else_body = if_stmt->else_body_.value_or(nullptr)) {
       auto else_map = origin_map;
-      else_yield =
-          AnalyzeStmtAliases(else_body, else_map, has_read, has_write, dma_store_spans, scalar_store_spans);
+      else_yield = AnalyzeStmtAliases(else_body, else_map, has_read, has_write, dma_store_spans,
+                                      scalar_store_spans, all_origins);
     }
     auto merged_yield = MergeYieldInfos(then_yield, else_yield);
     for (size_t i = 0; i < if_stmt->return_vars_.size(); ++i) {
@@ -2362,7 +2353,7 @@ YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_ma
       if (merged_yield.has_yield && i < merged_yield.origins.size()) {
         origins = merged_yield.origins[i];
       }
-      UpdateTensorAliasOrigin(if_stmt->return_vars_[i], origins, origin_map);
+      UpdateTensorAliasOrigin(if_stmt->return_vars_[i], origins, origin_map, all_origins);
     }
     return merged_yield;
   }
@@ -2380,10 +2371,10 @@ YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_ma
 
     auto carried_origins =
         AnalyzeLoopCarriedOrigins(for_stmt->body_, for_stmt->iter_args_, origin_map, has_read, has_write,
-                                  dma_store_spans, scalar_store_spans);
+                                  dma_store_spans, scalar_store_spans, all_origins);
     for (size_t i = 0; i < for_stmt->return_vars_.size(); ++i) {
       ParamOrigins origins = i < carried_origins.size() ? carried_origins[i] : ParamOrigins{};
-      UpdateTensorAliasOrigin(for_stmt->return_vars_[i], origins, origin_map);
+      UpdateTensorAliasOrigin(for_stmt->return_vars_[i], origins, origin_map, all_origins);
     }
     return {};
   }
@@ -2395,10 +2386,10 @@ YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_ma
 
     auto carried_origins =
         AnalyzeLoopCarriedOrigins(while_stmt->body_, while_stmt->iter_args_, origin_map, has_read, has_write,
-                                  dma_store_spans, scalar_store_spans);
+                                  dma_store_spans, scalar_store_spans, all_origins);
     for (size_t i = 0; i < while_stmt->return_vars_.size(); ++i) {
       ParamOrigins origins = i < carried_origins.size() ? carried_origins[i] : ParamOrigins{};
-      UpdateTensorAliasOrigin(while_stmt->return_vars_[i], origins, origin_map);
+      UpdateTensorAliasOrigin(while_stmt->return_vars_[i], origins, origin_map, all_origins);
     }
     return {};
   }
@@ -2443,6 +2434,36 @@ ParamAccessInfo AnalyzeParamAccess(const std::vector<StmtPtr>& stmts, const std:
   AnalyzeStmtSequenceAliases(stmts, origin_map, access.has_read, access.has_write, access.dma_store_spans,
                              access.scalar_store_spans);
   return access;
+}
+
+/// Resolve scope hints through the same GM alias analysis used for parameter
+/// directions. Ambiguous aliases inherit only when every possible root agrees.
+L2HintByVar ExpandL2HintsByAlias(const std::vector<StmtPtr>& stmts, const std::vector<VarPtr>& params,
+                                 const L2HintByVar& hints) {
+  if (hints.empty()) return hints;
+  AliasOriginMap origins;
+  for (size_t i = 0; i < params.size(); ++i) {
+    if (AsTensorTypeLike(params[i]->GetType())) origins[params[i].get()] = ParamOrigins{i};
+  }
+  AliasOriginMap all_origins = origins;
+  ParamAccessInfo access(params.size());
+  AnalyzeStmtSequenceAliases(stmts, origins, access.has_read, access.has_write, access.dma_store_spans,
+                             access.scalar_store_spans, &all_origins);
+  L2HintByVar expanded = hints;
+  for (const auto& [var, roots] : all_origins) {
+    std::optional<int> hint;
+    bool agree = !roots.empty();
+    for (size_t index : roots) {
+      auto found = hints.find(params[index].get());
+      if (found == hints.end() || (hint && *hint != found->second)) {
+        agree = false;
+        break;
+      }
+      hint = found->second;
+    }
+    if (agree && hint) expanded.insert_or_assign(var, *hint);
+  }
+  return expanded;
 }
 
 /// Upgrade In params to Out/InOut based on tile.store/tensor.write usage analysis.
@@ -2645,17 +2666,17 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
   consumer_collector.VisitStmt(canonical_body);
   consumer_collector.PropagateThroughInheritInputOps();
 
-  // Resolve the scope-declared GM cache policies onto this function's params.
-  // Every load this pass synthesises below, and every load already in the body,
-  // carries the declaration onward as a ``cache`` kwarg; the function attr is
-  // erased when the transformed function is rebuilt.
-  auto cache_policies = BuildCachePolicyByParam(func);
+  // Resolve scope load hints before conversion and store hints after all stores
+  // have been synthesized. Parameter-index metadata is consumed by this pass.
+  auto load_hints = ExpandL2HintsByAlias(FlattenToStmts(canonical_body), func->params_,
+                                         BuildL2HintsByParam(func, kAttrLoadL2HintParams));
+  auto store_hints = BuildL2HintsByParam(func, kAttrStoreL2HintParams);
 
   TensorConversionAnalysis tile_values(conv_registry);
   tile_values.VisitStmt(canonical_body);
   tile_values.Propagate();
 
-  TensorToTileMutator mutator(conv_registry, op_registry, consumer_collector, tile_values, cache_policies);
+  TensorToTileMutator mutator(conv_registry, op_registry, consumer_collector, tile_values, load_hints);
 
   // New body statements (prefix tile.loads + mutated body)
   std::vector<StmtPtr> new_stmts;
@@ -2771,13 +2792,17 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
     new_stmts.push_back(std::make_shared<ReturnStmt>(std::vector<ExprPtr>{}, span));
   }
 
+  auto store_hints_by_var = ExpandL2HintsByAlias(new_stmts, new_params, store_hints);
+  StoreHintStamper store_stamper(store_hints_by_var);
+  for (auto& stmt : new_stmts) stmt = store_stamper.VisitStmt(stmt);
+
   UpgradeWrittenTensorParamDirections(new_stmts, new_params, new_param_directions);
 
   auto new_body = SeqStmts::Flatten(std::move(new_stmts), span);
   auto new_func = std::make_shared<Function>(func->name_, new_params, new_param_directions, new_return_types,
                                              new_body, span, FunctionType::InCore, func->level_, func->role_,
-                                             EraseCachePolicyAttr(func->attrs_),
-                                             func->requires_runtime_binding_, func->ir_stage_);
+                                             EraseL2HintAttrs(func->attrs_), func->requires_runtime_binding_,
+                                             func->ir_stage_);
 
   return {new_func, num_added_outputs};
 }

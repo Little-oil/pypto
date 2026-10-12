@@ -139,26 +139,19 @@ output[0:1, 0:32] = staged
 Using `tensor.write` for every element is also supported when a single bulk
 store is not practical.
 
-### Cache-Policy Declarations → `tile.load` `cache` Kwarg
+### Scope L2 Hints → Transfer `l2_hint` Kwargs
 
-This pass is where a declared GM cache policy stops being metadata and becomes
-part of the access. [`OutlineIncoreScopes`](09-outline_incore_scopes.md) left the
-declarations on the InCore function as the `cache_policy` attr —
-`std::vector<std::pair<int32_t, int>>` (param index, `CachePolicy` as int).
-Phase 1 turns those indices back into param `Var` identities once per function,
-then adds `{"cache", <policy>}` to every `tile.load` whose source arg is a listed
-param: the entry loads it synthesises, the consumer-driven Mat loads, the
-input-space bridge loads, and any `tile.load` already in the body (user-written
-or produced by an earlier pass). The attr is **erased** when the transformed
-function is rebuilt — nothing downstream may see it, because its param indices go
-stale the moment a later pass grows the param list.
+This pass consumes `load_l2_hint` and `store_l2_hint` function attributes,
+resolves parameter indices to Vars, and stamps exact ISA encodings onto
+`tile.load` and `tile.store`. Explicit access hints take precedence, including
+zero-valued `NormalFirstVictim`. Unspecified accesses inherit scope hints.
 
-Precedence is per access: an explicit `pl.load(..., cache=...)` kwarg already on
-the load always wins over the scope declaration, in both directions, so
-`cache=pl.CachePolicy.DEFAULT` opts one read back into the cache inside a
-bypassing scope. From here the kwarg simply rides the op through the remaining
-passes to codegen, the way `target_memory` does. See
-[GM Cache-Access Policy](../language/05-cache-policy.md).
+Loads generated for compute operands inherit load hints; stores generated for
+`tensor.assemble` inherit destination store hints. Store stamping runs after
+all generated stores exist. Existing GM alias analysis propagates declarations
+through destination rebindings and loop carries; ambiguous aliases inherit only
+when every possible root agrees. Both function attrs are erased before later
+passes modify parameter lists. See [L2 Cache Hints](../language/05-l2-hints.md).
 
 ### Phase 2a: Propagate Added Outputs Through Spmd/Group Wrappers
 

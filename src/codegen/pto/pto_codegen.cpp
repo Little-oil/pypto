@@ -592,7 +592,7 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
   [[nodiscard]] bool UsesSubblockOp() const { return uses_subblock_op_; }
 
   /// Returns true when the visited body contains a tile.load that declared
-  /// CachePolicy.BYPASS. Drives PTOCodegen's decision to append the synthetic
+  /// LoadL2Hint.NotAlloc*. Drives PTOCodegen's decision to append the synthetic
   /// i64 device L2 no-cache alias offset param to the emitted func.func
   /// signature; the kernel wrapper resolves it from
   /// intrinsic.h::get_l2_cache_offset(args) at dispatch time, and each
@@ -629,7 +629,7 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
         uses_subblock_op_ = true;
       }
       if (!uses_l2_bypass_load_ && ir::IsOp(op, "tile.load") &&
-          static_cast<ir::CachePolicy>(op->GetKwarg<int>("cache", 0)) == ir::CachePolicy::kBypass) {
+          ir::IsNotAllocLoadL2Hint(op->GetKwarg<int>("l2_hint", 0))) {
         uses_l2_bypass_load_ = true;
       }
       if (ir::IsOp(op, "system.set_ffts") && op->args_.size() == 1) {

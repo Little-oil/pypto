@@ -587,7 +587,7 @@ class PTOCodegen : public CodegenBase {
    * the kernel wrapper reads ``intrinsic.h::get_l2_cache_offset(args)`` once at
    * entry and forwards it through this hidden ``i64`` parameter, appended after
    * the SDMA workspace pointer and before the SPMD identity parameters. Each
-   * ``tile.load`` that declared ``CachePolicy.BYPASS`` passes it as
+   * ``tile.load`` that declared ``LoadL2Hint.NotAlloc*`` passes it as
    * ``pto.tload``'s ``offset``, which PTOAS >= v0.64 adds to that one load's
    * source address. Returns empty when the function has no bypassing load, and
    * on every architecture but a2a3: the double mapping is an a2a3 property, and
@@ -1098,7 +1098,7 @@ class PTOCodegen : public CodegenBase {
     std::string sdma_workspace_arg_ssa;
 
     /// SSA name of the synthetic device L2 no-cache alias offset param. Empty
-    /// when no tile.load in the current function declared CachePolicy.BYPASS,
+    /// when no tile.load in the current function declared LoadL2Hint.NotAlloc*,
     /// and on every architecture but a2a3.
     std::string l2_cache_offset_arg;
 

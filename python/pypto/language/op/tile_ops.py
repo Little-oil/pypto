@@ -179,7 +179,6 @@ from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import (
     AccPhase,
     AtomicType,
-    CachePolicy,
     Expr,
     LoadL2Hint,
     MemorySpace,
@@ -403,7 +402,6 @@ def load(
     valid_shape: Sequence[IntLike] | None = None,
     target_memory: MemorySpace | None = None,
     clamp: bool = False,
-    cache: CachePolicy | None = None,
     l2_hint: LoadL2Hint | None = None,
 ) -> Tile:
     """Copy data from tensor to unified buffer (tile).
@@ -435,23 +433,10 @@ def load(
             load asserts ``offsets + valid_shape`` stays inside the source and is
             rejected when that provably fails; ``clamp=True`` cuts the request back
             to the source edge instead.
-        cache: GM cache-access policy for *this* read. ``None`` (the default)
-            states no policy, leaving any scope-level declaration to apply.
-            ``CachePolicy.BYPASS`` declares a streaming read — it asserts the
-            bytes have no reuse worth caching and that nothing writes them while
-            the kernel runs; coherency is the author's contract (see
-            [`pl.set_cache_policy`][pypto.language.tensor.set_cache_policy] for
-            the full contract). An explicit value here always wins over a
-            scope-level ``pl.set_cache_policy`` declaration for the same tensor,
-            in both directions: ``cache=CachePolicy.DEFAULT`` opts this one read
-            back into the cache inside a bypassing scope. Requires PTOAS >= v0.64,
-            where a BYPASS read compiles to a load issued against the page's
-            uncached alias on A2/A3 — the only architecture that maps GM twice,
-            and the only one where the declaration has an effect today; DEFAULT
-            emits nothing.
         l2_hint: Explicit per-load PTO-ISA hint. ``None`` leaves the hint
             unspecified; an explicit ``NormalFirstVictim`` retains its zero
-            encoding. This is distinct from the semantic ``cache`` policy.
+            encoding and overrides a scope load hint. A2/A3 NotAlloc modes
+            use the runtime no-cache address alias.
 
     Returns:
         Tile wrapping the load operation
@@ -460,7 +445,7 @@ def load(
         >>> # 2D load
         >>> tile = load(tensor, offsets=[0, 0], shapes=[32, 32])
         >>> # streaming read, no cache reuse expected
-        >>> tile = load(tensor, [0, 0], [32, 32], cache=pl.CachePolicy.BYPASS)
+        >>> tile = load(tensor, [0, 0], [32, 32], l2_hint=pl.LoadL2Hint.NotAllocClean)
     """
     if l2_hint is not None and not isinstance(l2_hint, LoadL2Hint):
         raise TypeError(f"load l2_hint must be LoadL2Hint, got {type(l2_hint).__name__}")
@@ -473,7 +458,6 @@ def load(
         _normalize_intlike(valid_shape),
         target_memory,
         clamp=clamp,
-        cache=None if cache is None else int(cache),
         l2_hint=None if l2_hint is None else int(l2_hint),
     )
     return Tile(expr=call_expr)

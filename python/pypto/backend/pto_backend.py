@@ -742,7 +742,7 @@ def _uses_l2_cache_offset(func: _ir_core.Function) -> bool:
     """Return whether the wrapper must forward the device L2 no-cache alias offset.
 
     True when the function contains a ``tile.load`` that declared
-    ``CachePolicy.BYPASS`` and the target reaches the uncached mapping through
+    ``LoadL2Hint.NotAlloc*`` and the target reaches the uncached mapping through
     an address alias — a2a3 only. Mirrors the C++ condition in
     ``PTOCodegen``'s signature emission (``MemRefCollectorVisitor::
     UsesL2BypassLoad`` gated on ``GetPtoTargetArch()``), because the wrapper's
@@ -762,7 +762,7 @@ def _uses_l2_cache_offset(func: _ir_core.Function) -> bool:
                 return
             ir_op = getattr(op, "op", None)
             if isinstance(ir_op, _ir_core.Op) and ir_op.name == _TILE_LOAD_OP:
-                if int(op.kwargs.get("cache", 0)) == int(_ir_core.CachePolicy.BYPASS):
+                if int(op.kwargs.get("l2_hint", 0)) in (4, 5, 6):
                     self.found = True
                     return
             super().visit_call(op)

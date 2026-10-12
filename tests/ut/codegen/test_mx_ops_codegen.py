@@ -116,19 +116,8 @@ class TestMxMatmulCodegen:
             "sizes = [%c1_index, %c1_index, %c1_index, %c16_index, %c2_index]" in line for line in partitions
         )
 
-    def test_mx_scale_load_joins_layout_and_cache_policy_in_one_attr_dict(self):
-        """An MX scale load declared `cache=BYPASS` carries BOTH attributes.
-
-        The MX ``layout`` and the L2-bypass ``cache_policy`` (pypto #2680) can
-        co-occur on one ``pto.tload``, and PTOAS takes all present attributes in
-        a single dict — two dicts, or a dropped attribute, would not assemble.
-        ``layout`` stays first so an MX load that declares no policy keeps its
-        byte-identical form.
-
-        Verified against a real ptoas v0.61 run of this emit (accepted; the load
-        lowers to ``TLOAD<pto::TLoadL2Hint::NotAllocKeep>``). UTs themselves run
-        with ``skip_ptoas=True``, so the assertion here is on the emitted text.
-        """
+    def test_mx_scale_load_preserves_layout_with_isa_l2_hint(self):
+        """A5 MX loads retain layout and forward the selected ISA hint separately."""
 
         @pl.program
         class Program:
@@ -137,14 +126,16 @@ class TestMxMatmulCodegen:
                 self,
                 a_s: pl.Tensor[[128, 8], pl.FP8E8M0, pl.MX_A_ZZ],
             ):
-                _ = pl.load(a_s, [0, 0], [16, 2], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.BYPASS)
+                _ = pl.load(
+                    a_s, [0, 0], [16, 2], target_memory=pl.Mem.Mat, l2_hint=pl.LoadL2Hint.NotAllocClean
+                )
 
         mlir = _emit_incore_mlir(Program)
         tloads = [line for line in mlir.splitlines() if "pto.tload" in line]
         assert len(tloads) == 1, f"expected one MX scale load:\n{mlir}"
-        assert (
-            "{layout = #pto.layout<mx_a_zz>, cache_policy = #pto.load_cache_policy<l2_bypass>}" in tloads[0]
-        ), tloads[0]
+        assert "{layout = #pto.layout<mx_a_zz>}" in tloads[0], tloads[0]
+        assert "__pypto_l2_hint_begin load NotAllocClean" in mlir
+        assert "cache_policy" not in tloads[0]
 
     def test_mx_scale_load_rejects_unprovable_dynamic_offset(self):
         """Unaligned / unprovable dynamic MX offsets fail at BlockMxScaleTensorViews."""

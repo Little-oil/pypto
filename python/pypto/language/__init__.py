@@ -43,7 +43,6 @@ from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import (
     AccPhase,
     AtomicType,
-    CachePolicy,
     CompactMode,
     ForKind,
     FunctionType,
@@ -123,7 +122,7 @@ from .op.tensor_ops import (
     paged_gather,
     random,
     scatter,
-    set_cache_policy,
+    set_l2_hint,
 )
 from .op.tile_ops import (
     MemRefType,
@@ -508,7 +507,7 @@ __all__ = [
     "spmd_submit",
     "no_dep",
     "dump_tag",
-    "set_cache_policy",
+    "set_l2_hint",
     "scatter",
     "arange",
     "gather",
@@ -522,7 +521,6 @@ __all__ = [
     "ForKind",
     "AccPhase",
     "AtomicType",
-    "CachePolicy",
     "LoadL2Hint",
     "StoreL2Hint",
     "KernelType",

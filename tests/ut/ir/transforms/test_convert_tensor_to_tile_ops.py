@@ -7717,10 +7717,66 @@ class TestSynthesizedOpSpans:
         assert exp_after.span.begin_line > func.span.begin_line
 
 
-class TestCachePolicyConversion:
-    """``pl.set_cache_policy`` reaches this pass as the outlined-function attr
-    ``cache_policy`` — ``(param index, CachePolicy-as-int)`` pairs stamped by
-    OutlineIncoreScopes (pass 9) — and leaves it as a ``cache`` kwarg on every
+@pytest.mark.parametrize("store_hint", list(pl.StoreL2Hint))
+@pytest.mark.parametrize("implicit", [False, True])
+def test_scope_store_hints_follow_repeated_destination_rebindings(store_hint, implicit):
+    first = (
+        "out = pl.assemble(out, pl.add(x, 1.0), [0, 0])"
+        if implicit
+        else ("t = pl.load(x, [0, 0], [32, 32])\n        out = pl.store(t, [0, 0], out)")
+    )
+    second = (
+        "out = pl.assemble(out, pl.add(x, 2.0), [0, 0])" if implicit else ("out = pl.store(t, [0, 0], out)")
+    )
+    source = f"""
+@pl.program
+class Stores:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, x: pl.Tensor[[32, 32], pl.FP32],
+               out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]) -> pl.Tensor[[32, 32], pl.FP32]:
+        pl.func_attr({{"store_l2_hint": [(1, {int(store_hint)})]}})
+        {first}
+        {second}
+        return out
+"""
+    program = passes.flatten_call_expr()(passes.convert_to_ssa()(pl.parse_program(source)))
+    after = passes.convert_tensor_to_tile_ops()(program)
+    kernel = after.get_function("kernel")
+    assert kernel is not None
+    stores = _find_calls_to(kernel, ir.get_op("tile.store").name)
+    assert len(stores) == 2
+    assert all(call.kwargs.get("l2_hint") == int(store_hint) for call in stores)
+    assert "store_l2_hint" not in dict(kernel.attrs)
+    assert all("l2_hint" not in call.kwargs for call in _find_calls_to(kernel, ir.get_op("tile.load").name))
+
+
+def test_scope_store_hint_preserves_explicit_zero_override_and_loop_carries():
+    @pl.program
+    class Loop:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self, x: pl.Tensor[[64, 32], pl.FP32], out: pl.Out[pl.Tensor[[64, 32], pl.FP32]]
+        ) -> pl.Tensor[[64, 32], pl.FP32]:
+            pl.func_attr({"store_l2_hint": [(1, 4)]})
+            for i, (carried,) in pl.range(2, init_values=(out,)):
+                t = pl.load(x, [i * 32, 0], [32, 32])
+                first = pl.store(t, [i * 32, 0], carried, l2_hint=pl.StoreL2Hint.NormalFirstVictim)
+                second = pl.store(t, [i * 32, 0], first)
+                out = pl.yield_(second)
+            return out
+
+    after = passes.convert_tensor_to_tile_ops()(passes.convert_to_ssa()(Loop))
+    kernel = after.get_function("kernel")
+    assert kernel is not None
+    stores = _find_calls_to(kernel, ir.get_op("tile.store").name)
+    assert [call.kwargs.get("l2_hint") for call in stores] == [0, 4]
+    assert "store_l2_hint" not in dict(kernel.attrs)
+
+
+class TestLoadL2HintConversion:
+    """``pl.set_l2_hint`` reaches this pass as the outlined-function attr
+    ``load_l2_hint`` — ``(param index, LoadL2Hint-as-int)`` pairs stamped by
+    OutlineIncoreScopes (pass 9) — and leaves it as a ``l2_hint`` kwarg on every
     ``tile.load`` that reads a declared param. The attr itself is erased here:
     its indices go stale the moment a later pass grows the param list, so
     nothing downstream may see it.
@@ -7733,14 +7789,14 @@ class TestCachePolicyConversion:
 
     Precedence (a per-access kwarg beats the scope declaration) is covered from
     both sides: BYPASS stated on a load under no declaration, and an explicit
-    ``cache=CachePolicy.DEFAULT`` re-caching one access inside a bypassing
+    ``l2_hint=LoadL2Hint.NormalFirstVictim`` re-caching one access inside a bypassing
     scope. The latter is why the load builder distinguishes an unstated policy
     (``None``, kwarg omitted) from an explicit ``DEFAULT`` (``0``, kwarg
     recorded) — collapsing the two would leave this pass unable to tell the
     override from an unannotated load.
     """
 
-    _BYPASS = int(pl.CachePolicy.BYPASS)
+    _BYPASS = int(pl.LoadL2Hint.NotAllocClean)
 
     @staticmethod
     def _loads_by_source(func: ir.Function) -> dict[str, ir.Call]:
@@ -7765,7 +7821,7 @@ class TestCachePolicyConversion:
                 b: pl.Tensor[[128, 256], pl.FP32],
                 out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
             ) -> pl.Tensor[[256, 256], pl.FP32]:
-                pl.func_attr({"cache_policy": [(1, 1)]})
+                pl.func_attr({"load_l2_hint": [(1, 5)]})
                 c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
                 out = pl.assemble(out, c, [0, 0])
                 return out
@@ -7815,10 +7871,10 @@ class TestCachePolicyConversion:
         after = passes.convert_tensor_to_tile_ops()(self._declared_matmul())
         loads = self._loads_by_source(_require_function(after, "mm"))
 
-        assert loads["b"].kwargs["cache"] == self._BYPASS
+        assert loads["b"].kwargs["l2_hint"] == self._BYPASS
         # The other operand is untouched: a declaration names one tensor, not
         # the kernel.
-        assert "cache" not in loads["a"].kwargs
+        assert "l2_hint" not in loads["a"].kwargs
 
     def test_undeclared_kernel_gets_no_cache_kwarg(self):
         """Control for the test above: with no attr, no load is stamped."""
@@ -7826,7 +7882,7 @@ class TestCachePolicyConversion:
         loads = self._loads_by_source(_require_function(after, "mm"))
 
         assert set(loads) == {"a", "b"}
-        assert all("cache" not in load.kwargs for load in loads.values())
+        assert all("l2_hint" not in load.kwargs for load in loads.values())
 
     def test_function_attr_is_erased_by_the_conversion(self):
         """Param indices stay valid only across passes 8..10 — later passes both
@@ -7834,8 +7890,8 @@ class TestCachePolicyConversion:
         outlive its consumer."""
         after = passes.convert_tensor_to_tile_ops()(self._declared_matmul())
 
-        assert "cache_policy" not in dict(_require_function(after, "mm").attrs)
-        assert "cache_policy" not in dict(_require_function(after, "main").attrs)
+        assert "load_l2_hint" not in dict(_require_function(after, "mm").attrs)
+        assert "load_l2_hint" not in dict(_require_function(after, "main").attrs)
 
     def test_preexisting_tile_load_of_a_declared_param_is_stamped(self):
         """A load already in the body honours the declaration exactly as a
@@ -7850,7 +7906,7 @@ class TestCachePolicyConversion:
                 y: pl.Tensor[[64, 64], pl.FP32],
                 out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
-                pl.func_attr({"cache_policy": [(0, 1)]})
+                pl.func_attr({"load_l2_hint": [(0, 5)]})
                 tx: pl.Tile[[64, 64], pl.FP32] = pl.load(x, [0, 0], [64, 64])
                 ty: pl.Tile[[64, 64], pl.FP32] = pl.load(y, [0, 0], [64, 64])
                 s: pl.Tile[[64, 64], pl.FP32] = pl.tile.add(tx, ty)
@@ -7868,15 +7924,15 @@ class TestCachePolicyConversion:
                 return z
 
         loads = self._loads_by_source(_require_function(passes.convert_tensor_to_tile_ops()(Before), "k"))
-        assert loads["x"].kwargs["cache"] == self._BYPASS
-        assert "cache" not in loads["y"].kwargs
+        assert loads["x"].kwargs["l2_hint"] == self._BYPASS
+        assert "l2_hint" not in loads["y"].kwargs
 
     def test_explicit_kwarg_survives_and_is_not_duplicated(self):
         """The per-access surface stands on its own, and coincides cleanly with
         the scope declaration.
 
         ``y`` is annotated at the access with no declaration behind it; ``x``
-        carries both. Either way the load ends up with exactly one ``cache``
+        carries both. Either way the load ends up with exactly one ``l2_hint``
         kwarg holding BYPASS — the pass never appends a second one over a value
         the load already states.
         """
@@ -7889,9 +7945,13 @@ class TestCachePolicyConversion:
                 y: pl.Tensor[[64, 64], pl.FP32],
                 out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
-                pl.func_attr({"cache_policy": [(0, 1)]})
-                tx: pl.Tile[[64, 64], pl.FP32] = pl.load(x, [0, 0], [64, 64], cache=pl.CachePolicy.BYPASS)
-                ty: pl.Tile[[64, 64], pl.FP32] = pl.load(y, [0, 0], [64, 64], cache=pl.CachePolicy.BYPASS)
+                pl.func_attr({"load_l2_hint": [(0, 5)]})
+                tx: pl.Tile[[64, 64], pl.FP32] = pl.load(
+                    x, [0, 0], [64, 64], l2_hint=pl.LoadL2Hint.NotAllocClean
+                )
+                ty: pl.Tile[[64, 64], pl.FP32] = pl.load(
+                    y, [0, 0], [64, 64], l2_hint=pl.LoadL2Hint.NotAllocClean
+                )
                 s: pl.Tile[[64, 64], pl.FP32] = pl.tile.add(tx, ty)
                 out = pl.store(s, [0, 0], out)
                 return out
@@ -7909,11 +7969,11 @@ class TestCachePolicyConversion:
         loads = self._loads_by_source(_require_function(passes.convert_tensor_to_tile_ops()(Before), "k"))
         for name in ("x", "y"):
             keys = [key for key, _ in loads[name].kwargs.items()]
-            assert keys.count("cache") == 1, f"duplicate cache kwarg on '{name}'"
-            assert loads[name].kwargs["cache"] == self._BYPASS
+            assert keys.count("l2_hint") == 1, f"duplicate cache kwarg on '{name}'"
+            assert loads[name].kwargs["l2_hint"] == self._BYPASS
 
     def test_explicit_default_on_a_load_survives_and_beats_the_declaration(self):
-        """An explicit ``cache=CachePolicy.DEFAULT`` re-caches one access.
+        """An explicit ``l2_hint=LoadL2Hint.NormalFirstVictim`` re-caches one access.
 
         Regression: the load builder used to omit the kwarg on any falsy policy,
         so an explicit DEFAULT was indistinguishable from an unstated one and
@@ -7928,8 +7988,10 @@ class TestCachePolicyConversion:
                 x: pl.Tensor[[64, 64], pl.FP32],
                 out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
-                pl.func_attr({"cache_policy": [(0, 1)]})
-                t: pl.Tile[[64, 64], pl.FP32] = pl.load(x, [0, 0], [64, 64], cache=pl.CachePolicy.DEFAULT)
+                pl.func_attr({"load_l2_hint": [(0, 5)]})
+                t: pl.Tile[[64, 64], pl.FP32] = pl.load(
+                    x, [0, 0], [64, 64], l2_hint=pl.LoadL2Hint.NormalFirstVictim
+                )
                 out = pl.store(t, [0, 0], out)
                 return out
 
@@ -7943,7 +8005,7 @@ class TestCachePolicyConversion:
                 return y
 
         loads = self._loads_by_source(_require_function(passes.convert_tensor_to_tile_ops()(Before), "k"))
-        assert loads["x"].kwargs["cache"] == int(pl.CachePolicy.DEFAULT)
+        assert loads["x"].kwargs["l2_hint"] == int(pl.LoadL2Hint.NormalFirstVictim)
 
     def test_an_unstated_policy_still_takes_the_declaration(self):
         """The control for the test above: no kwarg on the load means the
@@ -7956,7 +8018,7 @@ class TestCachePolicyConversion:
                 x: pl.Tensor[[64, 64], pl.FP32],
                 out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
-                pl.func_attr({"cache_policy": [(0, 1)]})
+                pl.func_attr({"load_l2_hint": [(0, 5)]})
                 t: pl.Tile[[64, 64], pl.FP32] = pl.load(x, [0, 0], [64, 64])
                 out = pl.store(t, [0, 0], out)
                 return out
@@ -7971,7 +8033,7 @@ class TestCachePolicyConversion:
                 return y
 
         loads = self._loads_by_source(_require_function(passes.convert_tensor_to_tile_ops()(Before), "k"))
-        assert loads["x"].kwargs["cache"] == self._BYPASS
+        assert loads["x"].kwargs["l2_hint"] == self._BYPASS
 
     def test_a_loop_carried_source_inherits_the_declaration(self):
         """A load whose source is an ``IterArg`` still resolves to the param.
@@ -7989,7 +8051,7 @@ class TestCachePolicyConversion:
                 x: pl.Tensor[[64, 64], pl.FP32],
                 out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
-                pl.func_attr({"cache_policy": [(0, 1)]})
+                pl.func_attr({"load_l2_hint": [(0, 5)]})
                 # `x` is carried, so the load inside the body reads an IterArg,
                 # not the parameter the declaration named. That is the whole
                 # point of the test: the lookup has to walk back to the param.
@@ -8012,7 +8074,7 @@ class TestCachePolicyConversion:
         carried_loads = _find_calls_to(after, ir.get_op("tile.load").name)
         assert carried_loads, "expected a tile.load in the loop body"
         for load in carried_loads:
-            assert load.kwargs["cache"] == self._BYPASS
+            assert load.kwargs["l2_hint"] == self._BYPASS
 
 
 class TestRegistryDrivenParamDirections:
