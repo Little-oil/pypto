@@ -447,5 +447,51 @@ def test_scope_optional_closure_direction_preserves_other_hint(load_hint):
     ir.assert_structural_equal(Optional, _reparse(Optional))
 
 
+@pytest.mark.parametrize("direction, other", [("load", "store"), ("store", "load")])
+def test_scope_literal_none_preserves_other_zero_hint(direction, other):
+    enum_name = "StoreL2Hint" if other == "store" else "LoadL2Hint"
+    source = f"""
+@pl.program
+class Optional:
+    @pl.function
+    def main(self, x: pl.InOut[pl.Tensor[[32, 32], pl.FP32]]) -> pl.Tensor[[32, 32], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP):
+            pl.set_l2_hint(x, {direction}=None, {other}=pl.{enum_name}.NormalFirstVictim)
+            t = pl.load(x, [0, 0], [32, 32])
+            x = pl.store(t, [0, 0], x)
+        return x
+"""
+    program = pl.parse_program(source)
+    text = ir.python_print(program)
+    assert f"{direction}=pl." not in text
+    assert f"{other}=pl.{enum_name}.NormalFirstVictim" in text
+    ir.assert_structural_equal(program, _reparse(program))
+    ir.assert_structural_equal(program, ir.deserialize(ir.serialize(program)))
+
+
+@pytest.mark.parametrize(
+    "load_hint, store_hint, diagnostic",
+    [
+        (pl.StoreL2Hint.NormalFirstVictim, None, "Expected pl.LoadL2Hint"),
+        (None, pl.LoadL2Hint.NormalFirstVictim, "Expected pl.StoreL2Hint"),
+        (0, pl.StoreL2Hint.NormalFirstVictim, "Expected pl.LoadL2Hint"),
+        (False, pl.StoreL2Hint.NormalFirstVictim, "Expected pl.LoadL2Hint"),
+        (None, None, "at least one non-None hint"),
+    ],
+)
+def test_scope_rejects_invalid_captured_hints(load_hint, store_hint, diagnostic):
+    with pytest.raises(ParserSyntaxError, match=diagnostic):
+
+        @pl.program
+        class Invalid:
+            @pl.function
+            def main(self, x: pl.InOut[pl.Tensor[[32, 32], pl.FP32]]) -> pl.Tensor[[32, 32], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    pl.set_l2_hint(x, load=load_hint, store=store_hint)
+                    t = pl.load(x, [0, 0], [32, 32])
+                    x = pl.store(t, [0, 0], x)
+                return x
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
