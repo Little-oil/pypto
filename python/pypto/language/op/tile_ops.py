@@ -435,8 +435,9 @@ def load(
             to the source edge instead.
         l2_hint: Explicit per-load PTO-ISA hint. ``None`` leaves the hint
             unspecified; an explicit ``NormalFirstVictim`` retains its zero
-            encoding and overrides a scope load hint. A2/A3 NotAlloc modes
-            use the runtime no-cache address alias.
+            encoding and overrides a scope load hint. All targets forward the
+            selected ISA enum. A2/A3 NotAlloc modes require runtime support
+            for the ISA's no-cache address alias configuration.
 
     Returns:
         Tile wrapping the load operation

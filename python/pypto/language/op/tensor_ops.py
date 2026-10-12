@@ -372,9 +372,10 @@ def set_l2_hint(
     declaration, including an explicit zero-valued normal hint. Tensor
     operations inherit the hints on their generated transfers.
 
-    A2/A3 nonallocating loads use the runtime's nocache address alias; the
-    three NotAlloc load modes share that implementation. A5 forwards each
-    mode to the ISA cache-control field. A nonallocating scope read may not
+    The selected enums are forwarded to ISA on A2/A3 and A5. A2/A3's three
+    NotAlloc load modes share the ISA's nocache address alias implementation,
+    which requires runtime initialization. A5 selects each mode through its
+    cache-control field. A nonallocating scope read may not
     target a tensor the same scope writes. The caller must also prevent
     concurrent cached writes to the same bytes outside the scope.
 

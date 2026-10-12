@@ -3,6 +3,7 @@
 `l2_hint` 是前端控制 PTO-ISA L2 缓存的统一接口。load 使用
 `pl.LoadL2Hint`，store 使用 `pl.StoreL2Hint`。枚举值保留 ISA 编码；
 其中 `NotAllocClean` 在 load 与 store 中的编码不同。
+PyPTO 在所有架构上保留调用方选择的精确枚举，不会将某一种 `NotAlloc*` 替换成另一种。
 
 | LoadL2Hint | Encoding | StoreL2Hint | Encoding |
 | ---------- | -------- | ----------- | -------- |
@@ -68,16 +69,29 @@ def matmul(
 | 架构 | Normal load hint | NotAlloc load hint | Store hint |
 | ---- | ---------------- | ------------------ | ---------- |
 | A5 | 精确 ISA 模板枚举，选择 `l2CacheCtl` | 精确 ISA 模板枚举，选择 `l2CacheCtl` | 精确 ISA 模板枚举，选择 `l2CacheCtl` |
-| A2/A3 | 接受，但无独立硬件缓存控制效果 | 三种模式均使用运行时 nocache 地址别名 | 接受，但无独立硬件缓存控制效果 |
+| A2/A3 | 精确 ISA 模板枚举；0/1/2 均为相同的正常读取行为 | 精确 ISA 模板枚举；4/5/6 均使用相同的 ISA nocache 地址别名 | 精确 ISA 模板枚举；无独立硬件缓存控制效果 |
 
-A2/A3 通过 `get_l2_cache_offset(args)` 获取设备相关的偏移，并作为合成的内核参数传递。
-现有 PTOAS 利用 `pto.tload` 的 `cache_policy = #pto.load_cache_policy<l2_bypass>`
-属性和 `offset` 操作数，将偏移恰好加一次。这是汇编器内部降级细节，不是第二套前端策略。
-设备返回偏移 0 时执行普通读取。该路径不会再添加 ISA NotAlloc 模板参数，因为 A2/A3
-ISA 实现会加上其全局配置的偏移，而 PyPTO 运行时未初始化该全局配置。
-A2/A3 无法像 A5 一样通过缓存控制字段区分 Keep/Clean/Drop。
+例如，选择 `pl.LoadL2Hint.NotAllocDrop` 后，A2/A3 与 A5 都生成相同的枚举：
 
-其他 hint 使用普通的 `pto.tload` / `pto.tstore`，并由 `emitc.verbatim` 标记包围。
+```cpp
+TLOAD<pto::TLoadL2Hint::NotAllocDrop>(dst, src);
+```
+
+在 A2/A3 上，ISA 对三种 `NotAlloc*` load hint 均将
+`g_opL2CacheHintCfg.l2Cacheoffset` 加到源地址。运行时必须在执行前为该全局配置提供有效
+存储并完成初始化；ISA 读取偏移，不查询驱动。设备偏移来自 `rtGetL2CacheOffset` 暴露的
+驱动查询接口，CANN 原生 ELF 加载器在初始化 L2 配置时直接调用相同的驱动查询。
+全局配置与显式查询是传递同一个设备相关偏移的不同方式。
+PyPTO 不对源地址加偏移，也不传递合成的 offset 参数。A5 则将枚举传给 `l2CacheCtl`，
+不修改源地址。
+
+当前 simpler 内核加载器只提取 `.text`，尚未接通 ISA 全局配置的存储、重定位和初始化。
+因此 A2/A3 的 `NotAlloc*` load 支持代码生成与编译，但在
+[simpler #2548](https://github.com/hw-native-sys/simpler/issues/2548) 解决前不支持板上执行。
+全局配置所在的数据段未加载时，源码中的零初始化不能作为安全回退。
+CPU 模拟也不能验证设备上的缓存行为。
+
+显式 hint 使用普通的 `pto.tload` / `pto.tstore`，并由 `emitc.verbatim` 标记包围。
 PyPTO 的 C++ 最终处理器将标记转换为选定的 PTO-ISA 模板参数，保留 store phase、atomic、
 quantization 和 ReLU 参数。PTOAS 仍能分析搬运操作的内存效果，用于同步与内存规划。
 两种内存规划器均支持。无需修改 PTOAS 源码，固定版本为 v0.65。
@@ -93,8 +107,7 @@ pl.set_l2_hint(t, load=..., store=...)        parser consumes declaration
   -> Scope attrs load_l2_hint_vars / store_l2_hint_vars  (Var, encoding)
   -> Function attrs load_l2_hint / store_l2_hint         (param index, encoding)
   -> tile.load / tile.store kwarg l2_hint                exact encoding
-  -> runtime address alias on A2/A3 NotAlloc loads
-     or selected PTO-ISA template enum for other transfers
+  -> selected PTO-ISA template enum on A2/A3 and A5       exact caller choice
 ```
 
 [OutlineIncoreScopes](../passes/09-outline_incore_scopes.md) 消费作用域元数据，并按参数索引
@@ -105,7 +118,12 @@ pl.set_l2_hint(t, load=..., store=...)        parser consumes declaration
 ## 迁移已删除的接口
 
 `CachePolicy`、`pl.load(cache=...)` 和 `pl.set_cache_policy` 已删除。
-将 `cache=CachePolicy.BYPASS` 改为 `l2_hint=pl.LoadL2Hint.NotAllocClean`；作用域 bypass
-声明改为 `pl.set_l2_hint(t, load=pl.LoadL2Hint.NotAllocClean)`。显式的
-`CachePolicy.DEFAULT` 覆盖改为 `pl.LoadL2Hint.NormalFirstVictim`；无需覆盖时可省略参数。
-A2/A3 保留运行时别名路径；A5 的新 NotAlloc hint 会实际选择 ISA 缓存控制。
+显式的 `CachePolicy.DEFAULT` 覆盖改为 `l2_hint=pl.LoadL2Hint.NormalFirstVictim`；
+无需覆盖时可省略参数。作用域覆盖使用
+`pl.set_l2_hint(t, load=pl.LoadL2Hint.NormalFirstVictim)`。
+
+迁移旧 BYPASS 读取时，应根据目标架构和工作负载选择 `NotAllocKeep`、`NotAllocClean`
+或 `NotAllocDrop`，再将用户选择传给 `l2_hint` 或 `pl.set_l2_hint` 的 `load` 参数。
+不会自动映射到编码 5。在 A2/A3 上，接通上述运行时依赖后，三者均选择相同的 ISA 地址
+别名行为。在 A5 上，三者对应不同的 ISA 模式；旧 BYPASS 没有指定其中一种模式，
+因此不能推导出唯一的替代值。store hint 独立选择，使用 `pl.StoreL2Hint`。

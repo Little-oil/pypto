@@ -3,6 +3,8 @@
 `l2_hint` is the single frontend interface for PTO-ISA L2 cache control. Use
 `pl.LoadL2Hint` for loads and `pl.StoreL2Hint` for stores. Their integer values
 are the ISA encodings; notably, `NotAllocClean` has different load/store values.
+PyPTO preserves the caller's exact enum on every target; it does not replace
+one `NotAlloc*` choice with another.
 
 | LoadL2Hint | Encoding | StoreL2Hint | Encoding |
 | ---------- | -------- | ----------- | -------- |
@@ -78,19 +80,35 @@ not configure transfers in a separately called device kernel.
 | Target | Normal load hints | NotAlloc load hints | Store hints |
 | ------ | ----------------- | ------------------- | ----------- |
 | A5 | Exact ISA template enum, selecting `l2CacheCtl` | Exact ISA template enum, selecting `l2CacheCtl` | Exact ISA template enum, selecting `l2CacheCtl` |
-| A2/A3 | Accepted; no distinct hardware cache control | All three use the runtime no-cache address alias | Accepted; no distinct hardware cache control |
+| A2/A3 | Exact ISA template enum; 0/1/2 have the same normal-load behavior | Exact ISA template enum; 4/5/6 use the same ISA no-cache address alias | Exact ISA template enum; no distinct hardware cache control |
 
-A2/A3 gets the device-specific offset from `get_l2_cache_offset(args)` and
-forwards it as a synthetic kernel argument. Stock PTOAS applies that offset
-once using `pto.tload`'s `cache_policy = #pto.load_cache_policy<l2_bypass>` and
-`offset` operand. This is an internal assembler lowering detail, not a second
-frontend policy. A device reporting offset zero performs an ordinary read.
-PyPTO does not also emit an ISA NotAlloc template on that path: the A2/A3 ISA
-implementation would add its own globally configured offset, which the PyPTO
-runtime does not populate. A2/A3 cannot distinguish Keep/Clean/Drop through the
-cache-control field as A5 does.
+For example, selecting `pl.LoadL2Hint.NotAllocDrop` emits the same enum on both
+A2/A3 and A5:
 
-For other hints, PyPTO emits ordinary `pto.tload` / `pto.tstore` operations
+```cpp
+TLOAD<pto::TLoadL2Hint::NotAllocDrop>(dst, src);
+```
+
+On A2/A3, ISA adds `g_opL2CacheHintCfg.l2Cacheoffset` to the source address for
+all three `NotAlloc*` load hints. The runtime must provide valid backing storage
+and initialize that global before execution; ISA reads the offset rather than
+querying the driver. The device offset comes from the driver query exposed by
+`rtGetL2CacheOffset`. CANN's native ELF loader reaches the same driver query
+directly when initializing its L2 configuration. The global and the explicit
+query are different ways of transporting the same device-specific offset.
+PyPTO does not add an offset to the source address or pass a synthetic offset
+argument. A5 instead forwards the enum to `l2CacheCtl` without changing the
+source address.
+
+The current simpler in-core loader extracts only `.text` and does not connect
+the ISA global's storage, relocation and initialization contract. Therefore
+A2/A3 `NotAlloc*` loads support code generation and compilation, but onboard
+execution is unsupported until [simpler #2548](https://github.com/hw-native-sys/simpler/issues/2548)
+is resolved. A source-level zero initializer is not a safe fallback when the
+global's backing section is not loaded. CPU simulation does not validate the
+device's cache behavior.
+
+For explicit hints, PyPTO emits ordinary `pto.tload` / `pto.tstore` operations
 surrounded by `emitc.verbatim` markers. Its C++ finalizer replaces those markers
 with the chosen PTO-ISA template parameter, preserving store phase, atomic,
 quantization and ReLU arguments. PTOAS still sees the transfers' memory effects
@@ -110,8 +128,7 @@ pl.set_l2_hint(t, load=..., store=...)        parser consumes declaration
   -> Scope attrs load_l2_hint_vars / store_l2_hint_vars  (Var, encoding)
   -> Function attrs load_l2_hint / store_l2_hint         (param index, encoding)
   -> tile.load / tile.store kwarg l2_hint                exact encoding
-  -> runtime address alias on A2/A3 NotAlloc loads
-     or selected PTO-ISA template enum for other transfers
+  -> selected PTO-ISA template enum on A2/A3 and A5       exact caller choice
 ```
 
 [OutlineIncoreScopes](../passes/09-outline_incore_scopes.md) consumes scope
@@ -124,9 +141,15 @@ serialization preserve both directions and explicit zero hints.
 ## Migrating the removed API
 
 `CachePolicy`, `pl.load(cache=...)` and `pl.set_cache_policy` have been removed.
-Replace `cache=CachePolicy.BYPASS` with
-`l2_hint=pl.LoadL2Hint.NotAllocClean`; replace a scope bypass declaration with
-`pl.set_l2_hint(t, load=pl.LoadL2Hint.NotAllocClean)`. Replace an explicit
-`CachePolicy.DEFAULT` override with `pl.LoadL2Hint.NormalFirstVictim`, or omit
-the argument when no override is needed. A2/A3 retains the runtime alias path;
-on A5 the new NotAlloc hint now selects ISA cache control.
+Replace an explicit `CachePolicy.DEFAULT` override with
+`l2_hint=pl.LoadL2Hint.NormalFirstVictim`, or omit the argument when no override
+is needed. For a scope override, use
+`pl.set_l2_hint(t, load=pl.LoadL2Hint.NormalFirstVictim)`.
+
+For an old BYPASS read, choose `NotAllocKeep`, `NotAllocClean` or `NotAllocDrop`
+for the target and workload, then pass that choice as `l2_hint` or as the
+`load` argument to `pl.set_l2_hint`. There is no automatic mapping to encoding
+5. On A2/A3, all three select the same ISA address-alias behavior once the
+runtime dependency above is resolved. On A5, they select distinct ISA modes;
+the old BYPASS did not specify one of these modes, so it does not determine a
+unique replacement. Store hints are independent and use `pl.StoreL2Hint`.

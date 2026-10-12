@@ -112,11 +112,7 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
       << "tile.load shapes tuple must have at least one element";
 
   const int hint = op->GetKwarg<int>("l2_hint", 0);
-  const bool alias_bypass =
-      ir::IsNotAllocLoadL2Hint(hint) && codegen.GetBackendHandler()->GetPtoTargetArch() == "a2a3";
-  // A2/A3 NotAlloc modes share the runtime's nocache address alias. Forwarding
-  // a NotAlloc ISA template as well would apply a second, uninitialized offset.
-  const bool emit_hint = op->HasKwarg("l2_hint") && !alias_bypass;
+  const bool emit_hint = op->HasKwarg("l2_hint");
 
   std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
   std::string tile_buf = codegen.GetCurrentResultTarget();
@@ -171,7 +167,6 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
   tload_line << tile_buf << " : " << tile_buf_type << ")";
 
-  std::vector<std::string> attrs;
   if (emit_hint) {
     // Stock PTOAS preserves these comments. PyPTO finalization uses them to
     // select this transfer's ISA overload; PTOAS still sees the real load's
@@ -180,33 +175,9 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
                  ir::LoadL2HintToString(static_cast<ir::LoadL2Hint>(hint)) + "\"");
   }
   if (is_mx_load) {
-    attrs.push_back("layout = #pto.layout<" + pto_layout + ">");
-  }
-  if (alias_bypass) {
-    attrs.emplace_back("cache_policy = #pto.load_cache_policy<l2_bypass>");
+    tload_line << " {layout = #pto.layout<" << pto_layout << ">}";
   }
 
-  // Default-valued attributes are omitted so an undeclared load keeps its
-  // byte-identical PTO form. PTOAS expects all present attributes in one dict
-  // (same contract as tile.store below).
-  if (!attrs.empty()) {
-    tload_line << " {";
-    for (size_t i = 0; i < attrs.size(); ++i) {
-      if (i != 0) tload_line << ", ";
-      tload_line << attrs[i];
-    }
-    tload_line << "}";
-  }
-
-  // A2/A3 NotAlloc modes all use the runtime no-cache address alias. PTOAS
-  // applies this offset once; forwarding the ISA NotAlloc template as well
-  // would attempt a second offset via ISA's uninitialized global configuration.
-  if (alias_bypass) {
-    const std::string l2_cache_offset = codegen.GetL2CacheOffsetArgSSA();
-    INTERNAL_CHECK_SPAN(!l2_cache_offset.empty(), op->span_)
-        << "Internal error: nonallocating A2/A3 load is missing its runtime L2 offset";
-    tload_line << " offset = " << l2_cache_offset << " : i64";
-  }
   codegen.Emit(tload_line.str());
   if (emit_hint) {
     codegen.Emit("emitc.verbatim \"// __pypto_l2_hint_end\"");

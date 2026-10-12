@@ -61,7 +61,7 @@ class ZeroParamPrefetchProgram:
 
 @pl.program
 class OrderedSyntheticArgsProgram:
-    """Combine every synthetic argument: dynamic shape, SDMA workspace, L2 offset, SPMD."""
+    """Combine dynamic shape, SDMA and SPMD arguments with an ISA L2 hint."""
 
     @pl.function(type=pl.FunctionType.InCore)
     def ordered(
@@ -97,7 +97,7 @@ class TestPrefetchPTOCodegen:
         assert "func.func @main(%arg0: !pto.ptr<i8>)" in mlir, mlir
 
     def test_synthetic_argument_order_matches_wrapper(self):
-        """Dynamic dims, then SDMA, then the L2 offset, then SPMD — in both call layers.
+        """Dynamic dims, then SDMA, then SPMD — in both call layers.
 
         The wrapper forwards positionally, so any disagreement between the two
         layers silently passes one runtime value as another.
@@ -115,7 +115,7 @@ class TestPrefetchPTOCodegen:
         assert re.search(
             r"func\.func @ordered\("
             r"%arg0: !pto\.ptr<f32>, %arg1: !pto\.ptr<f32>, %arg2: !pto\.ptr<f32>, "
-            r"%arg3: index, %arg4: !pto\.ptr<i8>, %__pypto_l2_cache_offset: i64, "
+            r"%arg3: index, %arg4: !pto\.ptr<i8>, "
             r"%__pypto_spmd_block_idx: i32, %__pypto_spmd_block_num: i32\)",
             signature_line,
         ), signature_line
@@ -126,10 +126,12 @@ class TestPrefetchPTOCodegen:
         call_line = next(line.strip() for line in wrapper.splitlines() if line.strip().startswith("ordered("))
         assert re.search(
             r"ordered\(prefetch_src\w*, x\w*, out\w*, ROWS, "
-            r"__pypto_sdma_workspace, __pypto_l2_cache_offset, "
+            r"__pypto_sdma_workspace, "
             r"__pypto_spmd_block_idx, __pypto_spmd_block_num\);",
             call_line,
         ), call_line
+        assert "__pypto_l2_cache_offset" not in mlir
+        assert "get_l2_cache_offset" not in wrapper
 
     def test_async_prefetch_lowers_with_partition_view(self):
         """``tprefetch_async`` takes a whole-tensor partition view plus the context."""
