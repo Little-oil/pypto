@@ -2200,6 +2200,16 @@ jobs:
               tests/st/runtime/cross_core/test_cross_core.py \
               -v --forked --platform=a5 --device=\$TASK_DEVICE"
 
+      - name: cache-policy-tests-a5
+        timeout-minutes: 30
+        run: |
+          source activate.sh
+          test -n "$DEVICE_ID" || { echo "DEVICE_ID is empty in the runner env"; exit 1; }
+          task-submit --device "$DEVICE_ID" --timeout 3600 --max-time 1200 \
+            --run "cd $GITHUB_WORKSPACE/a5-checkout && source activate.sh && python -m pytest \
+              tests/st/runtime/ops/test_cache_policy.py \
+              -v --forked --platform=a5 --device=\$TASK_DEVICE"
+
       - name: mx-tests-a5
         timeout-minutes: 60
         # Same card session shape as mixed-kernel-tests-a5. matmul_mx covers

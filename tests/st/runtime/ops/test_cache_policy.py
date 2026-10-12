@@ -26,12 +26,19 @@ resolved to the outlined kernel's parameters and applied by
 Inputs are small integers so the FP32 accumulation is exact and the comparison
 runs at ``rtol=atol=0``: a load that read the wrong address would have to
 reproduce the product by accident to pass.
+
+Explicit L2 hints are covered separately by exact elementwise addition: every
+load/store hint pair runs with both memory planners, including zero-valued hints
+and a loop containing an ordinary load beside the hinted load. Nonallocating
+load hints require A5. These cases check correctness, not cache-hit rates or
+performance; codegen unit tests separately verify the emitted ISA arguments.
 """
 
 import pypto.language as pl
 import pytest
 import torch
 from harness import st
+from pypto.pypto_core.passes import MemoryPlanner
 
 M, K, N = 64, 256, 128
 
@@ -108,6 +115,80 @@ def _golden(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
 )
 def test_cache_bypass_reads_the_same_bytes(case_run):
     """The aliased read is exact, so the declaration costs cache and nothing else."""
+    case_run.assert_passed()
+
+
+def _l2_hint_case(load_hint, store_hint, planner):
+    """Exercise explicit hints beside ordinary transfers inside a tile loop."""
+
+    @pl.jit.incore
+    def hinted_kernel(
+        x: pl.Tensor[[64, 32], pl.FP32],
+        y: pl.Tensor[[64, 32], pl.FP32],
+        out: pl.Out[pl.Tensor[[64, 32], pl.FP32]],
+    ) -> pl.Tensor[[64, 32], pl.FP32]:
+        for i, (out_iter,) in pl.range(2, init_values=(out,)):
+            a = pl.load(x, [i * 32, 0], [32, 32], l2_hint=load_hint)
+            b = pl.load(y, [i * 32, 0], [32, 32])
+            updated = pl.store(pl.add(a, b), [i * 32, 0], out_iter, l2_hint=store_hint)
+            out = pl.yield_(updated)
+        return out
+
+    @pl.jit
+    def hinted_add(
+        x: pl.Tensor[[64, 32], pl.FP32],
+        y: pl.Tensor[[64, 32], pl.FP32],
+        out: pl.Out[pl.Tensor[[64, 32], pl.FP32]],
+    ) -> pl.Tensor[[64, 32], pl.FP32]:
+        return hinted_kernel(x, y, out)
+
+    x = (torch.arange(64 * 32).reshape(64, 32) % 127 - 63).float()
+    y = (torch.arange(64 * 32).reshape(64, 32) % 31 - 15).float()
+    return st.case(
+        hinted_add,
+        x,
+        y,
+        torch.full_like(x, float("nan")),
+        name=f"l2_{load_hint.name}_{store_hint.name}_{planner.name}",
+        golden=lambda tensors: tensors["x"] + tensors["y"],
+        memory_planner=planner,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+@st.cases(
+    *[
+        _l2_hint_case(load_hint, store_hint, planner)
+        for load_hint in (
+            pl.LoadL2Hint.NormalFirstVictim,
+            pl.LoadL2Hint.NormalLastVictim,
+            pl.LoadL2Hint.NormalPersistent,
+        )
+        for store_hint in pl.StoreL2Hint
+        for planner in (MemoryPlanner.PYPTO, MemoryPlanner.PTOAS)
+    ]
+)
+def test_l2_hints_preserve_results(case_run):
+    """Normal load hints and all store hints preserve exact results on both chips."""
+    case_run.assert_passed()
+
+
+@pytest.mark.platforms("a5", "a5sim")
+@st.cases(
+    *[
+        _l2_hint_case(load_hint, store_hint, planner)
+        for load_hint in (
+            pl.LoadL2Hint.NotAllocKeep,
+            pl.LoadL2Hint.NotAllocClean,
+            pl.LoadL2Hint.NotAllocDrop,
+        )
+        for store_hint in pl.StoreL2Hint
+        for planner in (MemoryPlanner.PYPTO, MemoryPlanner.PTOAS)
+    ]
+)
+def test_l2_not_alloc_hints_preserve_results(case_run):
+    """A5-only nonallocating loads must read the right bytes for every store hint."""
     case_run.assert_passed()
 
 
