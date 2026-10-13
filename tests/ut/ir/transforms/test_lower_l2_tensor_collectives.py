@@ -382,10 +382,152 @@ def test_unsupported_collective_in_a_chip_body_is_named():
         passes.lower_l2_tensor_collectives()(ChipAllReduce)
 
 
-def test_multi_core_request_is_rejected():
-    """core_num > 1 is not implemented yet and must fail loudly, not silently."""
-    with pytest.raises(ValueError, match="only a compile-time core_num=1"):
-        passes.lower_l2_tensor_collectives()(_build_program(core_num=2))
+def _build_exchange(nr: int, signal_stride: int, core_num):
+    """One CHIP exchange over ``nr`` ranks with a ``[nr, signal_stride]`` signal."""
+    total = nr * MAX_RECV
+
+    @pl.program
+    class Exchange:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_pipeline(
+            self,
+            stage: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+            data: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, signal_stride], pl.INT32]],
+            counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+            recv: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[total, SIZE], pl.FP32]:
+            return pld.tensor.all_to_all_v(stage, data, signal, counts, recv, core_num=core_num)
+
+    return Exchange
+
+
+def _kernel_call(program: ir.Program) -> ir.Call:
+    """The single call to the synthesized builtin kernel in ``chip_pipeline``."""
+    pipeline = _get_func(program, "chip_pipeline")
+    assert pipeline is not None
+    calls = [c for c in _collect_calls(pipeline.body) if c.op.name == _KERNEL_NAME]
+    assert len(calls) == 1, [c.op.name for c in _collect_calls(pipeline.body)]
+    return calls[0]
+
+
+def test_single_block_request_attaches_no_launch_spec():
+    """``core_num=1`` keeps the rail exactly as it was: no launch-spec attrs.
+
+    ``B == 1`` needs no gang launch, and leaving the call untouched keeps the
+    emitted orchestration byte-identical to what shipped before multi-AIV.
+    """
+    call = _kernel_call(passes.lower_l2_tensor_collectives()(_build_exchange(NR, 1, 1)))
+    assert "core_num" not in call.attrs
+    assert "sync_start" not in call.attrs
+
+
+# RFC #2521 worked-example table, run through the *compiler's* fold. The HOST
+# rail's entry has its own, independently-compiled copy of the formula (pinned
+# in test_host_orch_distributed.py); asserting both against the same table is
+# what keeps the two implementation sites from drifting. Each row is
+# (P, requested L, admitted B).
+_RFC_2521_BLOCK_TABLE = (
+    (8, 1, 1),
+    (8, 7, 7),
+    (8, 8, 8),
+    (8, 10, 8),
+    (8, 15, 8),
+    (8, 16, 16),
+    (16, 7, 7),
+    (16, 16, 16),
+)
+
+
+@pytest.mark.parametrize(("p", "requested", "blocks"), _RFC_2521_BLOCK_TABLE)
+def test_launch_spec_carries_the_folded_block_count(p, requested, blocks):
+    """The call asks the runtime for ``B = CalAllToAllVBlocks(P, L)``, never ``L``.
+
+    ``(8, 10) -> 8`` is the row that distinguishes the two: the request is not a
+    multiple of P, so the gang is rounded down to whole peers.
+    """
+    program = passes.lower_l2_tensor_collectives()(_build_exchange(p, max(blocks, 1), requested))
+    call = _kernel_call(program)
+    if blocks == 1:
+        assert "core_num" not in call.attrs
+        return
+    core_num = call.attrs["core_num"]
+    assert isinstance(core_num, ir.ConstInt), type(core_num).__name__
+    assert core_num.value == blocks
+    # The block-aware barrier needs every admitted block to start together; the
+    # runtime rejects an over-capacity sync-start launch instead of part-starting it.
+    assert call.attrs["sync_start"] is True
+
+
+def test_launch_spec_does_not_change_the_kernel_abi():
+    """Five operands + the CommCtx suffix, whatever ``core_num`` is.
+
+    The launch spec rides the call's attrs, which are not parameters. Making
+    ``core_num`` a kernel parameter once shifted the CommContext off the shared
+    kernel's fixed ``args[5]`` and parked a block in ``ExchangeBarrier`` until
+    the watchdog fired, so the signature must not depend on the request.
+    """
+    single = passes.lower_l2_tensor_collectives()(_build_exchange(4, 4, 1))
+    multi = passes.lower_l2_tensor_collectives()(_build_exchange(4, 4, 4))
+    expected = ["input", "target", "signal", "send_counts", "recv_counts"]
+    for program in (single, multi):
+        kernel = _get_func(program, _KERNEL_NAME)
+        assert kernel is not None
+        assert [p.name_hint for p in kernel.params] == expected
+        assert len(_kernel_call(program).args) == len(expected)
+
+
+def test_capacity_check_uses_the_folded_block_count_not_the_request():
+    """``L=10, P=8, S=8`` is legal: ``B`` folds to 8, so a stride of 8 suffices.
+
+    Comparing the stride against the raw request would reject this request even
+    though only eight blocks launch.
+    """
+    call = _kernel_call(passes.lower_l2_tensor_collectives()(_build_exchange(8, 8, 10)))
+    assert call.attrs["core_num"].value == 8
+
+
+def test_signal_stride_below_the_launched_blocks_is_rejected():
+    """``S < B`` is a defect, not something the kernel should silently clamp.
+
+    Same condition, and the same wording, as the HOST rail's entry check.
+    """
+    with pytest.raises(
+        ValueError, match=r"signal stride \(1\) is smaller than the admitted block count \(2\)"
+    ):
+        passes.lower_l2_tensor_collectives()(_build_exchange(2, 1, 2))
+
+
+@pytest.mark.parametrize("requested", [2**31, 2**40])
+def test_core_num_above_int32_is_rejected(requested):
+    """A static request past ``INT32_MAX`` can never be honoured, so it is rejected up front.
+
+    The launch width is a 32-bit count and the HOST entry bounds ``core_num`` to
+    ``[1, INT32_MAX]`` the same way; folding it instead would overflow ``B``.
+    """
+    with pytest.raises(ValueError, match=r"core_num must be in \[1, 2147483647\]"):
+        passes.lower_l2_tensor_collectives()(_build_exchange(NR, 1, requested))
+
+
+def test_dynamic_core_num_is_rejected_with_guidance():
+    """A runtime ``core_num`` is out of scope for this cut and must say so."""
+
+    @pl.program
+    class DynamicRequest:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_pipeline(
+            self,
+            stage: pl.InOut[pld.DistributedTensor[[TOTAL, SIZE], pl.FP32]],
+            data: pl.InOut[pld.DistributedTensor[[TOTAL, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[NR, 4], pl.INT32]],
+            counts: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
+            recv: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
+            n: pl.Scalar[pl.INDEX],
+        ) -> pld.DistributedTensor[[TOTAL, SIZE], pl.FP32]:
+            return pld.tensor.all_to_all_v(stage, data, signal, counts, recv, core_num=n)
+
+    with pytest.raises(ValueError, match="a runtime core_num is not supported on this rail yet"):
+        passes.lower_l2_tensor_collectives()(DynamicRequest)
 
 
 def test_int8_synthesizes_int8_variant():

@@ -7,7 +7,7 @@ rewrites a `pld.tensor.*` collective written in a **CHIP orchestration body**
 into a call to a compiler-synthesized AIV kernel, so the collective becomes one
 ordinary task inside the caller's own pipeline.
 
-Today it handles `pld.tensor.all_to_all_v` with `core_num=1`.
+Today it handles `pld.tensor.all_to_all_v` with a compile-time `core_num`.
 
 The HOST rail ([`LowerHostTensorCollectives`](47-lower_host_tensor_collectives.md))
 solves the same problem one level up, and differently: it fans the collective
@@ -134,11 +134,30 @@ three slots wide, and the first ctx always lands at `args[5]` because the tail
 follows all five tensor parameters. All three resolve to the same `device_ctx`,
 since every operand of one collective belongs to one comm domain.
 
+## Launch width
+
+`core_num` is the requested block limit `L`. It must be a compile-time constant on this rail, so the pass folds
+the admitted block count `B = CalAllToAllVBlocks(P, L)` itself: `L` while `L < P`, otherwise the largest
+multiple of `P` not exceeding `L`. `P` is the static `NR` of the `[NR, S]` signal.
+
+- `B == 1` leaves the kernel call untouched.
+- `B > 1` attaches `core_num=B` and `sync_start=True` to the kernel call. The block-aware barrier needs every
+  admitted block resident together, and the runtime rejects an over-capacity sync-start launch instead of
+  part-starting it.
+
+The launch spec rides the call's attrs, which are not kernel parameters, so the five-operand ABI above is
+unchanged. `B` — never `L` — is what is validated: `signal` must satisfy `S >= B`, so `L=10, P=8` (which
+launches 8 blocks) accepts `S=8`. The HOST rail computes the same `B` in its generated entry; both sites are
+pinned to RFC #2521's worked-example table. `NR` must equal the runtime comm-domain size, because the kernel
+reads the rank count from the `CommContext`.
+
 ## Constraints and diagnostics
 
 | Condition | Diagnostic |
 | --------- | ---------- |
-| `core_num != 1` | rejected — the multi-AIV launch is not implemented yet |
+| `core_num` not a compile-time constant | rejected — a runtime `core_num` is not supported on this rail yet |
+| `core_num` outside `[1, INT32_MAX]` | rejected — the same bound the HOST rail's entry enforces at runtime |
+| `signal` stride `S < B` | rejected — `B` is the folded block count (see *Launch width*), not the raw `core_num` |
 | `dtype != FP32 && dtype != INT8` | rejected — FP32 and INT8 are supported (same allowlist as the HOST rail) |
 | collective left in a non-HOST orchestration body | rejected by the pass's own postcondition check |
 
@@ -160,9 +179,9 @@ passes earlier, so re-reporting them here would blame the wrong pass.
 
 ## Current limitations
 
-- **`core_num > 1`.** The requested block limit is carried through the op but
-  only `1` is accepted here. The `L -> B` mapping, atomic gang admission and
-  per-lane synchronization protocol are separate work.
+- **A runtime `core_num`.** Only a compile-time `core_num` is accepted. A runtime value would need `B`
+  computed in the emitted orchestration and a runtime `S >= B` check, and orchestration has no surface for
+  raising that fatal today. The HOST rail accepts a runtime value because its entry runs on the host.
 - **Operand validation is static, and aliasing is only partly covered.** The
   `pld.tensor.all_to_all_v` type deducer rejects what the operand types alone
   prove: a non-ND layout, a stride vector that is not the packed one, a
@@ -177,8 +196,9 @@ passes earlier, so re-reporting them here would blame the wrong pass.
   all five. This rail — like the InCore composite rail — sees the operands as
   enclosing-pipeline parameters and has no such provenance, so pairwise-distinct
   windows are the caller's obligation here. There is also no runtime re-check
-  before the AIV task is submitted; with `B` fixed at 1 the checks that would
-  need one (signal stride `>= B`) are vacuous.
+  before the AIV task is submitted; the check that would need one (signal
+  stride `>= B`) is enforced statically at lowering instead, where both `S`
+  and the folded `B` are compile-time values.
 - **Rank count.** The kernel reads `CommContext::rankNum`, so an explicit device
   subset smaller than the context's rank count would be handled differently from
   the HOST rail, which passes the comm domain's `domain_size`.
@@ -199,7 +219,8 @@ passes earlier, so re-reporting them here would blame the wrong pass.
 
 - `tests/ut/ir/transforms/test_lower_l2_tensor_collectives.py` — lowered shape,
   synthesized signature and directions, template attrs, variant sharing,
-  InCore pass-through, `core_num > 1` rejection, INT8 variant.
+  InCore pass-through, launch-spec attachment and block-count fold, capacity check, runtime `core_num`
+  rejection, INT8 variant.
 - `tests/ut/codegen/distributed/test_builtin_collective_kernel_source.py` —
   HOST and CHIP rails render a byte-identical kernel for FP32 and INT8.
 - `tests/ut/ir/transforms/test_lower_composite_ops.py` — the composite rail

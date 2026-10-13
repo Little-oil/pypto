@@ -13,6 +13,7 @@ import os
 import re
 from collections.abc import Callable
 from enum import Enum, unique
+from pathlib import Path
 
 from pypto.compile_profiling import CompileProfiler
 from pypto.pypto_core import ir as core_ir
@@ -80,6 +81,20 @@ def _format_warnings(
             out.append(f"{dump_filename}: warning: {d.message} [{d.rule_name}]")
 
     return "\n".join(out) + "\n" if out else ""
+
+
+def _write_ir_dump(program: core_ir.Program, path: str, prefix: str, explicit_layout: bool) -> str:
+    """Keep readable dumps and lossless Buffer companions together."""
+    content = python_print(program, prefix=prefix, explicit_layout=explicit_layout)
+    Path(path).write_text(content if content.endswith("\n") else content + "\n")
+    binary_path = Path(path).with_suffix(".msgpack")
+    if any(function.ir_stage == core_ir.FunctionIRStage.Buffer for function in program.functions.values()):
+        # Buffer Python text is diagnostic, not executable DSL. Reuse the same
+        # binary boundary as the roundtrip instrument for numerical replay.
+        binary_path.write_bytes(core_ir.serialize(program))
+    else:
+        binary_path.unlink(missing_ok=True)
+    return content
 
 
 PassFactory = Callable[[], passes.Pass]
@@ -364,7 +379,7 @@ class PassManager:
         # MemoryReuse yet still select dbC=2, coalescing the two co-live L0C accumulators
         # into one shrunk single-buffer tile (see _check_planner_consistency).
         self._construction_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
-        self._construction_buffer_ir = ctx.get_enable_buffer_ir() if ctx else False
+        self._construction_buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
         skipped_mem_planning_passes: tuple[str, ...]
         if self._construction_planner == passes.MemoryPlanner.PTOAS:
             skipped_mem_planning_passes = ("MemoryReuse", "AllocateMemoryAddr")
@@ -383,6 +398,8 @@ class PassManager:
         )
         for pass_factory in pass_factories:
             pass_obj = pass_factory()
+            if self._construction_buffer_ir and pass_obj.get_name() == "MaterializeSemanticAliases":
+                self._pipeline.add_pass(passes.select_buffer_ir_functions())
             if self._construction_buffer_ir and pass_obj.get_name() == "AllocateMemoryAddr":
                 self._pipeline.add_pass(passes.verify_tile_storage())
             if pass_obj.get_name() in skipped_mem_planning_passes:
@@ -418,7 +435,7 @@ class PassManager:
         """
         ctx = passes.PassContext.current()
         run_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
-        run_buffer_ir = ctx.get_enable_buffer_ir() if ctx else False
+        run_buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
         if run_buffer_ir != self._construction_buffer_ir:
             raise RuntimeError(
                 "PassManager enable_buffer_ir changed after construction. Build and run the "
@@ -481,11 +498,7 @@ class PassManager:
 
         # Save frontend IR
         frontend_path = os.path.join(output_dir, "00_frontend.py")
-        with open(frontend_path, "w") as f:
-            content = python_print(input_ir, prefix=prefix, explicit_layout=explicit_layout)
-            f.write(content)
-            if not content.endswith("\n"):
-                f.write("\n")
+        _write_ir_dump(input_ir, frontend_path, prefix, explicit_layout)
 
         # Use instrument for IR dumping -- verification handled by C++ pipeline.
         # Snapshot the pipeline-derived names for stable callback indexing during
@@ -520,11 +533,7 @@ class PassManager:
 
             # Dump IR
             dump_path = os.path.join(output_dir, f"{stem}.py")
-            with open(dump_path, "w") as f:
-                content = python_print(program, prefix=prefix, explicit_layout=explicit_layout)
-                f.write(content)
-                if not content.endswith("\n"):
-                    f.write("\n")
+            content = _write_ir_dump(program, dump_path, prefix, explicit_layout)
 
             # Dump per-pass warnings alongside the IR
             if not effective_checks.empty():
@@ -570,7 +579,7 @@ class PassManager:
         mplan = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
         dbc_flag = ctx.get_enable_pypto_l0c_double_buffer() if ctx else False
         runtime = ctx.get_runtime() if ctx else passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
-        buffer_ir = ctx.get_enable_buffer_ir() if ctx else False
+        buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
         outer_phase = ctx.get_diagnostic_phase() if ctx else passes.get_default_diagnostic_phase()
         if outer_phase == passes.DiagnosticPhase.POST_PASS:
             inner_phase = passes.DiagnosticPhase.PRE_PIPELINE
@@ -623,7 +632,7 @@ class PassManager:
         mplan = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
         dbc_flag = ctx.get_enable_pypto_l0c_double_buffer() if ctx else False
         runtime = ctx.get_runtime() if ctx else passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
-        buffer_ir = ctx.get_enable_buffer_ir() if ctx else False
+        buffer_ir = ctx.get_enable_buffer_ir() if ctx else True
         dphase = ctx.get_diagnostic_phase() if ctx else passes.get_default_diagnostic_phase()
         if ctx:
             disabled = ctx.get_disabled_diagnostics()

@@ -35,6 +35,8 @@ compiling a second distributed program inside a test that then dispatches its
 own destabilised the run and cost device force-resets.)
 """
 
+import re
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
@@ -73,16 +75,20 @@ def _l2_kernel_of(name: str) -> str:
     return f"__builtin_all_to_all_v__{name}.cpp"
 
 
-def _build_chip_rail_program(dtype_name: str = "fp32"):
+def _build_chip_rail_program(dtype_name: str = "fp32", core_num: int = 1, signal_stride: int = 1):
     """CHIP/L2 rail: the collective written in a CHIP orchestration body.
 
     Identical to the HOST program below except for *where* the collective is
     written — same five windows, same host allocation, same comm domain. That
     one difference is the whole point of the comparison.
+
+    ``core_num`` / ``signal_stride`` choose the requested block limit and the
+    signal's per-block lane count ``S`` (the signal is ``[NR, S]``).
     """
     dtype = _dtype_of(dtype_name)
     payload_bytes = TOTAL * SIZE * dtype.get_byte()
     i32_bytes = NR * pl.INT32.get_byte()
+    signal_bytes = NR * signal_stride * pl.INT32.get_byte()
 
     @pl.program
     class ChipRail:
@@ -91,24 +97,24 @@ def _build_chip_rail_program(dtype_name: str = "fp32"):
             self,
             stage: pl.InOut[pld.DistributedTensor[[TOTAL, SIZE], dtype]],
             data: pl.InOut[pld.DistributedTensor[[TOTAL, SIZE], dtype]],
-            signal: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
+            signal: pl.InOut[pld.DistributedTensor[[NR, signal_stride], pl.INT32]],
             counts: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
             recv: pl.InOut[pld.DistributedTensor[[NR, 1], pl.INT32]],
         ) -> pld.DistributedTensor[[TOTAL, SIZE], dtype]:
-            return pld.tensor.all_to_all_v(stage, data, signal, counts, recv, core_num=1)
+            return pld.tensor.all_to_all_v(stage, data, signal, counts, recv, core_num=core_num)
 
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
         def host_orch(self):
             stage_buf = pld.alloc_window_buffer(payload_bytes)
             data_buf = pld.alloc_window_buffer(payload_bytes)
-            signal_buf = pld.alloc_window_buffer(i32_bytes)
+            signal_buf = pld.alloc_window_buffer(signal_bytes)
             counts_buf = pld.alloc_window_buffer(i32_bytes)
             recv_buf = pld.alloc_window_buffer(i32_bytes)
 
             for r in pl.range(pld.world_size()):
                 stage = pld.window(stage_buf, [TOTAL, SIZE], dtype=dtype)
                 data = pld.window(data_buf, [TOTAL, SIZE], dtype=dtype)
-                sig = pld.window(signal_buf, [NR, 1], dtype=pl.INT32)
+                sig = pld.window(signal_buf, [NR, signal_stride], dtype=pl.INT32)
                 counts = pld.window(counts_buf, [NR, 1], dtype=pl.INT32)
                 recv = pld.window(recv_buf, [NR, 1], dtype=pl.INT32)
                 self.chip_pipeline(stage, data, sig, counts, recv, device=r)
@@ -225,6 +231,51 @@ def test_both_rails_render_a_byte_identical_builtin_kernel(tmp_path, dtype_name)
         "HOST and CHIP rails must render the same builtin kernel source; a difference means "
         "the two rails no longer share one transport implementation"
     )
+
+
+def _chip_orchestration_sources(output_dir) -> str:
+    """Every emitted CHIP-orchestration C++ source of ``chip_pipeline``, concatenated."""
+    sources = sorted((output_dir / "next_levels" / "chip_pipeline").rglob("*.cpp"))
+    orchestration = [s for s in sources if "orchestration" in s.parts]
+    assert orchestration, f"expected an emitted orchestration source under {output_dir}"
+    return "\n".join(s.read_text() for s in orchestration)
+
+
+def test_chip_rail_multi_block_request_emits_the_launch_spec(tmp_path):
+    """``core_num=2`` over two ranks launches a two-block, sync-start gang.
+
+    The pass folds ``B = CalAllToAllVBlocks(2, 2) = 2`` and the orchestration
+    codegen renders it onto the kernel's task, next to ``require_sync_start``.
+    """
+    chip = _compile(_build_chip_rail_program(core_num=2, signal_stride=2), tmp_path, "chip_multi")
+    source = _chip_orchestration_sources(chip.output_dir)
+    assert re.search(r"\.launch_spec\.\w+\(2\);", source), source
+    assert ".launch_spec.set_require_sync_start(true);" in source, source
+
+
+def test_chip_rail_single_block_request_emits_no_launch_spec(tmp_path):
+    """``core_num=1`` is unchanged: a plain single-block task, no gang launch."""
+    chip = _compile(_build_chip_rail_program(core_num=1), tmp_path, "chip_single")
+    assert ".launch_spec." not in _chip_orchestration_sources(chip.output_dir)
+
+
+def test_multi_block_chip_rail_still_renders_the_shared_kernel(tmp_path):
+    """A multi-block request must not fork the kernel from the HOST rail's.
+
+    The launch spec is a call attr, not a kernel parameter, so the rendered
+    source stays byte-identical — the tripwire for a future "just pass it as an
+    argument" change that would shift the CommContext off ``args[5]``.
+    """
+    chip = _compile(_build_chip_rail_program(core_num=2, signal_stride=2), tmp_path, "chip_multi_kernel")
+    host = _compile(_build_host_rail_program(), tmp_path, "host_multi_kernel")
+    chip_kernel = (
+        chip.output_dir / "next_levels" / "chip_pipeline" / "kernels" / "aiv" / _l2_kernel_of("fp32")
+    )
+    host_kernel = _sole_file(
+        host.output_dir / "next_levels" / _variant_of("fp32") / "kernels" / "aiv", "*.cpp"
+    )
+    assert chip_kernel.is_file(), f"expected the rendered CHIP kernel at {chip_kernel}"
+    assert host_kernel.read_text() == chip_kernel.read_text()
 
 
 def test_chip_rail_emits_no_builtin_chip_dispatch(tmp_path):

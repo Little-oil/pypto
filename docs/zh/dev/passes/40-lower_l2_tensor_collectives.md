@@ -6,7 +6,7 @@
 它把写在 **CHIP orchestration 函数体**里的 `pld.tensor.*` 集合通信改写成对编译器
 合成的 AIV kernel 的调用，使该集合通信成为调用方自身 pipeline 里的一个普通 task。
 
-目前支持 `pld.tensor.all_to_all_v`，且要求 `core_num=1`。
+目前支持 `pld.tensor.all_to_all_v`，且要求 `core_num` 为编译期常量。
 
 HOST 通路（[`LowerHostTensorCollectives`](47-lower_host_tensor_collectives.md)）
 在上一层解决同一问题，做法不同：它把集合通信按设备扇出成**每个设备一次**
@@ -121,11 +121,28 @@ rank 数，`pld.system.nranks` 只有 InCore 代码生成，没有 orchestration
 落在 `args[5]`，因为尾部跟在全部五个 tensor 参数之后。三者全部解析到同一个
 `device_ctx`，因为一次调用的五个操作数必属同一个 comm domain。
 
+## 启动宽度
+
+`core_num` 是请求的 block 上限 `L`。在本通路上它必须是编译期常量，因此 pass 自己折叠出准入的
+block 数 `B = CalAllToAllVBlocks(P, L)`：当 `L < P` 时取 `L`，否则取不超过 `L` 的最大 `P` 的倍数。
+`P` 是 `[NR, S]` signal 的静态 `NR`。
+
+- `B == 1` 时 kernel 调用保持不变。
+- `B > 1` 时在 kernel 调用上附加 `core_num=B` 与 `sync_start=True`。感知 block 的 barrier 要求所有
+  准入的 block 同时驻留，而 runtime 会拒绝超出容量的 sync-start 启动，而不是只启动一部分。
+
+启动规格放在调用的 attrs 上，而 attrs 不是 kernel 参数，所以上文的五操作数 ABI 不变。被校验的是 `B`
+而不是 `L`：`signal` 必须满足 `S >= B`，因此 `L=10, P=8`（实际启动 8 个 block）接受 `S=8`。HOST
+通路在其生成的 entry 中计算同一个 `B`；两处实现都对照 RFC #2521 的算例表固定。`NR` 必须等于运行期
+通信域大小，因为 kernel 从 `CommContext` 读取 rank 数。
+
 ## 约束与诊断
 
 | 条件 | 诊断 |
 | ---- | ---- |
-| `core_num != 1` | 拒绝 —— 多 AIV 启动尚未实现 |
+| `core_num` 不是编译期常量 | 拒绝 —— 本通路暂不支持运行期 `core_num` |
+| `core_num` 不在 `[1, INT32_MAX]` 内 | 拒绝 —— 与 HOST 通路 entry 在运行期强制的上界相同 |
+| `signal` 步长 `S < B` | 拒绝 —— `B` 是折叠后的 block 数（见 *启动宽度*），不是原始 `core_num` |
 | `dtype != FP32 && dtype != INT8` | 拒绝 —— 支持 FP32 与 INT8（与 HOST 通路的 allowlist 一致） |
 | 集合通信残留在非 HOST 的 orchestration 函数体中 | 被本 pass 自身的后置条件检查拒绝 |
 
@@ -145,8 +162,9 @@ pass 之前就已运行，在这里重复报告会指向错误的 pass。
 
 ## 当前限制
 
-- **`core_num > 1`**。请求的 block 上限会随 op 传递，但此处只接受 `1`。
-  `L -> B` 映射、原子 gang 准入和 per-lane 同步协议属于独立工作项。
+- **运行期 `core_num`**。仅接受编译期 `core_num`。运行期值需要在生成的 orchestration 中计算 `B`，并做
+  运行期 `S >= B` 检查，而 orchestration 目前没有抛出该致命错误的途径。HOST 通路因其 entry 运行在
+  host 上而接受运行期值。
 - **操作数校验是静态的，且别名只覆盖了一部分**。`pld.tensor.all_to_all_v` 的类型
   推导只拒绝仅凭操作数类型即可证明的违规：非 ND 布局、与紧凑步长不符的 stride
   向量、比 shape 更窄的 `valid_shape`，以及 `input` 与 `target` 是**同一个表达式**。
@@ -158,8 +176,8 @@ pass 之前就已运行，在这里重复报告会指向错误的 pass。
   其 `WindowBuffer`，并对五个操作数运行 `CheckPairwiseDistinctWindows`。本通路
   —— 与 InCore composite 通路一样 —— 看到的操作数是外层 pipeline 的参数，没有这样
   的溯源能力，因此在这里「窗口两两互不相同」是调用方的义务。此外，在提交 AIV task
-  前也没有运行期复检 —— `B` 固定为 1 时，需要复检的项（signal stride `>= B`）本身
-  是平凡成立的。
+  前也没有运行期复检 —— 需要复检的项（signal stride `>= B`）改由 lowering 阶段静
+  态校验：`S` 与折叠出的 `B` 都是编译期常量。
 - **rank 数**。kernel 读取 `CommContext::rankNum`，因此当显式设备子集小于 context
   的 rank 数时，其行为与传入 comm domain `domain_size` 的 HOST 通路不同。
 - **「同属一个通信域」是未经检查的前置条件**。kernel 通过单个 `CommContext`
@@ -174,8 +192,8 @@ pass 之前就已运行，在这里重复报告会指向错误的 pass。
 ## 测试
 
 - `tests/ut/ir/transforms/test_lower_l2_tensor_collectives.py` —— 改写后的形态、
-  合成签名与方向、模板 attrs、variant 共享、InCore 透传、`core_num > 1` 拒绝、
-  INT8 variant。
+  合成签名与方向、模板 attrs、variant 共享、InCore 透传、启动规格附加与 block 数折叠、
+  容量检查、运行期 `core_num` 拒绝、INT8 variant。
 - `tests/ut/codegen/distributed/test_builtin_collective_kernel_source.py` ——
   HOST 与 CHIP 通路对 FP32 / INT8 渲染逐字节相同的 kernel。
 - `tests/ut/ir/transforms/test_lower_composite_ops.py` —— composite 通路把

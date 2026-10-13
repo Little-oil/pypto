@@ -23,13 +23,18 @@
  * This pass is the CHIP/L2 rail. It rewrites
  *
  *     target = pld.tensor.all_to_all_v(input, target, signal,
- *                                      send_counts, recv_counts, core_num=1)
+ *                                      send_counts, recv_counts, core_num=L)
  *
  * into a call to a synthesized AIV kernel function backed by the *same*
  * hand-written builtin kernel source the HOST rail uses:
  *
  *     target = __builtin_all_to_all_v__fp32(input, target, signal,
  *                                           send_counts, recv_counts)
+ *
+ * ``L`` must be a compile-time constant. The pass folds the admitted block count
+ * ``B = CalAllToAllVBlocks(P, L)`` (``P`` is the signal's static ``NR``) and, for
+ * ``B > 1``, attaches it to the call as the ``core_num`` / ``sync_start`` launch
+ * spec — call attrs, not kernel parameters, so the ABI below is unchanged.
  *
  * The result is one ``rt_submit_aiv_task`` inside the caller's own pipeline —
  * no nested L2 -> L2 dispatch — and the collective participates in the normal
@@ -67,6 +72,8 @@
 
 #include <any>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -113,6 +120,16 @@ constexpr const char* kAllToAllV = "pld.tensor.all_to_all_v";
   return func && IsOrchestrationLike(func->func_type_) && func->level_.has_value() &&
          *func->level_ == Level::CHIP;
 }
+
+/// The admitted block count ``B`` for a requested limit ``L`` over ``P`` ranks
+/// (RFC #2521 frozen item #3): ``L`` while ``L < P``, otherwise the largest
+/// multiple of ``P`` not exceeding ``L``. Payload size never enters.
+///
+/// This is the compiler-side copy of the formula. The HOST rail evaluates it in
+/// its generated entry (``entry.cpp.in``), which is compiled standalone and cannot
+/// link against this file, so the two sites are kept in step by tests that run
+/// the RFC's worked-example table through both.
+[[nodiscard]] int64_t CalAllToAllVBlocks(int64_t p, int64_t l) { return l < p ? l : (l / p) * p; }
 
 /// Variant suffix and C++ element type the builtin kernel template is
 /// instantiated with.
@@ -318,20 +335,62 @@ class LowerL2TensorCollectivesMutator : public IRMutator {
         << call->args_.size();
 
     // core_num (args_[5]) is the requested block limit L, carried as a
-    // Scalar[INDEX] argument. This rail supports only a single block: a dynamic
-    // core_num can't even be range-checked here, so only the statically-known
-    // case is rejected explicitly. The value is consumed by this gate and then
-    // dropped — it never reaches the kernel, whose argument layout must stay
-    // identical to the HOST rail's.
+    // Scalar[INDEX] argument. It is consumed here and then dropped from the
+    // kernel call — it never reaches the kernel, whose argument layout must stay
+    // identical to the HOST rail's. What it becomes instead is the launch spec on
+    // the call (see the end of this function).
+    //
+    // Only a compile-time L is accepted. A runtime L would need the block count
+    // computed in the emitted orchestration, plus a runtime `signal stride >= B`
+    // check, and orchestration has no surface for raising that fatal today; the
+    // HOST rail takes a runtime L because its entry runs on the host.
     auto core_num_const = As<ConstInt>(call->args_[5]);
-    CHECK_SPAN(core_num_const && core_num_const->value_ == 1, call->span_)
-        << "CHIP pld.tensor.all_to_all_v currently supports only a compile-time core_num=1, got "
-        << (core_num_const ? std::to_string(core_num_const->value_) : std::string("a dynamic value"))
-        << "; multi-AIV launch is not implemented on this rail yet";
+    CHECK_SPAN(core_num_const != nullptr, call->span_)
+        << "CHIP pld.tensor.all_to_all_v: a runtime core_num is not supported on this rail yet; pass a "
+           "compile-time core_num (the HOST rail accepts a runtime value)";
+    const int64_t requested_blocks = core_num_const->value_;
+    // The launch width is a 32-bit count, and the HOST entry bounds `core_num` to
+    // the same [1, INT32_MAX] at runtime; a static request outside it can never
+    // be honoured, so say so here instead of folding it into an overflowing B.
+    CHECK_SPAN(requested_blocks >= 1 && requested_blocks <= std::numeric_limits<int32_t>::max(), call->span_)
+        << "CHIP pld.tensor.all_to_all_v: core_num must be in [1, " << std::numeric_limits<int32_t>::max()
+        << "], got " << requested_blocks;
 
     auto target_type = As<DistributedTensorType>(call->args_[1]->GetType());
     INTERNAL_CHECK_SPAN(target_type, call->span_)
         << "LowerL2TensorCollectives: pld.tensor.all_to_all_v target must be DistributedTensorType";
+
+    // The rank count P is a compile-time constant on this rail: the deducer
+    // requires `signal` to be [NR, S] with static NR and S, and the program is
+    // built once per rank count. That is what lets the compiler fold
+    // B = CalAllToAllVBlocks(P, L) here instead of in a generated entry. The
+    // kernel itself still reads the rank count from the CommContext, so NR must
+    // equal the runtime domain size — an invariant this rail already relies on
+    // for correctness (every counts address derives from NR), now also for width.
+    auto signal_type = As<DistributedTensorType>(call->args_[2]->GetType());
+    INTERNAL_CHECK_SPAN(signal_type && signal_type->shape_.size() == 2, call->span_)
+        << "LowerL2TensorCollectives: pld.tensor.all_to_all_v signal must be a 2D DistributedTensor";
+    auto nranks_const = As<ConstInt>(signal_type->shape_[0]);
+    auto stride_const = As<ConstInt>(signal_type->shape_[1]);
+    INTERNAL_CHECK_SPAN(nranks_const && stride_const, call->span_)
+        << "LowerL2TensorCollectives: pld.tensor.all_to_all_v signal must have a static [NR, S] shape "
+           "(deducer-enforced)";
+    const int64_t nranks = nranks_const->value_;
+    const int64_t signal_stride = stride_const->value_;
+    // Deducer-enforced positive; stated here because CalAllToAllVBlocks divides by P.
+    INTERNAL_CHECK_SPAN(nranks >= 1 && signal_stride >= 1, call->span_)
+        << "LowerL2TensorCollectives: pld.tensor.all_to_all_v signal [NR, S] must be positive, got ["
+        << nranks << ", " << signal_stride << "]";
+    const int64_t launched_blocks = CalAllToAllVBlocks(nranks, requested_blocks);
+
+    // A stride narrower than the launched gang is a defect, not something the
+    // kernel should clamp its way past (RFC #2521 §13.3). Compare against the
+    // folded B, never the raw L: L=10, P=8 launches 8 blocks, so S=8 is enough.
+    // Same condition and wording as the HOST rail's entry.
+    CHECK_SPAN(signal_stride >= launched_blocks, call->span_)
+        << "CHIP pld.tensor.all_to_all_v: signal stride (" << signal_stride
+        << ") is smaller than the admitted block count (" << launched_blocks
+        << ") for core_num=" << requested_blocks << ", nranks=" << nranks;
 
     // send_counts is read REMOTELY by every peer (the hand-written kernel
     // resolves each peer's copy through CommRemotePtr for the counts pull), so
@@ -384,7 +443,24 @@ class LowerL2TensorCollectivesMutator : public IRMutator {
            "trailing core_num scalar";
     std::vector<ExprPtr> kernel_args(
         call->args_.begin(), call->args_.begin() + static_cast<std::ptrdiff_t>(spec.param_names.size()));
-    return std::make_shared<Call>(std::make_shared<GlobalVar>(spec.function_name), std::move(kernel_args),
+    auto kernel_callee = std::make_shared<GlobalVar>(spec.function_name);
+    if (launched_blocks == 1) {
+      // One block needs no gang launch; leave the call exactly as it was.
+      return std::make_shared<Call>(kernel_callee, std::move(kernel_args), call->args_[1]->GetType(),
+                                    call->span_);
+    }
+    // The launch spec rides the call's attrs, which are not kernel parameters, so
+    // the five-operand ABI above is untouched. `require_sync_start` is not
+    // optional: the block-aware barrier needs every admitted block resident
+    // together, and the runtime rejects an over-capacity sync-start launch
+    // rather than part-starting it.
+    auto core_num_dtype = As<ScalarType>(core_num_const->GetType())->dtype_;
+    std::vector<std::pair<std::string, std::any>> launch_attrs;
+    launch_attrs.emplace_back(
+        kAttrCoreNum, ExprPtr(std::make_shared<ConstInt>(launched_blocks, core_num_dtype, call->span_)));
+    launch_attrs.emplace_back(kAttrSyncStart, true);
+    return std::make_shared<Call>(kernel_callee, std::move(kernel_args),
+                                  std::vector<std::pair<std::string, std::any>>{}, std::move(launch_attrs),
                                   call->args_[1]->GetType(), call->span_);
   }
 
@@ -413,7 +489,7 @@ class ResidualCollectiveChecker : public IRVisitor {
       CHECK_SPAN(false, op->span_)
           << op->op_->name_ << " in function '" << func_name_
           << "' was not lowered. The managed CHIP/L2 rail currently supports only " << kAllToAllV
-          << " with core_num=1; write any other collective in a HOST orchestrator (builtin "
+          << " with a compile-time core_num; write any other collective in a HOST orchestrator (builtin "
              "dispatch rail) or an InCore function (composite rail)";
     }
     IRVisitor::VisitExpr_(op);

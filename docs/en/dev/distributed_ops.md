@@ -536,10 +536,11 @@ unchanged; the per-lane completion surface stays the `AtomicAdd(-2)`
 self-clearing credit lanes.
 
 The InCore composite rail rejects any `core_num` other than a compile-time `1`,
-naming the CHIP rail in the diagnostic. The CHIP/L2 rail (below) is deliberately
-left gated at `core_num=1` — wiring a genuine multi-block launch into the
-L2-managed path is a separate, not-yet-started roadmap item (O2), not part of
-K2.
+naming the CHIP rail in the diagnostic. The CHIP/L2 rail (below) accepts a
+compile-time `core_num`: it folds the same `B = CalAllToAllVBlocks(P, L)` at
+lowering and attaches it as the launch spec (`core_num=B`, `sync_start`) when
+`B > 1`. A runtime `core_num` is not supported on that rail yet — see
+[`40-lower_l2_tensor_collectives.md`](passes/40-lower_l2_tensor_collectives.md).
 
 **CHIP builtin** (`LowerL2TensorCollectives`): the same call written one level
 down, in a CHIP `Orchestration` body rather than in `host_orch`. It is rewritten

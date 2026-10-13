@@ -263,7 +263,9 @@ Pass LowerHostTensorCollectives();
  * own task DAG, so ``compute -> collective -> consume`` is ordered by ordinary
  * TensorMap dependencies and the host dispatches one pipeline per rank.
  *
- * Today only ``pld.tensor.all_to_all_v`` with ``core_num=1`` is supported.
+ * ``pld.tensor.all_to_all_v`` is supported with a compile-time ``core_num``: the
+ * pass folds the admitted block count ``B = CalAllToAllVBlocks(P, L)`` and launches
+ * ``B`` blocks; a runtime ``core_num`` is rejected.
  */
 Pass LowerL2TensorCollectives();
 
@@ -300,6 +302,9 @@ Pass MaterializeValidShapeSymbols();
  * automatic verification is disabled, and verifies BufferIR after conversion.
  */
 Pass LowerTileToBuffer();
+
+/// Select whole kernels for the default Buffer rollout before storage legalization.
+Pass SelectBufferIRFunctions();
 
 /**
  * @brief Make every FunctionType::Graph function legal to record and replay

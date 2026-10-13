@@ -35,6 +35,7 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/utils/buffer_ir_selection.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/verifier.h"
@@ -133,13 +134,10 @@ class BufferIRVisitor : public IRVisitor {
       view_handles_.insert(op->var_.get());
       if (window == windows_.end()) {
         Error("Buffer view requires proven source-window provenance", call->span_);
+      } else if (IsOp(call, "buffer.subview")) {
+        RegisterSubviewWindow(op->var_, call, window->second);
       } else {
-        uint64_t offset = window->second.offset;
-        if (IsOp(call, "buffer.subview")) {
-          const auto offsets = As<MakeTuple>(call->args_[1]);
-          offset += static_cast<uint64_t>(As<ConstInt>(offsets->elements_[0])->value_) * 32;
-        }
-        RegisterWindow(op->var_, window->second.root, offset);
+        RegisterWindow(op->var_, window->second.root, window->second.offset, &window->second);
       }
     }
     if (As<ScalarType>(op->var_->GetType())) constants_[op->var_.get()] = ConstantAddress(op->value_);
@@ -308,6 +306,8 @@ class BufferIRVisitor : public IRVisitor {
     const Var* root;
     uint64_t offset;
     uint64_t bytes;
+    uint64_t row_pitch;
+    bool known_offset;
   };
 
   std::optional<uint64_t> PhysicalBytes(const BufferTypePtr& type) {
@@ -316,9 +316,42 @@ class BufferIRVisitor : public IRVisitor {
     return entry->second;
   }
 
-  void RegisterWindow(const VarPtr& variable, const Var* root, uint64_t offset) {
-    if (const auto bytes = PhysicalBytes(As<BufferType>(variable->GetType()))) {
-      windows_[variable.get()] = Window{root, offset, *bytes};
+  // A static window spans from its first element to the end of its last row
+  // at the source's pitch. A runtime offset is only known to stay within the
+  // source window, which is therefore its conservative range.
+  void RegisterSubviewWindow(const VarPtr& variable, const CallPtr& call, const Window& source_window) {
+    const auto source = As<BufferType>(call->args_[0]->GetType());
+    const auto view = As<BufferType>(variable->GetType());
+    const auto offsets = As<MakeTuple>(call->args_[1]);
+    const auto row = As<ConstInt>(offsets->elements_[0]);
+    const auto col = As<ConstInt>(offsets->elements_[1]);
+    if (!row || !col || !source_window.known_offset) {
+      windows_[variable.get()] = source_window;
+      windows_[variable.get()].known_offset = false;
+      return;
+    }
+    const uint64_t element = source->dtype_.GetBit() / 8;
+    const uint64_t pitch = source_window.row_pitch;
+    windows_[variable.get()] = Window{
+        source_window.root,
+        source_window.offset + static_cast<uint64_t>(row->value_) * pitch +
+            static_cast<uint64_t>(col->value_) * element,
+        static_cast<uint64_t>(view->shape_[0] - 1) * pitch + static_cast<uint64_t>(view->shape_[1]) * element,
+        pitch, true};
+  }
+
+  void RegisterWindow(const VarPtr& variable, const Var* root, uint64_t offset,
+                      const Window* source_window = nullptr) {
+    const auto type = As<BufferType>(variable->GetType());
+    if (const auto bytes = PhysicalBytes(type)) {
+      const auto pitch = type->shape_.size() == 2
+                             ? static_cast<uint64_t>(type->shape_[1]) * (type->dtype_.GetBit() / 8)
+                             : *bytes;
+      // Reshape establishes a new layout, but cannot recover the origin of a
+      // runtime-offset view. Keep its conservative bounds through relabels.
+      const bool known_offset = !source_window || source_window->known_offset;
+      const auto extent = known_offset ? *bytes : source_window->bytes;
+      windows_[variable.get()] = Window{root, offset, extent, pitch, known_offset};
     }
   }
 
@@ -367,7 +400,11 @@ class BufferIRVisitor : public IRVisitor {
       source_start += src_address->value_;
       destination_start += dst_address->value_;
     }
-    if (source_start == destination_start && src->second.bytes == dst->second.bytes && exact_allowed) return;
+    if (src->second.known_offset && dst->second.known_offset && source_start == destination_start &&
+        src->second.bytes == dst->second.bytes && src->second.row_pitch == dst->second.row_pitch &&
+        exact_allowed) {
+      return;
+    }
     if (source_start + src->second.bytes > destination_start &&
         destination_start + dst->second.bytes > source_start) {
       Error(name + (exact_allowed ? " rejects partially overlapping placed source and destination ranges"
@@ -531,22 +568,37 @@ class BufferIRPropertyVerifierImpl : public PropertyVerifier {
   void Verify(const ProgramPtr& program, std::vector<Diagnostic>& diagnostics) override {
     if (!program) return;
     std::vector<FunctionPtr> functions;
+    bool selected_pipeline = false;
+    bool malformed = false;
     for (const auto& [global_var, function] : program->functions_) {
-      if (!function || !IsInCoreType(function->func_type_)) continue;
+      if (!function) continue;
+      selected_pipeline |= function->HasAttr(kAttrBufferIrSelected);
+      if (!IsInCoreType(function->func_type_) ||
+          (!IsBufferIRSelected(function) && function->ir_stage_ != FunctionIRStage::Buffer)) {
+        continue;
+      }
       BufferIRVisitor visitor(diagnostics, function->name_);
       visitor.VisitFunction(function);
       // Other verifiers assume intact structural nodes. The diagnostics above
       // already reject missing callees or assignment fields; do not send those
       // malformed functions into verifiers with stronger input assumptions.
+      malformed |= visitor.HasMalformedStructure();
       if (!visitor.HasMalformedStructure()) functions.push_back(function);
     }
     if (functions.empty()) return;
-    // Existing verifiers own binding and lexical definition checks. Restrict their
-    // input to device functions so this property leaves orchestration alone.
-    auto device_program = std::make_shared<Program>(functions, program->name_, program->span_);
+    // Low-level representation checks remain scoped to device functions. In a
+    // selected pipeline, unchanged Tile kernels and orchestration still share
+    // SSA, lexical scope, call signatures and Submit dependencies with Buffer.
+    auto device_program = selected_pipeline && !malformed
+                              ? program
+                              : std::make_shared<Program>(functions, program->name_, program->span_);
     CreateSSAPropertyVerifier()->Verify(device_program, diagnostics);
     CreateLexicalUseAfterDefPropertyVerifier()->Verify(device_program, diagnostics);
     CreateAssignTypeSymmetryPropertyVerifier()->Verify(device_program, diagnostics);
+    if (selected_pipeline && !malformed) {
+      CreateTypeCheckPropertyVerifier()->Verify(program, diagnostics);
+      CreateManualDepsOnSubmitOnlyPropertyVerifier()->Verify(program, diagnostics);
+    }
   }
 };
 

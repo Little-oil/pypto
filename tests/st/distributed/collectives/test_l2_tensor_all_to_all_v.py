@@ -17,11 +17,11 @@ a stage and a consume step around it, a rank costs three L3 -> L2 round trips.
 
 Here the same call is written one level down, in the CHIP pipeline itself::
 
-    @pl.function(type=pl.FunctionType.Orchestration)
+    @pl.jit
     def chip_pipeline(...):
-        stage, counts = self.stage_step(...)
+        stage, counts = stage_step(...)
         data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv, core_num=1)
-        return self.consume_step(data, recv, out, recv_out)
+        return consume_step(data, recv, out, recv_out)
 
 ``LowerL2TensorCollectives`` rewrites the collective into a call to a synthesized
 AIV kernel backed by the *same* hand-written builtin source the HOST rail
@@ -38,18 +38,14 @@ scalar word per rank from this window after Barrier A, so the ``[NR]`` INT32
 vector is all it needs) and ``recv`` (per-source valid row counts, written by
 the collective).
 
-**Why ``@pl.program`` and not ``@pl.jit``** (issue #2638): ``@pl.jit``
-propagates local tensor metadata statement by statement, but its walker
-recognizes only *one-level* attribute calls — ``pl.store(...)``,
-``pld.window(...)``. ``pld.tensor.all_to_all_v(...)`` is a two-level attribute,
-matches no branch of ``_update_local_tensor_meta``, and so drops the metadata
-of the name it rebinds; passing that name on then fails with "missing inferred
-tensor metadata for parameter 'data' of 'consume_step'". One line decides it:
-``data = pld.tensor.all_to_all_v(...)`` followed by ``consume_step(data, ...)``
-is rejected, while binding the result to a fresh name and passing the original
-window through specializes fine. The limitation is in the specializer, not in
-this rail — it applies to every ``pld.tensor.*`` collective on every rail,
-which is why all of ``tests/st/distributed/`` is written in the class form.
+**Why this file used to be ``@pl.program``**: while issue #2638 was open,
+``@pl.jit``'s specializer dropped local tensor metadata across a two-level
+collective rebinding — ``data = pld.tensor.all_to_all_v(...)`` followed by
+``consume_step(data, ...)`` failed with "missing inferred tensor metadata for
+parameter 'data'". The specializer was generalized (#2901; #2638 closed
+2026-10-10, pinned by ``tests/ut/jit/test_decorator.py``), so this file now
+uses the user-facing ``@pl.jit`` surface — the family the rule
+(``.claude/rules/testing-and-examples.md``) requires for ``tests/st/``.
 
 ST coverage: P=2 and P=4 (skips when fewer devices are available) — the
 uniform golden, plus the same 0 / 1 / capacity / over-capacity / negative
@@ -70,14 +66,28 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 import torch
-from pypto import ir
 from pypto.ir import DistributedConfig
+from pypto.runtime import RunConfig
 
 SIZE = 64
 MAX_RECV = 4
 
 
-def _build_l2_all_to_all_v_program(n_ranks: int, max_recv: int):
+def _admitted_blocks(n_ranks: int, core_num: int) -> int:
+    """``B = CalAllToAllVBlocks(P, L)``: ``L`` below ``P``, else the largest multiple of ``P`` <= ``L``.
+
+    An independent restatement, as in the HOST multicore ST, so a case's expected
+    gang width does not come from the code under test.
+    """
+    return core_num if core_num < n_ranks else (core_num // n_ranks) * n_ranks
+
+
+# Requested block limits ``L``. With P=2 these admit B = 1, 2, 4; with P=4, B = 1, 2, 4 — covering
+# the single-block rail, B < P (multi-peer-per-core) and B = P / B > P (peer x length lanes).
+_CORE_NUMS = (1, 2, 4)
+
+
+def _build_l2_all_to_all_v_program(n_ranks: int, max_recv: int, core_num: int = 1):
     """Build an N-rank CHIP-pipeline variable-size all-to-all program.
 
     Signal/counts shapes are per-rank-count, so the program is built by a
@@ -86,137 +96,132 @@ def _build_l2_all_to_all_v_program(n_ranks: int, max_recv: int):
     nr = n_ranks
     mr = max_recv
     total = nr * mr
+    # The signal is [NR, S] with one lane per admitted block, so S = B (the
+    # smallest legal stride: the pass rejects S < B).
+    stride = _admitted_blocks(nr, core_num)
 
-    @pl.program
-    class L2TensorAllToAllV:
-        """N-rank program whose CHIP pipeline holds the managed collective."""
+    @pl.jit.incore
+    def stage_step(
+        inp: pl.Tensor[[total, SIZE], pl.FP32],
+        counts_row: pl.Tensor[[nr, 1], pl.INT32],
+        stage: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+        counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+    ) -> tuple[
+        pld.DistributedTensor[[total, SIZE], pl.FP32],
+        pld.DistributedTensor[[nr, 1], pl.INT32],
+    ]:
+        """Publish this rank's payload and send counts into their windows.
 
-        @pl.function(type=pl.FunctionType.InCore)
-        def stage_step(
-            self,
-            inp: pl.Tensor[[total, SIZE], pl.FP32],
-            counts_row: pl.Tensor[[nr, 1], pl.INT32],
-            stage: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
-            counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-        ) -> tuple[
-            pld.DistributedTensor[[total, SIZE], pl.FP32],
-            pld.DistributedTensor[[nr, 1], pl.INT32],
-        ]:
-            """Publish this rank's payload and send counts into their windows.
+        Both are window-bound because every operand of one collective must
+        live in the same comm domain — the same narrowing the HOST rail
+        imposes, which is why the counts need a staging step at all.
+        """
+        for row in pl.range(total):
+            chunk = pl.load(inp, [row, 0], [1, SIZE])
+            stage = pl.store(chunk, [row, 0], stage)
+        # Scalar read/write — a [1,1] INT32 tile.load fails ptoas 32-byte
+        # row alignment (4 bytes), the pitfall the other all_to_all_v STs
+        # avoid the same way.
+        for d in pl.range(nr):
+            v = pl.read(counts_row, [d, 0])
+            pl.write(counts, [d, 0], v)
+        return stage, counts
 
-            Both are window-bound because every operand of one collective must
-            live in the same comm domain — the same narrowing the HOST rail
-            imposes, which is why the counts need a staging step at all.
-            """
-            for row in pl.range(total):
-                chunk = pl.load(inp, [row, 0], [1, SIZE])
-                stage = pl.store(chunk, [row, 0], stage)
-            # Scalar read/write — a [1,1] INT32 tile.load fails ptoas 32-byte
-            # row alignment (4 bytes), the pitfall the other all_to_all_v STs
-            # avoid the same way.
-            for d in pl.range(nr):
-                v = pl.read(counts_row, [d, 0])
-                pl.write(counts, [d, 0], v)
-            return stage, counts
+    @pl.jit.incore
+    def consume_step(
+        data: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+        # Written by the collective (pulled from each source's send_counts
+        # window); recv_counts[src, 0] is the count the consumer reads.
+        recv_counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
+        recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
+    ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
+        """Read back each source's block, bounded by its published count.
 
-        @pl.function(type=pl.FunctionType.InCore)
-        def consume_step(
-            self,
-            data: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
-            # Written by the collective (pulled from each source's send_counts
-            # window); recv_counts[src, 0] is the count the consumer reads.
-            recv_counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-            out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
-            recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
-        ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
-            """Read back each source's block, bounded by its published count.
+        Both loops target ``out`` and their row ranges partition each
+        sender's slot, so every row is written exactly once: a ``pl.Out``
+        tensor is write-only on the device, so a row the kernel skipped
+        would come back as undefined host memory rather than as window
+        content. Keeping the valid-row loop bounded by ``recv_counts``
+        exercises the intended consumer pattern; the tail loop is what makes
+        a bounded-transfer regression visible.
+        """
+        for src in pl.range(nr):
+            n_rows_i32 = pl.read(recv_counts, [src, 0])
+            pl.write(recv_out, [src, 0], n_rows_i32)
+            n_rows = pl.cast(n_rows_i32, pl.INDEX)
+            base = src * mr
+            for r in pl.range(n_rows):
+                flat_row = base + r
+                chunk = pl.load(data, [flat_row, 0], [1, SIZE])
+                out = pl.store(chunk, [flat_row, 0], out)
+            for r in pl.range(n_rows, mr):
+                flat_row = base + r
+                chunk = pl.load(data, [flat_row, 0], [1, SIZE])
+                out = pl.store(chunk, [flat_row, 0], out)
+        return out, recv_out
 
-            Both loops target ``out`` and their row ranges partition each
-            sender's slot, so every row is written exactly once: a ``pl.Out``
-            tensor is write-only on the device, so a row the kernel skipped
-            would come back as undefined host memory rather than as window
-            content. Keeping the valid-row loop bounded by ``recv_counts``
-            exercises the intended consumer pattern; the tail loop is what makes
-            a bounded-transfer regression visible.
-            """
-            for src in pl.range(nr):
-                n_rows_i32 = pl.read(recv_counts, [src, 0])
-                pl.write(recv_out, [src, 0], n_rows_i32)
-                n_rows = pl.cast(n_rows_i32, pl.INDEX)
-                base = src * mr
-                for r in pl.range(n_rows):
-                    flat_row = base + r
-                    chunk = pl.load(data, [flat_row, 0], [1, SIZE])
-                    out = pl.store(chunk, [flat_row, 0], out)
-                for r in pl.range(n_rows, mr):
-                    flat_row = base + r
-                    chunk = pl.load(data, [flat_row, 0], [1, SIZE])
-                    out = pl.store(chunk, [flat_row, 0], out)
-            return out, recv_out
+    @pl.jit
+    def chip_pipeline(
+        inp: pl.Tensor[[total, SIZE], pl.FP32],
+        counts_row: pl.Tensor[[nr, 1], pl.INT32],
+        out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
+        recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
+        stage: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+        data: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+        signal: pl.InOut[pld.DistributedTensor[[nr, stride], pl.INT32]],
+        counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        recv: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+    ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
+        """One per-rank pipeline: stage -> collective -> consume.
 
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def chip_pipeline(
-            self,
-            inp: pl.Tensor[[total, SIZE], pl.FP32],
-            counts_row: pl.Tensor[[nr, 1], pl.INT32],
-            out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
-            recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
-            stage: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
-            data: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
-            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-            counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-            recv: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-        ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
-            """One per-rank pipeline: stage -> collective -> consume.
+        The three tasks are ordered by real TensorMap dependencies —
+        ``stage`` and ``counts`` are written then read, ``data`` and
+        ``recv`` are written by the collective then read by the consumer —
+        not by an injected ordering token.
+        """
+        stage, counts = stage_step(inp, counts_row, stage, counts)
+        data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv, core_num=core_num)
+        return consume_step(data, recv, out, recv_out)
 
-            The three tasks are ordered by real TensorMap dependencies —
-            ``stage`` and ``counts`` are written then read, ``data`` and
-            ``recv`` are written by the collective then read by the consumer —
-            not by an injected ordering token.
-            """
-            stage, counts = self.stage_step(inp, counts_row, stage, counts)
-            data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv, core_num=1)
-            return self.consume_step(data, recv, out, recv_out)
+    @pl.jit.host
+    def host_orch(
+        inputs: pl.Tensor[[nr, total, SIZE], pl.FP32],
+        send_counts: pl.Tensor[[nr, nr, 1], pl.INT32],
+        outputs: pl.Out[pl.Tensor[[nr, total, SIZE], pl.FP32]],
+        recv_outputs: pl.Out[pl.Tensor[[nr, nr, 1], pl.INT32]],
+    ) -> tuple[pl.Tensor[[nr, total, SIZE], pl.FP32], pl.Tensor[[nr, nr, 1], pl.INT32]]:
+        """Allocate the five windows once, dispatch one pipeline per rank."""
+        stage_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
+        data_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
+        signal_buf = pld.alloc_window_buffer(nr * stride * pl.INT32.get_byte())
+        # Peers pull ONE word per rank from this window (scalar ld_dev read),
+        # so the [NR, 1] INT32 vector is the whole requirement — no fixed-
+        # width TLOAD unit set.
+        counts_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
+        recv_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
 
-        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
-        def host_orch(
-            self,
-            inputs: pl.Tensor[[nr, total, SIZE], pl.FP32],
-            send_counts: pl.Tensor[[nr, nr, 1], pl.INT32],
-            outputs: pl.Out[pl.Tensor[[nr, total, SIZE], pl.FP32]],
-            recv_outputs: pl.Out[pl.Tensor[[nr, nr, 1], pl.INT32]],
-        ) -> tuple[pl.Tensor[[nr, total, SIZE], pl.FP32], pl.Tensor[[nr, nr, 1], pl.INT32]]:
-            """Allocate the five windows once, dispatch one pipeline per rank."""
-            stage_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
-            data_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
-            signal_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
-            # Peers pull ONE word per rank from this window (scalar ld_dev read),
-            # so the [NR, 1] INT32 vector is the whole requirement — no fixed-
-            # width TLOAD unit set.
-            counts_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
-            recv_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
+        for r in pl.range(pld.world_size()):
+            stage = pld.window(stage_buf, [total, SIZE], dtype=pl.FP32)
+            data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
+            sig = pld.window(signal_buf, [nr, stride], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
+            chip_pipeline(
+                inputs[r],
+                send_counts[r],
+                outputs[r],
+                recv_outputs[r],
+                stage,
+                data,
+                sig,
+                counts,
+                recv,
+                device=r,
+            )
+        return outputs, recv_outputs
 
-            for r in pl.range(pld.world_size()):
-                stage = pld.window(stage_buf, [total, SIZE], dtype=pl.FP32)
-                data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
-                sig = pld.window(signal_buf, [nr, 1], dtype=pl.INT32)
-                counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
-                recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
-                self.chip_pipeline(
-                    inputs[r],
-                    send_counts[r],
-                    outputs[r],
-                    recv_outputs[r],
-                    stage,
-                    data,
-                    sig,
-                    counts,
-                    recv,
-                    device=r,
-                )
-            return outputs, recv_outputs
-
-    return L2TensorAllToAllV
+    return host_orch
 
 
 def _golden_inputs(nr: int, mr: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -243,9 +248,14 @@ def _golden_inputs(nr: int, mr: int) -> tuple[torch.Tensor, torch.Tensor]:
 class TestL2TensorAllToAllV:
     """L2 managed all_to_all_v: one chip pipeline per rank, no nested dispatch."""
 
+    @pytest.mark.parametrize("core_num", _CORE_NUMS)
     @pytest.mark.parametrize("n_ranks", [2, 4])
-    def test_l2_all_to_all_v(self, test_config, device_ids, n_ranks):
-        """Compile and run the CHIP-pipeline all_to_all_v for P in {2, 4}."""
+    def test_l2_all_to_all_v(self, test_config, device_ids, n_ranks, core_num):
+        """Compile and run the CHIP-pipeline all_to_all_v for P in {2, 4}, L in {1, 2, 4}.
+
+        ``L > 1`` must produce results identical to ``L = 1``: the golden below
+        does not depend on ``core_num``.
+        """
         if len(device_ids) < n_ranks:
             pytest.skip(f"L2 all_to_all_v P={n_ranks} needs {n_ranks} devices, got {device_ids}")
 
@@ -253,13 +263,22 @@ class TestL2TensorAllToAllV:
         mr = MAX_RECV
         total = nr * mr
 
-        program = _build_l2_all_to_all_v_program(nr, mr)
-        compiled = ir.compile(
-            program,
-            platform=test_config.platform,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:nr],
-                num_sub_workers=0,
+        inputs, send_counts = _golden_inputs(nr, mr)
+        outputs = torch.zeros((nr, total, SIZE), dtype=torch.float32)
+        recv_outputs = torch.zeros((nr, nr, 1), dtype=torch.int32)
+
+        program = _build_l2_all_to_all_v_program(nr, mr, core_num)
+        compiled = program.compile(
+            inputs,
+            send_counts,
+            outputs,
+            recv_outputs,
+            config=RunConfig(
+                platform=test_config.platform,
+                distributed_config=DistributedConfig(
+                    device_ids=device_ids[:nr],
+                    num_sub_workers=0,
+                ),
             ),
         )
 
@@ -274,11 +293,7 @@ class TestL2TensorAllToAllV:
         kernel_src = next_levels / "chip_pipeline" / "kernels" / "aiv" / "__builtin_all_to_all_v__fp32.cpp"
         assert kernel_src.is_file(), f"expected the rendered builtin kernel at {kernel_src}"
 
-        inputs, send_counts = _golden_inputs(nr, mr)
-        outputs = torch.zeros((nr, total, SIZE), dtype=torch.float32)
-        recv_outputs = torch.zeros((nr, nr, 1), dtype=torch.int32)
-
-        compiled(inputs, send_counts, outputs, recv_outputs)
+        compiled(inputs, send_counts, outputs, recv_outputs, config=RunConfig(platform=test_config.platform))
 
         # Rank `rank` receives from `src` the chunk that `src` sent to dest=rank.
         for rank in range(nr):
@@ -340,8 +355,9 @@ class TestL2TensorAllToAllVSkew:
     """
 
     @pytest.mark.parametrize("case", sorted(_SKEW_CASES))
+    @pytest.mark.parametrize("core_num", _CORE_NUMS)
     @pytest.mark.parametrize("n_ranks", [2, 4])
-    def test_l2_all_to_all_v_skewed_counts(self, test_config, device_ids, n_ranks, case):
+    def test_l2_all_to_all_v_skewed_counts(self, test_config, device_ids, n_ranks, core_num, case):
         if len(device_ids) < n_ranks:
             pytest.skip(f"L2 all_to_all_v P={n_ranks} needs {n_ranks} devices, got {device_ids}")
 
@@ -350,23 +366,19 @@ class TestL2TensorAllToAllVSkew:
         total = nr * mr
         raw = _SKEW_CASES[case](nr, mr)
 
-        compiled = ir.compile(
-            _build_l2_all_to_all_v_program(nr, mr),
-            platform=test_config.platform,
-            distributed_config=DistributedConfig(device_ids=device_ids[:nr], num_sub_workers=0),
-        )
-
         # Fill the FULL capacity slot of every destination, not just the rows
         # being sent, so an over-send would deposit recognisable data in the
         # padding rows and the tail assertion below would catch it.
         #
-        # ``salt`` makes every (case, n_ranks) payload unique. Window memory is
-        # not zero-initialised on reuse AND persists across tests in one
-        # process, so an unwritten row could otherwise still hold the pattern an
-        # earlier test wrote — indistinguishable from a real over-send. The
-        # 900000 base additionally separates this file's salts from the InCore
-        # and HOST files', which share the same formula.
-        salt = 900000 + (sorted(_SKEW_CASES).index(case) + 1) * 100000 + nr * 10000
+        # ``salt`` makes every (case, n_ranks, core_num) payload unique. Window
+        # memory is not zero-initialised on reuse AND persists across tests in
+        # one process, so an unwritten row could otherwise still hold the
+        # pattern an earlier test wrote — indistinguishable from a real
+        # over-send. The core_num term keeps that true across the L
+        # parametrizations, which reuse the same (case, n_ranks) slot layout;
+        # the 900000 base additionally separates this file's salts from the
+        # InCore and HOST files', which share the same formula.
+        salt = 900000 + (sorted(_SKEW_CASES).index(case) + 1) * 100000 + nr * 10000 + core_num * 1000
         inputs = torch.zeros((nr, total, SIZE), dtype=torch.float32)
         send_counts = torch.zeros((nr, nr, 1), dtype=torch.int32)
         for r in range(nr):
@@ -379,7 +391,19 @@ class TestL2TensorAllToAllVSkew:
 
         outputs = torch.zeros((nr, total, SIZE), dtype=torch.float32)
         recv_outputs = torch.zeros((nr, nr, 1), dtype=torch.int32)
-        compiled(inputs, send_counts, outputs, recv_outputs)
+
+        program = _build_l2_all_to_all_v_program(nr, mr, core_num)
+        compiled = program.compile(
+            inputs,
+            send_counts,
+            outputs,
+            recv_outputs,
+            config=RunConfig(
+                platform=test_config.platform,
+                distributed_config=DistributedConfig(device_ids=device_ids[:nr], num_sub_workers=0),
+            ),
+        )
+        compiled(inputs, send_counts, outputs, recv_outputs, config=RunConfig(platform=test_config.platform))
 
         for rank in range(nr):
             for src in range(nr):

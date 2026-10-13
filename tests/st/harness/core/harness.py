@@ -210,7 +210,7 @@ class PTOTestCase(ABC):
         strategy: OptimizationStrategy | None = None,
         memory_planner: MemoryPlanner | None = None,
         enable_pypto_l0c_double_buffer: bool | None = None,
-        enable_buffer_ir: bool = False,
+        enable_buffer_ir: bool = True,
     ):
         """Initialize test case.
 
@@ -231,7 +231,8 @@ class PTOTestCase(ABC):
                 If None, falls back to ``get_memory_planner()`` (which returns
                 None, deferring to ir.compile's PYPTO default).
             enable_buffer_ir: Use and verify the staged Buffer pipeline in
-                inline and precompiled runs. Defaults to false.
+                inline and precompiled runs. Defaults to true; pass False
+                to keep the legacy Tile path.
         """
         self.config = config or RunConfig()
         self._override_platform = platform

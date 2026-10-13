@@ -9,11 +9,13 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -22,6 +24,9 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_config.h"
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/backend/common/buffer_elementwise_recipes.h"
 #include "pypto/backend/common/buffer_type_support.h"
 #include "pypto/backend/common/buffer_view_semantics.h"
@@ -45,6 +50,7 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/buffer_ir_selection.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/property_verifier_registry.h"
@@ -64,25 +70,66 @@ std::vector<int64_t> StaticExtents(const std::vector<ExprPtr>& extents, const Sp
   return result;
 }
 
+// Valid extents of a Vec descriptor. A runtime extent makes both dimensions
+// dynamic: the native metadata update always writes both. The lane-1 [0, 0]
+// sentinel means "no data on this lane", not a static empty window, so it is a
+// runtime value too.
+std::vector<int64_t> DescriptorValid(const std::vector<ExprPtr>& valid, const std::vector<int64_t>& shape) {
+  std::vector<int64_t> result;
+  for (const auto& extent : valid) {
+    auto constant = As<ConstInt>(extent);
+    if (!constant || constant->value_ == 0) return std::vector<int64_t>(shape.size(), -1);
+    result.push_back(constant->value_);
+  }
+  return result;
+}
+
+bool IsDenseVecTile(const TileTypePtr& tile, const TileView& view) {
+  return tile->shape_.size() == 2 && backend::IsDenseBufferTransferDtype(tile->dtype_) &&
+         tile->GetMemorySpace() == MemorySpace::Vec && view.blayout == TileLayout::row_major &&
+         view.slayout == TileLayout::none_box && view.fractal == 512 && view.pad == PadValue::null &&
+         view.compact == CompactMode::null;
+}
+
+void CheckDenseVecTile(const TileTypePtr& tile, const TileView& view, const Span& span) {
+  CHECK_SPAN(IsDenseVecTile(tile, view), span)
+      << "LowerTileToBuffer: this recipe requires dense rank-2 Vec FP16/BF16/FP32/INT32 tiles";
+}
+
 BufferTypePtr DenseDescriptor(const TileTypePtr& tile, const Span& span) {
   const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
-  CHECK_SPAN(tile->shape_.size() == 2 && backend::IsDenseBufferTransferDtype(tile->dtype_) &&
-                 tile->GetMemorySpace() == MemorySpace::Vec && view.blayout == TileLayout::row_major &&
-                 view.slayout == TileLayout::none_box && view.fractal == 512 && view.pad == PadValue::null &&
-                 view.compact == CompactMode::null,
-             span)
-      << "LowerTileToBuffer: this recipe requires dense rank-2 Vec FP16/BF16/FP32/INT32 tiles";
+  CheckDenseVecTile(tile, view, span);
   const auto view_offset = As<ConstInt>(view.start_offset);
   CHECK_SPAN(!view.start_offset || (view_offset && view_offset->value_ == 0), span)
       << "LowerTileToBuffer: nonzero tile view offsets require an explicit Buffer view recipe";
   const auto shape = StaticExtents(tile->shape_, span);
-  const auto valid = StaticExtents(view.valid_shape.empty() ? tile->shape_ : view.valid_shape, span);
   if (!view.stride.empty()) {
     const auto strides = StaticExtents(view.stride, span);
     CHECK_SPAN(strides == std::vector<int64_t>({shape[1], 1}), span)
         << "LowerTileToBuffer: strided tiles require an explicit Buffer view recipe";
   }
+  const auto valid = DescriptorValid(view.valid_shape.empty() ? tile->shape_ : view.valid_shape, shape);
   return std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec, valid);
+}
+
+// A use-site window of another handle. Its row pitch and offset belong to the
+// explicit buffer.subview, so the Tile's own stride/offset view is not checked.
+// A window never takes a metadata update, so each valid dimension is static or
+// dynamic on its own, as the subview's explicit valid clause types it.
+BufferTypePtr WindowDescriptor(const TileTypePtr& tile, const Span& span) {
+  const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
+  CheckDenseVecTile(tile, view, span);
+  const auto shape = StaticExtents(tile->shape_, span);
+  std::vector<int64_t> valid;
+  for (const auto& extent : view.valid_shape.empty() ? tile->shape_ : view.valid_shape) {
+    auto constant = As<ConstInt>(extent);
+    valid.push_back(constant && constant->value_ != 0 ? constant->value_ : -1);
+  }
+  return std::make_shared<BufferType>(shape, tile->dtype_, MemorySpace::Vec, valid);
+}
+
+bool HasDynamicValid(const BufferTypePtr& type) {
+  return std::any_of(type->valid_shape_.begin(), type->valid_shape_.end(), [](int64_t v) { return v < 0; });
 }
 
 // A cube-space tile keeps its resolved fractal layout. Its physical extents
@@ -135,7 +182,7 @@ class StorageIndex : public IRVisitor {
     // Call retains its logical deduced type and is not an allocation identity.
     auto variable = AsVarLike(expr);
     if (auto tile = variable ? As<TileType>(variable->GetType()) : nullptr;
-        tile && types_.insert(tile.get()).second) {
+        tile && !windows.count(tile.get()) && types_.insert(tile.get()).second) {
       auto memory = GetDefinedMemRef(tile);
       CHECK_SPAN(memory && memory->base_ && !memory->is_pinned_ && memory->slot_count_ == 1 &&
                      !memory->slot_index_.has_value(),
@@ -159,6 +206,9 @@ class StorageIndex : public IRVisitor {
   std::unordered_map<const Var*, BufferStorage> roots;
   std::unordered_map<const TileType*, VarPtr> handles;
   std::unordered_map<const Call*, VarPtr> write_views;
+  // Tiles that are use-site windows of another handle (slices and their
+  // relabels). Their storage is the source's; lowering defines them in place.
+  std::unordered_set<const TileType*> windows;
 
  protected:
   void VisitStmt_(const AssignStmtPtr& assign) override {
@@ -169,7 +219,24 @@ class StorageIndex : public IRVisitor {
     if (auto call = As<Call>(assign->value_); call && IsOp(call, "tile.matmul_acc")) {
       IndexProductView(call, assign->var_);
     }
+    if (auto call = As<Call>(assign->value_); call && IsWindowDefinition(call)) {
+      if (auto tile = As<TileType>(assign->var_->GetType())) windows.insert(tile.get());
+    }
+    if (auto call = As<Call>(assign->value_);
+        call && (IsOp(call, "tile.slice") || IsOp(call, "tile.assemble"))) {
+      const auto& source = IsOp(call, "tile.slice") ? call->args_[0] : ExprPtr(assign->var_);
+      if (auto tile = As<TileType>(source->GetType())) window_sources_.insert(tile.get());
+    }
     IRVisitor::VisitStmt_(assign);
+  }
+
+  // A slice is a window at its (possibly runtime) offset; a relabel of a
+  // window is still a window. Allocation-backed relabels stay storage members.
+  bool IsWindowDefinition(const CallPtr& call) const {
+    if (IsOp(call, "tile.slice")) return true;
+    if (!IsOp(call, "tile.reshape") && !IsOp(call, "tile.reinterpret_view")) return false;
+    auto source = call->args_.empty() ? nullptr : As<TileType>(call->args_[0]->GetType());
+    return source && windows.count(source.get());
   }
 
   // tile.matmul_acc may accumulate into a wider valid rectangle than its
@@ -259,6 +326,24 @@ class StorageIndex : public IRVisitor {
     CHECK_SPAN(origin, span) << "LowerTileToBuffer: addressed storage needs a full-capacity MemRef anchor; "
                                 "interior windows alone do not determine the planned allocation origin";
 
+    // Valid extents are handle metadata. Members naming one window that
+    // disagree only in valid extents, one of them runtime, share one dynamic
+    // handle whose metadata each definition updates.
+    std::set<std::tuple<int64_t, std::string, std::vector<int64_t>>> dynamic_windows;
+    for (const auto& member : storage.members) {
+      if (HasDynamicValid(member.descriptor)) {
+        dynamic_windows.emplace(As<ConstInt>(member.memory->byte_offset_)->value_,
+                                member.descriptor->dtype_.ToString(), member.descriptor->shape_);
+      }
+    }
+    for (auto& member : storage.members) {
+      const auto& d = member.descriptor;
+      if (!HasDynamicValid(d) && dynamic_windows.count({As<ConstInt>(member.memory->byte_offset_)->value_,
+                                                        d->dtype_.ToString(), d->shape_})) {
+        member.descriptor = std::make_shared<BufferType>(d->shape_, d->dtype_, d->memory_space_,
+                                                         std::vector<int64_t>(d->shape_.size(), -1));
+      }
+    }
     std::map<ViewKey, BufferTypePtr> descriptors;
     std::vector<ViewKey> member_keys;
     for (const auto& member : storage.members) {
@@ -279,21 +364,56 @@ class StorageIndex : public IRVisitor {
                         backend::DenseBufferBytes(first.second) == capacity;
     CHECK_SPAN(direct || capacity % 32 == 0, span)
         << "LowerTileToBuffer: byte storage views require allocation capacity aligned to 32 bytes";
+    for (const auto& [key, descriptor] : descriptors) {
+      CHECK_SPAN(direct || !HasDynamicValid(descriptor), span)
+          << "LowerTileToBuffer: a tile with runtime valid extents needs its own allocation; it cannot share "
+             "a byte-view storage root";
+    }
     auto root_type =
         direct ? first.second
                : std::make_shared<BufferType>(std::vector<int64_t>{static_cast<int64_t>(capacity / 32), 32},
                                               DataType::UINT8, MemorySpace::Vec);
     storage.handle = std::make_shared<Var>(base->name_hint_ + "_buffer", root_type, span);
-    std::vector<ExprPtr> args{std::make_shared<MakeTuple>(std::vector<ExprPtr>{}, span)};
+    // A runtime valid dimension starts as its physical extent; each defining
+    // operation then states the valid extents it produces.
+    std::vector<ExprPtr> initial_valid;
+    for (size_t axis = 0; axis < root_type->valid_shape_.size(); ++axis) {
+      if (root_type->valid_shape_[axis] < 0) {
+        initial_valid.push_back(std::make_shared<ConstInt>(root_type->shape_[axis], DataType::INDEX, span));
+      }
+    }
+    std::vector<ExprPtr> args{std::make_shared<MakeTuple>(initial_valid, span)};
     if (addressed_) args.push_back(std::make_shared<ConstInt>(*origin, DataType::INDEX, span));
     auto allocation = OpRegistry::GetInstance().CreateInternal("buffer.alloc", args, {}, root_type, span);
     storage.definitions.push_back(std::make_shared<AssignStmt>(storage.handle, allocation, span));
 
+    std::set<ViewKey> source_keys;
+    for (size_t i = 0; i < storage.members.size(); ++i) {
+      if (window_sources_.count(storage.members[i].tile.get())) source_keys.insert(member_keys[i]);
+    }
     std::map<ViewKey, VarPtr> views;
     std::map<std::pair<uint64_t, uint64_t>, VarPtr> byte_windows;
     for (const auto& [key, descriptor] : descriptors) {
       if (direct) {
         views.emplace(key, storage.handle);
+        continue;
+      }
+      if (source_keys.count(key)) {
+        // An addressed allocation at the window's planned address aliases the
+        // same bytes the byte view would; addressless storage has no address.
+        CHECK_SPAN(addressed_, span)
+            << "LowerTileToBuffer: a tile sliced or assembled into cannot share an addressless storage root";
+        std::vector<ExprPtr> args{std::make_shared<MakeTuple>(std::vector<ExprPtr>{}, span),
+                                  std::make_shared<ConstInt>(*origin + static_cast<int64_t>(std::get<0>(key)),
+                                                             DataType::INDEX, span)};
+        CHECK_SPAN(!HasDynamicValid(descriptor), span) << "LowerTileToBuffer: a tile with runtime valid "
+                                                          "extents needs its own allocation; it cannot share "
+                                                          "a byte-view storage root";
+        auto handle = std::make_shared<Var>(base->name_hint_ + "_window_source", descriptor, span);
+        storage.definitions.push_back(std::make_shared<AssignStmt>(
+            handle, OpRegistry::GetInstance().CreateInternal("buffer.alloc", args, {}, descriptor, span),
+            span));
+        views.emplace(key, handle);
         continue;
       }
       const auto offset = std::get<0>(key);
@@ -407,6 +527,9 @@ class StorageIndex : public IRVisitor {
   }
 
   bool addressed_;
+  // Tiles that windows are cut from. PTOAS cannot legalize a subview of a
+  // byte-root relabel, so in addressed storage they get their own allocation.
+  std::unordered_set<const TileType*> window_sources_;
   std::unordered_set<const TileType*> types_;
   std::unordered_map<const Var*, CallPtr> declarations_;
 };
@@ -446,7 +569,9 @@ class TileToBufferMutator : public IRMutator {
   }
 
   StmtPtr VisitStmt_(const AssignStmtPtr& assign) override {
-    if (auto call = As<Call>(assign->value_)) return LowerCall(call, assign->var_);
+    if (auto call = As<Call>(assign->value_)) {
+      return WithValidState(call, assign->var_, LowerCall(call, assign->var_));
+    }
     if (As<TileType>(assign->var_->GetType())) {
       auto source = AsVarLike(assign->value_);
       INTERNAL_CHECK_SPAN(source && Handle(source) == Handle(assign->var_), assign->span_)
@@ -599,19 +724,87 @@ class TileToBufferMutator : public IRMutator {
   VarPtr Handle(const ExprPtr& value) const {
     auto tile = As<TileType>(value->GetType());
     INTERNAL_CHECK_SPAN(tile, value->span_) << "Internal error: Buffer conversion expected a Tile operand";
+    if (auto window = window_handles_.find(tile.get()); window != window_handles_.end()) {
+      return window->second;
+    }
     auto found = storage_.handles.find(tile.get());
     INTERNAL_CHECK_SPAN(found != storage_.handles.end(), value->span_)
         << "Internal error: missing indexed storage view for a Tile operand";
     return found->second;
   }
 
-  MakeTuplePtr Valid(const ExprPtr& tile) const {
-    const auto type = As<BufferType>(Handle(tile)->GetType());
+  // The Tile's own valid extents: constants for a static descriptor, the
+  // runtime expressions otherwise. They equal the handle's current metadata.
+  MakeTuplePtr Valid(const ExprPtr& tile) {
+    const auto type = As<TileType>(tile->GetType());
+    INTERNAL_CHECK_SPAN(type, tile->span_) << "Internal error: valid extents require a Tile operand";
+    const auto view = tile_view_semantics::GetEffectiveTileView(*type);
     std::vector<ExprPtr> extents;
-    for (const auto extent : type->valid_shape_) {
-      extents.push_back(std::make_shared<ConstInt>(extent, DataType::INDEX, tile->span_));
+    for (const auto& extent : view.valid_shape.empty() ? type->shape_ : view.valid_shape) {
+      if (auto constant = As<ConstInt>(extent)) {
+        extents.push_back(std::make_shared<ConstInt>(constant->value_, DataType::INDEX, tile->span_));
+      } else {
+        extents.push_back(VisitExpr(extent));
+      }
     }
     return std::make_shared<MakeTuple>(std::move(extents), tile->span_);
+  }
+
+  // A definition of a dynamic handle first states the valid extents it
+  // produces. Windows carry theirs in their own buffer.subview instead.
+  StmtPtr WithValidState(const CallPtr& call, const VarPtr& result, const StmtPtr& lowered) {
+    if (!result || !As<TileType>(result->GetType()) ||
+        window_handles_.count(As<TileType>(result->GetType()).get()) || IsOp(call, "tile.alloc") ||
+        IsOp(call, "tile.set_validshape") || IsOp(call, "tile.reshape") ||
+        IsOp(call, "tile.reinterpret_view") || IsOp(call, "tile.transpose_view")) {
+      return lowered;
+    }
+    const auto handle = Handle(result);
+    const auto type = As<BufferType>(handle->GetType());
+    if (!type || !HasDynamicValid(type)) return lowered;
+    return std::make_shared<SeqStmts>(
+        std::vector<StmtPtr>{Operation("buffer.set_validshape", {handle, Valid(result)}, call->span_),
+                             lowered},
+        call->span_);
+  }
+
+  // Define a use-site window of `source` at `offsets`, typed by `descriptor`.
+  VarPtr DefineWindow(const std::string& name, const VarPtr& source, const MakeTuplePtr& offsets,
+                      const BufferTypePtr& descriptor, const MakeTuplePtr& valid, std::vector<StmtPtr>& out,
+                      const Span& span) {
+    // The explicit valid clause types each native result dimension.
+    std::vector<ExprPtr> args{source, offsets, valid};
+    auto handle = std::make_shared<Var>(name, descriptor, span);
+    out.push_back(std::make_shared<AssignStmt>(
+        handle, OpRegistry::GetInstance().CreateInternal("buffer.subview", args, {}, descriptor, span),
+        span));
+    window_origins_[handle.get()] = {source, offsets};
+    return handle;
+  }
+
+  MakeTuplePtr Offsets(const ExprPtr& tuple) {
+    auto offsets = As<MakeTuple>(tuple);
+    INTERNAL_CHECK_SPAN(offsets && offsets->elements_.size() == 2, tuple->span_)
+        << "Internal error: rank-2 window offsets must be a MakeTuple";
+    return std::make_shared<MakeTuple>(
+        std::vector<ExprPtr>{VisitExpr(offsets->elements_[0]), VisitExpr(offsets->elements_[1])},
+        tuple->span_);
+  }
+
+  static MakeTuplePtr ZeroOffsets(const Span& span) {
+    auto zero = std::make_shared<ConstInt>(0, DataType::INDEX, span);
+    return std::make_shared<MakeTuple>(std::vector<ExprPtr>{zero, zero}, span);
+  }
+
+  // Allocation metadata updates make both dimensions dynamic. A use-site
+  // subview instead types each dimension from its explicit valid operand.
+  // Bridge those representations without changing storage or copying data.
+  VarPtr WindowHandle(const ExprPtr& tile, std::vector<StmtPtr>& out) {
+    auto handle = Handle(tile);
+    const auto descriptor = WindowDescriptor(As<TileType>(tile->GetType()), tile->span_);
+    if (structural_equal(handle->GetType(), descriptor)) return handle;
+    return DefineWindow(handle->name_hint_ + "_valid_window", handle, ZeroOffsets(tile->span_), descriptor,
+                        Valid(tile), out, tile->span_);
   }
 
   StmtPtr Operation(const std::string& name, const std::vector<ExprPtr>& args, const Span& span) const {
@@ -645,8 +838,104 @@ class TileToBufferMutator : public IRMutator {
       (void)Handle(result);
       return Empty(call->span_);
     }
-    if (IsOp(call, "tile.reshape")) {
-      INTERNAL_CHECK_SPAN(result, call->span_) << "Internal error: tile.reshape has no result";
+    if (IsOp(call, "tile.slice")) {
+      // A slice aliases its source at (possibly runtime) offsets, keeping the
+      // source's row pitch. It is defined here, where its offsets are in scope.
+      INTERNAL_CHECK_SPAN(result && call->args_.size() >= 3, call->span_)
+          << "Internal error: tile.slice requires a source, shape, offsets and a result";
+      const auto tile = As<TileType>(result->GetType());
+      const auto drop_dims = call->args_.size() == 5 ? As<MakeTuple>(call->args_[4]) : nullptr;
+      CHECK_SPAN((!drop_dims || drop_dims->elements_.empty()) && tile->shape_.size() == 2 &&
+                     As<TileType>(call->args_[0]->GetType())->shape_.size() == 2,
+                 call->span_)
+          << "LowerTileToBuffer: rank-reducing tile.slice requires a Buffer view recipe";
+      std::vector<StmtPtr> out;
+      window_handles_[tile.get()] =
+          DefineWindow(result->name_hint_, Handle(call->args_[0]), Offsets(call->args_[2]),
+                       WindowDescriptor(tile, call->span_), Valid(result), out, call->span_);
+      return std::make_shared<SeqStmts>(out, call->span_);
+    }
+    if ((IsOp(call, "tile.reshape") || IsOp(call, "tile.reinterpret_view")) && result &&
+        storage_.windows.count(As<TileType>(result->GetType()).get())) {
+      // A relabel of a window cannot be declared at the allocation: it
+      // reinterprets the window handle where that handle is defined.
+      const auto tile = As<TileType>(result->GetType());
+      const auto descriptor = WindowDescriptor(tile, call->span_);
+      CHECK_SPAN(!HasDynamicValid(descriptor), call->span_)
+          << "LowerTileToBuffer: relabelling a window with runtime valid extents requires a Buffer view "
+             "recipe";
+      auto handle = std::make_shared<Var>(result->name_hint_, descriptor, call->span_);
+      window_handles_[tile.get()] = handle;
+      return std::make_shared<AssignStmt>(
+          handle,
+          OpRegistry::GetInstance().CreateInternal("buffer.reshape", {Handle(call->args_[0])}, {}, descriptor,
+                                                   call->span_),
+          call->span_);
+    }
+    if (IsOp(call, "tile.set_validshape")) {
+      // The result shares the input's storage. A static result is already the
+      // indexed static alias; a runtime result updates the shared handle.
+      INTERNAL_CHECK_SPAN(result && call->args_.size() == 3, call->span_)
+          << "Internal error: tile.set_validshape requires a tile, two extents and a result";
+      const auto handle = Handle(result);
+      if (!HasDynamicValid(As<BufferType>(handle->GetType()))) return Empty(call->span_);
+      CHECK_SPAN(!window_handles_.count(As<TileType>(result->GetType()).get()), call->span_)
+          << "LowerTileToBuffer: tile.set_validshape cannot change a window's static view metadata";
+      return Operation("buffer.set_validshape",
+                       {handle, std::make_shared<MakeTuple>(std::vector<ExprPtr>{VisitExpr(call->args_[1]),
+                                                                                 VisitExpr(call->args_[2])},
+                                                            call->span_)},
+                       call->span_);
+    }
+    if (IsOp(call, "tile.assemble")) {
+      INTERNAL_CHECK_SPAN(result && call->args_.size() == 3, call->span_)
+          << "Internal error: tile.assemble requires a target, a source, offsets and a result";
+      CHECK_SPAN(!GetOptionalDoubleKwarg(call->kwargs_, "pre_quant") &&
+                     !GetKwargOr<bool>(call->kwargs_, "pre_relu", false),
+                 call->span_)
+          << "LowerTileToBuffer: fix-pipe pre_quant/pre_relu assembles require a Buffer transfer recipe";
+      const auto source_tile = As<TileType>(call->args_[1]->GetType());
+      const auto result_space = As<TileType>(result->GetType())->GetMemorySpace();
+      CHECK_SPAN(source_tile->GetMemorySpace() == MemorySpace::Vec && result_space == MemorySpace::Vec,
+                 call->span_)
+          << "LowerTileToBuffer: tile.assemble into "
+          << (result_space ? MemorySpaceToString(*result_space) : std::string("an unresolved space"))
+          << " requires a Buffer transfer recipe (only Vec -> Vec is supported)";
+      // The result owns the target's storage. Data outside the window is the
+      // target's, copied first when the planner gave the result new storage.
+      std::vector<StmtPtr> out;
+      const auto destination = Handle(result);
+      const auto target = Handle(call->args_[0]);
+      if (target != destination) {
+        auto copy_target = target;
+        auto copy_destination = destination;
+        if (!structural_equal(target->GetType(), destination->GetType())) {
+          // Assemble can enlarge the valid region. Preserve only the old
+          // target rectangle through a destination view with its descriptor.
+          copy_target = WindowHandle(call->args_[0], out);
+          copy_destination =
+              DefineWindow(result->name_hint_ + "_preserved_window", destination, ZeroOffsets(call->span_),
+                           As<BufferType>(copy_target->GetType()), Valid(call->args_[0]), out, call->span_);
+        }
+        out.push_back(Operation("buffer.copy", {copy_target, copy_destination}, call->span_));
+      }
+      const auto source = Handle(call->args_[1]);
+      const auto offsets = Offsets(call->args_[2]);
+      // A source that already is this window was written in place.
+      if (auto origin = window_origins_.find(source.get());
+          origin != window_origins_.end() && origin->second.first == destination &&
+          structural_equal(origin->second.second, offsets)) {
+        return std::make_shared<SeqStmts>(out, call->span_);
+      }
+      const auto copy_source = WindowHandle(call->args_[1], out);
+      const auto source_type = As<BufferType>(copy_source->GetType());
+      auto window = DefineWindow(result->name_hint_ + "_window", destination, offsets, source_type,
+                                 Valid(call->args_[1]), out, call->span_);
+      out.push_back(Operation("buffer.copy", {copy_source, window}, call->span_));
+      return std::make_shared<SeqStmts>(out, call->span_);
+    }
+    if (IsOp(call, "tile.reshape") || IsOp(call, "tile.reinterpret_view")) {
+      INTERNAL_CHECK_SPAN(result, call->span_) << "Internal error: tile relabel has no result";
       const auto& entry = OpRegistry::GetInstance().GetEntry(call->op_->name_);
       ValidateKwargs(call->kwargs_, entry.GetOp()->GetAttrs(), call->op_->name_);
       const auto expected = As<TileType>(entry.GetDeduceType()(call->args_, call->kwargs_));
@@ -655,14 +944,16 @@ class TileToBufferMutator : public IRMutator {
       const auto source_memory = GetDefinedMemRef(source);
       const auto destination_memory = GetDefinedMemRef(destination);
       const auto descriptor = As<BufferType>(Handle(result)->GetType());
-      INTERNAL_CHECK_SPAN(expected && expected->dtype_ == descriptor->dtype_ &&
-                              StaticExtents(expected->shape_, call->span_) == descriptor->shape_ &&
-                              StaticExtents(tile_view_semantics::GetEffectiveTileView(*expected).valid_shape,
-                                            call->span_) == descriptor->valid_shape_ &&
-                              source_memory->base_ == destination_memory->base_ &&
-                              structural_equal(source_memory->byte_offset_, destination_memory->byte_offset_),
-                          call->span_)
-          << "Internal error: planned tile.reshape must preserve its validated storage window";
+      INTERNAL_CHECK_SPAN(
+          expected && expected->dtype_ == descriptor->dtype_ &&
+              StaticExtents(expected->shape_, call->span_) == descriptor->shape_ &&
+              (HasDynamicValid(descriptor) ||
+               DescriptorValid(tile_view_semantics::GetEffectiveTileView(*expected).valid_shape,
+                               descriptor->shape_) == descriptor->valid_shape_) &&
+              source_memory->base_ == destination_memory->base_ &&
+              structural_equal(source_memory->byte_offset_, destination_memory->byte_offset_),
+          call->span_)
+          << "Internal error: planned " << call->op_->name_ << " must preserve its validated storage window";
       // StorageIndex already materialized this typed alias at the allocation.
       // Logical reshape has no data transfer and needs no second alias handle.
       return Empty(call->span_);
@@ -705,15 +996,24 @@ class TileToBufferMutator : public IRMutator {
       INTERNAL_CHECK_SPAN(call->args_.size() == entry.GetArgumentCount(), call->span_)
           << "Internal error: malformed Tile elementwise recipe operand count";
       ValidateKwargs(call->kwargs_, entry.GetOp()->GetAttrs(), call->op_->name_);
-      const auto destination = Handle(result);
+      auto destination = Handle(result);
       const auto dtype = As<BufferType>(destination->GetType())->dtype_;
-      std::vector<ExprPtr> args;
+      bool needs_windows = false;
       for (const auto& input : recipe->inputs) {
         INTERNAL_CHECK_SPAN(input.logical_index < call->args_.size(), call->span_)
             << "Internal error: malformed Tile elementwise recipe operands";
+        if (input.kind == backend::BufferElementwiseOperandKind::Buffer &&
+            !structural_equal(Handle(call->args_[input.logical_index])->GetType(), destination->GetType())) {
+          needs_windows = true;
+        }
+      }
+      std::vector<StmtPtr> out;
+      if (needs_windows) destination = WindowHandle(result, out);
+      std::vector<ExprPtr> args;
+      for (const auto& input : recipe->inputs) {
         const auto& source = call->args_[input.logical_index];
         if (input.kind == backend::BufferElementwiseOperandKind::Buffer) {
-          args.push_back(Handle(source));
+          args.push_back(needs_windows ? WindowHandle(source, out) : Handle(source));
         } else {
           // Scalar representation belongs to the lowering contract. The emitter
           // consumes the resulting type and never repairs element operands.
@@ -735,7 +1035,8 @@ class TileToBufferMutator : public IRMutator {
       // kwargs retain their typed schema and are checked during construction.
       const auto kwargs = IsOp(call, "tile.full") ? decltype(call->kwargs_){} : call->kwargs_;
       auto lowered = OpRegistry::GetInstance().CreateInternal(recipe->buffer_op, args, kwargs, call->span_);
-      return std::make_shared<EvalStmt>(lowered, call->span_);
+      out.push_back(std::make_shared<EvalStmt>(lowered, call->span_));
+      return std::make_shared<SeqStmts>(out, call->span_);
     }
     if (IsOp(call, "tile.transpose_view")) {
       // StorageIndex already declared the relabelled window at the source's
@@ -813,22 +1114,238 @@ class TileToBufferMutator : public IRMutator {
   }
 
   const StorageIndex& storage_;
+  std::unordered_map<const TileType*, VarPtr> window_handles_;
+  std::unordered_map<const Var*, std::pair<VarPtr, MakeTuplePtr>> window_origins_;
   YieldContext* yield_context_ = nullptr;
   // Input SSA uses distinct identities for branch-local definitions. Retaining
   // their mappings is linear and avoids copying the outer map at each region.
   std::unordered_map<const Var*, ExprPtr> tensor_aliases_;
 };
 
+// Capability is decided before any Buffer-specific storage mutation. This is
+// deliberately narrower than the explicit low-level lowering API. No exception
+// is interpreted as an unsupported capability: malformed selected IR must fail.
+class FirstBufferKernelSupport : public IRVisitor {
+ public:
+  explicit FirstBufferKernelSupport(const FunctionPtr& function) : return_types_(function->return_types_) {
+    for (const auto& param : function->params_) tensor_aliases_.emplace(param.get(), param);
+  }
+
+  bool supported = true;
+  bool has_load = false;
+  bool has_store = false;
+
+  static bool ConstantEquals(const ExprPtr& value, int64_t expected) {
+    const auto constant = As<ConstInt>(value);
+    return constant && constant->value_ == expected;
+  }
+
+  static bool SameShape(const std::vector<ExprPtr>& lhs, const std::vector<ExprPtr>& rhs) {
+    return lhs.size() == rhs.size() &&
+           std::equal(lhs.begin(), lhs.end(), rhs.begin(),
+                      [](const ExprPtr& a, const ExprPtr& b) { return structural_equal(a, b); });
+  }
+
+  static bool StaticShape(const std::vector<ExprPtr>& shape) {
+    return shape.size() == 2 && As<ConstInt>(shape[0]) && As<ConstInt>(shape[1]) &&
+           As<ConstInt>(shape[0])->value_ > 0 && As<ConstInt>(shape[1])->value_ > 1;
+  }
+
+  void CheckType(const TypePtr& type) {
+    if (!checked_types_.insert(type.get()).second) return;
+    if (auto tile = As<TileType>(type)) {
+      const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
+      if (!StaticShape(tile->shape_) || tile->dtype_ != DataType::FP32 || !IsDenseVecTile(tile, view)) {
+        supported = false;
+        return;
+      }
+      const auto cols = As<ConstInt>(tile->shape_[1])->value_;
+      supported &= cols % 8 == 0 && (!view.start_offset || ConstantEquals(view.start_offset, 0));
+      supported &= view.stride.empty() || (view.stride.size() == 2 && ConstantEquals(view.stride[0], cols) &&
+                                           ConstantEquals(view.stride[1], 1));
+      supported &= view.valid_shape.empty() || SameShape(view.valid_shape, tile->shape_);
+      if (const auto memory = tile->memref_.value_or(nullptr)) {
+        supported &= memory->slot_count_ == 1 && !memory->slot_index_;
+      }
+    } else if (auto tensor = As<TensorType>(type)) {
+      supported &= StaticShape(tensor->shape_) && tensor->dtype_ == DataType::FP32;
+      if (supported && tensor->tensor_view_) {
+        const auto& view = *tensor->tensor_view_;
+        supported &= view.layout == TensorLayout::ND && view.pad == PadValue::null;
+        supported &= view.valid_shape.empty() || SameShape(view.valid_shape, tensor->shape_);
+        supported &=
+            view.stride.empty() || (view.stride.size() == 2 &&
+                                    ConstantEquals(view.stride[0], As<ConstInt>(tensor->shape_[1])->value_) &&
+                                    ConstantEquals(view.stride[1], 1));
+      }
+    } else if (!As<ScalarType>(type) && !As<PtrType>(type) && !As<VoidType>(type) && !As<TupleType>(type)) {
+      supported = false;
+    }
+  }
+
+  void VisitExpr(const ExprPtr& expr) override {
+    if (!supported || !expr) return;
+    CheckType(expr->GetType());
+    IRVisitor::VisitExpr(expr);
+  }
+
+  void VisitStmt(const StmtPtr& stmt) override {
+    if (!supported) return;
+    if (!As<SeqStmts>(stmt) && !As<AssignStmt>(stmt) && !As<EvalStmt>(stmt) && !As<ReturnStmt>(stmt)) {
+      supported = false;
+      return;
+    }
+    IRVisitor::VisitStmt(stmt);
+  }
+
+ protected:
+  void VisitVarLike_(const VarPtr&) override {}
+  void VisitStmt_(const AssignStmtPtr& assign) override {
+    IRVisitor::VisitStmt_(assign);
+    if (!supported || !As<TensorType>(assign->var_->GetType())) return;
+    ExprPtr source = assign->value_;
+    if (auto call = As<Call>(source); call && IsOp(call, "tile.store") && call->args_.size() == 3) {
+      source = call->args_[2];
+    }
+    auto var = AsVarLike(source);
+    auto alias = tensor_aliases_.find(var.get());
+    if (alias != tensor_aliases_.end()) tensor_aliases_.emplace(assign->var_.get(), alias->second);
+  }
+
+  void VisitStmt_(const ReturnStmtPtr& ret) override {
+    // Buffer lowering erases store-result and plain GM aliases. Its codegen ABI
+    // requires the resulting parameter type to match the declared result,
+    // including TensorView metadata introduced by earlier frontend passes.
+    if (ret->value_.size() != return_types_.size()) {
+      supported = false;
+      return;
+    }
+    for (size_t i = 0; i < ret->value_.size(); ++i) {
+      auto value = AsVarLike(ret->value_[i]);
+      auto alias = tensor_aliases_.find(value.get());
+      if (alias == tensor_aliases_.end() || !structural_equal(alias->second->GetType(), return_types_[i])) {
+        supported = false;
+        return;
+      }
+    }
+    IRVisitor::VisitStmt_(ret);
+  }
+
+  void VisitExpr_(const SubmitPtr&) override { supported = false; }
+  void VisitExpr_(const CallPtr& call) override {
+    if (As<GlobalVar>(call->op_)) {
+      supported = false;
+      return;
+    }
+    // Selection must reject metadata that the final lowering cannot carry.
+    if (!StripAttr(call->attrs_, kPipelineMembershipAttr).empty()) {
+      supported = false;
+      return;
+    }
+    if (IsOp(call, "tile.load")) {
+      has_load = true;
+      supported &= GetIntKwarg(call->kwargs_, "cache", 0) == 0 && !call->HasKwarg("l2_hint");
+    } else if (IsOp(call, "tile.store")) {
+      has_store = true;
+      supported &= GetIntKwarg(call->kwargs_, "atomic", 0) == 0 &&
+                   GetIntKwarg(call->kwargs_, "st_phase", 0) == 0 &&
+                   !GetOptionalDoubleKwarg(call->kwargs_, "pre_quant") &&
+                   !GetKwargOr<bool>(call->kwargs_, "pre_relu", false) && !call->HasKwarg("l2_hint");
+    } else if (!IsOp(call, "tile.alloc")) {
+      const auto* recipe = backend::FindLogicalBufferElementwiseRecipe(call->op_->name_);
+      supported &= recipe && recipe->default_enabled;
+    }
+    IRVisitor::VisitExpr_(call);
+  }
+
+ private:
+  const std::vector<TypePtr>& return_types_;
+  std::unordered_map<const Var*, VarPtr> tensor_aliases_;
+  std::unordered_set<const Type*> checked_types_;
+};
+
+FunctionPtr SelectBufferFunction(const FunctionPtr& function, bool device_helper) {
+  if (!IsInCoreType(function->func_type_) || function->ir_stage_ == FunctionIRStage::Buffer ||
+      function->HasAttr(kAttrBufferIrSelected)) {
+    return function;
+  }
+  FirstBufferKernelSupport support(function);
+  const auto* context = PassContext::Current();
+  support.supported =
+      !device_helper && (!context || context->GetEnableBufferIR()) && backend::BackendConfig::IsConfigured();
+  if (support.supported) {
+    const auto arch = backend::BackendConfig::GetBackend()->GetHandler()->GetPtoTargetArch();
+    support.supported = arch == "a2a3";
+  }
+  for (const auto& param : function->params_) {
+    // This rollout has no device helper ABI or runtime scalar inputs.
+    if (!As<TensorType>(param->GetType())) support.supported = false;
+    support.CheckType(param->GetType());
+  }
+  for (const auto& type : function->return_types_) {
+    if (!As<TensorType>(type)) support.supported = false;
+    support.CheckType(type);
+  }
+  support.VisitStmt(function->body_);
+  auto selected = std::make_shared<Function>(*function);
+  selected->attrs_.emplace_back(kAttrBufferIrSelected,
+                                support.supported && support.has_load && support.has_store);
+  return selected;
+}
+
+// A GM-shaped function called from device code is still a helper, not a
+// separately dispatched kernel. Keep both caller and callee out of this rollout.
+class DeviceHelperCollector : public IRVisitor {
+ public:
+  std::unordered_set<std::string> callees;
+
+ protected:
+  void VisitVarLike_(const VarPtr&) override {}
+  void VisitExpr_(const CallPtr& call) override { Collect(call); }
+  void VisitExpr_(const SubmitPtr& submit) override {
+    Collect(submit);
+    for (const auto& dep : submit->deps_) VisitExpr(dep);
+  }
+
+ private:
+  template <typename CallLike>
+  void Collect(const CallLike& call) {
+    if (auto global = As<GlobalVar>(call->op_)) callees.insert(global->name_);
+    for (const auto& arg : call->args_) VisitExpr(arg);
+  }
+};
+
+ProgramPtr SelectBufferFunctions(const ProgramPtr& program) {
+  DeviceHelperCollector helpers;
+  for (const auto& [global, function] : program->functions_) {
+    if (IsInCoreType(function->func_type_)) helpers.VisitStmt(function->body_);
+  }
+  std::vector<FunctionPtr> functions;
+  functions.reserve(program->functions_.size());
+  for (const auto& [global, function] : program->functions_) {
+    functions.push_back(SelectBufferFunction(function, helpers.callees.count(function->name_) != 0));
+  }
+  return std::make_shared<Program>(functions, program->name_, program->span_);
+}
+
 ProgramPtr TransformProgram(const ProgramPtr& program) {
   const auto* context = PassContext::Current();
   const bool addressed = !context || context->GetMemoryPlanner() != MemoryPlanner::PtoAS;
   auto& verifiers = PropertyVerifierRegistry::GetInstance();
+  std::vector<FunctionPtr> selected;
+  for (const auto& [global, function] : program->functions_) {
+    if (IsInCoreType(function->func_type_) && IsBufferIRSelected(function)) selected.push_back(function);
+  }
+  if (selected.empty()) return program;
+  verifiers.VerifyOrThrow({IRProperty::NoNestedCalls},
+                          std::make_shared<Program>(selected, program->name_, program->span_));
   verifiers.VerifyOrThrow({IRProperty::TileStorageLegalized}, program);
   if (addressed) verifiers.VerifyOrThrow({IRProperty::TileStorageAllocated}, program);
   std::vector<FunctionPtr> functions;
   functions.reserve(program->functions_.size());
   for (const auto& [global, function] : program->functions_) {
-    if (!IsInCoreType(function->func_type_) || function->ir_stage_ == FunctionIRStage::Buffer) {
+    if (!IsInCoreType(function->func_type_) || function->ir_stage_ == FunctionIRStage::Buffer ||
+        !IsBufferIRSelected(function)) {
       functions.push_back(function);
       continue;
     }
@@ -853,6 +1370,11 @@ ProgramPtr TransformProgram(const ProgramPtr& program) {
 }  // namespace
 
 namespace pass {
+
+Pass SelectBufferIRFunctions() {
+  return CreateProgramPass(SelectBufferFunctions, "SelectBufferIRFunctions",
+                           kSelectBufferIRFunctionsProperties);
+}
 
 Pass LowerTileToBuffer() {
   return CreateProgramPass(TransformProgram, "LowerTileToBuffer", kLowerTileToBufferProperties);

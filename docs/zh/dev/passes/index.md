@@ -63,7 +63,7 @@ PyPTO IR 变换的参考文档，按阅读顺序组织。实际执行顺序请�
 | 32 | [CanonicalizeIOOrder](32-canonicalize_io_order.md) | 按 scalar → load → compute → store 阶梯重排流水循环体内的语句 |
 | 33 | [MaterializeTensorStrides](33-materialize_tensor_strides.md) | 为每个尚无 stride 的 tensor view 填入紧致规范 stride |
 | 34 | [InitMemRef](34-init_memref.md) | 初始化 MemRef 并创建地址未分配的 alloc 操作 |
-| 35 | [MaterializeSemanticAliases](35-materialize_semantic_aliases.md) | 强制语义要求同一分配的缓冲区真正共用一块（循环携带、原地更新） |
+| 35 | [SelectBufferIRFunctions / MaterializeSemanticAliases](35-materialize_semantic_aliases.md) | 强制语义要求同一分配的缓冲区真正共用一块（循环携带、原地更新） |
 | 36 | [MemoryReuse](36-memory_reuse.md) | 基于生命周期分析复用缓冲区并删除冗余 alloc；`memory_planner=DSA_RP` 或 `PTOAS` 时跳过 |
 | 37 | [AllocateMemoryAddr](37-allocate_memory_addr.md) | 为已有 alloc 操作分配真实地址；`memory_planner=PTOAS` 时跳过 |
 | 38 | [FoldNoOpReshape](38-fold_no_op_reshape.md) | 折叠既不改变物理形状也不改变分配的 `tile.reshape` |
@@ -82,7 +82,7 @@ PyPTO IR 变换的参考文档，按阅读顺序组织。实际执行顺序请�
 | 51 | [ClassifyIterArgCarry](51-classify_iter_arg_carry.md) | 把编排层 `ForStmt` 的每个 iter_arg 分类为平凡别名或需物化的重绑定携带 |
 | 52 | [InsertCommFence](52-insert_comm_fence.md) | 为每个发布性写入打标记（本地：region `system.cacheinvalid` + `system.fence`；远端写：仅 fence；opaque 写：whole-GM），并为每个 wait 插入 whole-GM `system.cacheinvalid`；notify 本身不加任何标记 |
 | 53 | [MaterializeValidShapeSymbols](53-materialize_valid_shape_symbols.md) | 将设备 kernel 中无法绑定的 `valid_shape` 符号转换为前置的 `Scalar[INDEX]` 参数，并传入调用方的实际有效范围 |
-| 54 | [LowerTileToBuffer](54-lower_tile_to_buffer.md) | 按迁移选项将完成规划的 Tile 存储最终转换为显式 Buffer 操作 |
+| 54 | [LowerTileToBuffer](54-lower_tile_to_buffer.md) | 默认将选中 kernel 的已规划 Tile 存储转换为显式 Buffer 操作，其余 kernel 保留 Tile |
 
 ## 默认流水线之外
 
