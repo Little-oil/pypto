@@ -208,6 +208,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/legalize_graph_boundary_pass.cpp
     src/ir/transforms/materialize_valid_shape_symbols_pass.cpp
     src/ir/transforms/lower_tile_to_buffer_pass.cpp
+    src/ir/transforms/select_buffer_ir_functions_pass.cpp
     src/ir/transforms/optimize_orch_tensors_pass.cpp
     src/ir/transforms/derive_call_directions_pass.cpp
     src/ir/transforms/auto_derive_task_dependencies_pass.cpp
@@ -220,7 +221,10 @@ set(PYPTO_SOURCES
     src/ir/transforms/loop_invariant_mat_residency.cpp
     src/ir/transforms/inline_functions_pass.cpp
     src/ir/transforms/init_memref.cpp
+    src/ir/transforms/lower_composite/lower_composite_allgather.cpp
+    src/ir/transforms/lower_composite/lower_composite_allreduce.cpp
     src/ir/transforms/lower_composite/lower_composite_builder.cpp
+    src/ir/transforms/lower_composite/lower_composite_common.cpp
     src/ir/transforms/lower_composite_ops_pass.cpp
     src/ir/transforms/materialize_tensor_strides_pass.cpp
     src/ir/transforms/ir_property.cpp

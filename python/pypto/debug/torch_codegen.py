@@ -547,15 +547,80 @@ def _buffer_alloc(shape, dtype, valid_shape, dynamic_valid):
     valid = tuple(next(dynamic) if s < 0 else s for s in valid_shape)
     return _buffer_set_valid(torch.empty(shape, dtype=dtype), valid)
 
+class _MatrixBuffer:
+    # Each descriptor indexes shared physical bytes, including fractal relabels.
+    def __init__(self, storage, shape, dtype, valid, row_major, inner_row_major, fractal):
+        self.storage = storage.view(dtype)
+        self.shape = shape
+        self.dtype = dtype
+        self._pypto_valid_shape = valid
+        rows, cols = shape
+        if fractal == 1024:
+            br, bc = 16, 16
+        elif inner_row_major:
+            br, bc = 16, 32 // self.storage.element_size()
+        else:
+            br, bc = 32 // self.storage.element_size(), 16
+        row = torch.arange(rows)[:, None]
+        col = torch.arange(cols)[None, :]
+        outer = ((row // br) * (cols // bc) + col // bc if row_major
+                 else (col // bc) * (rows // br) + row // br)
+        inner = (row % br) * bc + col % bc if inner_row_major else (col % bc) * br + row % br
+        self.indices = outer * (br * bc) + inner
+
+    def read(self, shape):
+        return self.storage[self.indices[:shape[0], :shape[1]]]
+
+    def write(self, data):
+        self.storage[self.indices[:data.shape[0], :data.shape[1]]] = data.to(self.dtype)
+
+def _matrix_alloc(pools, space, address, shape, dtype, valid, row_major, inner_row_major, fractal):
+    size = shape[0] * shape[1] * torch.empty((), dtype=dtype).element_size()
+    storage = (torch.empty(size, dtype=torch.uint8) if address is None
+               else pools[space][address:address + size])
+    return _MatrixBuffer(storage, shape, dtype, valid, row_major, inner_row_major, fractal)
+
+def _matrix_reshape(source, shape, dtype, valid, row_major, inner_row_major, fractal):
+    return _MatrixBuffer(source.storage.view(torch.uint8), shape, dtype, valid,
+                         row_major, inner_row_major, fractal)
+
+def _buffer_read(buffer, shape):
+    if isinstance(buffer, _MatrixBuffer):
+        return buffer.read(shape)
+    return buffer[tuple(slice(0, int(s)) for s in shape)]
+
+def _buffer_write(buffer, data):
+    if isinstance(buffer, _MatrixBuffer):
+        buffer.write(data)
+    else:
+        buffer[tuple(slice(0, s) for s in data.shape)].copy_(data)
+
 def _buffer_active(buffer):
-    return buffer[tuple(slice(0, s) for s in buffer._pypto_valid_shape)]
+    return _buffer_read(buffer, buffer._pypto_valid_shape)
+
+def _buffer_copy(source, destination):
+    _buffer_write(destination, _buffer_active(source))
+
+def _buffer_extract(source, row, column, destination):
+    rows, cols = destination._pypto_valid_shape
+    data = _buffer_active(source)[int(row):int(row) + rows, int(column):int(column) + cols]
+    _buffer_write(destination, data)
+
+def _buffer_matmul(lhs, rhs, destination, accumulate):
+    left = _buffer_active(lhs)
+    right = _buffer_active(rhs)[:left.shape[1]]
+    dtype = torch.int32 if lhs.dtype == torch.int8 else torch.float32
+    product = left.to(dtype) @ right.to(dtype)
+    if accumulate:
+        product = product + _buffer_active(destination)
+    _buffer_write(destination, product)
 
 def _buffer_load(tensor, offsets, valid, destination):
     data = _tile_load(tensor, offsets, valid)
-    destination[tuple(slice(0, int(s)) for s in valid)].copy_(data)
+    _buffer_write(destination, data)
 
 def _buffer_store(source, offsets, valid, tensor):
-    data = source[tuple(slice(0, int(s)) for s in valid)]
+    data = _buffer_read(source, valid)
     _tile_store(data, offsets, tensor)
 
 def _buffer_subview(source, offsets, shape, valid):
@@ -1175,13 +1240,41 @@ def _register_ops() -> None:  # noqa: PLR0915
     m["buffer.load"] = lambda a, _kw: f"_buffer_load({', '.join(a)})"
     m["buffer.store"] = lambda a, _kw: f"_buffer_store({', '.join(a)})"
     m["buffer.set_validshape"] = lambda a, _kw: f"_buffer_set_valid({a[0]}, {a[1]})"
-    m["buffer.copy"] = lambda a, _kw: f"_buffer_active({a[1]}).copy_(_buffer_active({a[0]}))"
-    m["buffer.add"] = lambda a, _kw: (
-        f"_buffer_active({a[2]}).copy_(_buffer_active({a[0]}) + _buffer_active({a[1]}))"
-    )
-    m["buffer.mul"] = lambda a, _kw: (
-        f"_buffer_active({a[2]}).copy_(_buffer_active({a[0]}) * _buffer_active({a[1]}))"
-    )
+    m["buffer.copy"] = lambda a, _kw: f"_buffer_copy({', '.join(a)})"
+    m["buffer.extract"] = lambda a, _kw: f"_buffer_extract({', '.join(a)})"
+    m["buffer.matmul"] = lambda a, _kw: f"_buffer_matmul({', '.join(a)}, False)"
+    m["buffer.matmul_acc"] = lambda a, _kw: f"_buffer_matmul({', '.join(a)}, True)"
+    # Evaluate all inputs before copy_ so exact source/destination aliases remain safe.
+    for suffix in (
+        "add",
+        "sub",
+        "mul",
+        "div",
+        "maximum",
+        "minimum",
+        "abs",
+        "exp",
+        "sqrt",
+        "neg",
+        "relu",
+        "log",
+        "recip",
+    ):
+        handler = m[f"tile.{suffix}"]
+        m[f"buffer.{suffix}"] = lambda a, kw, fn=handler: (
+            f"_buffer_active({a[-1]}).copy_({fn([f'_buffer_active({v})' for v in a[:-1]], kw)})"
+        )
+    for suffix in ("adds", "subs", "muls", "divs", "maximums", "minimums", "lrelu"):
+        handler = m[f"tile.{suffix}"]
+        m[f"buffer.{suffix}"] = lambda a, kw, fn=handler: (
+            f"_buffer_active({a[-1]}).copy_("
+            f"{fn([f'_buffer_active({a[0]})', f'torch.as_tensor({a[1]}, dtype={a[0]}.dtype)'], kw)})"
+        )
+    m["buffer.full"] = lambda a, _kw: f"_buffer_active({a[1]}).fill_({a[0]})"
+
+    m["buffer.get_block_idx"] = lambda _a, _kw: "0"
+    m["buffer.get_block_num"] = lambda _a, _kw: "1"
+    m["buffer.get_subblock_idx"] = lambda _a, _kw: "_get_subblock_idx()"
 
     # --- Cross-core pipe ops ---
     m["tile.tpush_to_aiv"] = _handle_tpush_to_aiv
@@ -1250,6 +1343,37 @@ _BINARY_OP_STR: dict[type, str] = {
 # ---------------------------------------------------------------------------
 
 
+class _MatrixAllocationSizes(_ir.IRVisitor):
+    """Index addressed cube allocations once so overlapping descriptors share bytes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sizes: dict[int, int] = {}
+        self.has_matrix = False
+
+    def visit_iter_arg(self, op: _ir.IterArg) -> None:
+        pass
+
+    def visit_call(self, op: _ir.Call) -> None:
+        descriptor = op.type
+        if (
+            op.op.name == _ir.get_op("buffer.alloc").name
+            and isinstance(descriptor, _ir.BufferType)
+            and descriptor.memory_space != _ir.MemorySpace.Vec
+        ):
+            self.has_matrix = True
+            if len(op.args) == 2:
+                address = op.args[1]
+                if not isinstance(address, _ir.ConstInt) or address.value < 0:
+                    raise ValueError("torch_codegen requires static nonnegative matrix allocation addresses")
+                size = descriptor.dtype.get_bit() // 8
+                for extent in descriptor.shape:
+                    size *= extent
+                space = descriptor.memory_space.value
+                self.sizes[space] = max(self.sizes.get(space, 0), address.value + size)
+        super().visit_call(op)
+
+
 class TorchCodegen(_ir.IRVisitor):
     """Emit executable PyTorch code from PyPTO IR."""
 
@@ -1268,6 +1392,7 @@ class TorchCodegen(_ir.IRVisitor):
         # reusing object ids for short-lived nanobind wrappers.
         self._seen_var_refs: list[_ir.Var] = []
         self._name_counter: dict[str, int] = {}
+        self._matrix_pools_name = "matrix_storage"
         self._yield_targets: list[str] = []  # names to assign on yield
         self._check_shapes: bool = check_shapes
         self._group_meta: dict[str, dict[str, Any]] = group_meta or {}
@@ -1351,11 +1476,14 @@ class TorchCodegen(_ir.IRVisitor):
             self.visit_expr(expr)
         return self._expr_result
 
-    def _has_body_content(self, stmt: _ir.Stmt) -> bool:
-        """Check if a statement body produces any lines."""
-        if isinstance(stmt, _ir.SeqStmts):
-            return len(stmt.stmts) > 0
-        return True
+    def _emit_body(self, stmt: _ir.Stmt) -> None:
+        """Emit an indented suite, including pass when its IR emits no statements."""
+        self._indent += 1
+        start = len(self._lines)
+        self.visit_stmt(stmt)
+        if len(self._lines) == start:
+            self._emit("pass")
+        self._indent -= 1
 
     def _emit_iter_arg_inits(self, iter_args: list[_ir.IterArg]) -> list[str]:
         """Emit init assignments for SSA iter_args and return their names."""
@@ -1427,6 +1555,15 @@ class TorchCodegen(_ir.IRVisitor):
                 # so only check dtype — not shape — for all function params.
                 self._emit_shape_dtype_check(self._name_of(p), p.type, shape=False)
         self._emit_dyn_dim_symbols(func)
+        allocations = _MatrixAllocationSizes()
+        allocations.visit_stmt(func.body)
+        self._matrix_pools_name = self._unique_name("matrix_storage")
+        if allocations.has_matrix:
+            self._emit(
+                f"{self._matrix_pools_name} = "
+                f"{{space: torch.empty(size, dtype=torch.uint8) "
+                f"for space, size in {allocations.sizes!r}.items()}}"
+            )
         n_before = len(self._lines)
         self.visit_stmt(func.body)
         if len(self._lines) == n_before:
@@ -1483,22 +1620,79 @@ class TorchCodegen(_ir.IRVisitor):
             self._expr_result = f"abs({operand})"
         elif isinstance(op, _ir.Cast):
             self._expr_result = (
-                f"{operand}.to({_torch_dtype(op.dtype)})" if hasattr(op, "dtype") else f"int({operand})"
+                f"torch.as_tensor({operand}).to({_torch_dtype(op.dtype)})"
+                if hasattr(op, "dtype")
+                else f"int({operand})"
             )
         else:
             self._expr_result = operand
 
     def _buffer_descriptor(self, op: _ir.Call) -> _ir.BufferType:
-        """Keep physical layouts outside the default dense Vec subset explicit."""
+        """Validate the Vec and ordinary cube descriptors modeled by Torch."""
         descriptor = op.type
-        if (
-            not isinstance(descriptor, _ir.BufferType)
-            or descriptor.memory_space != _ir.MemorySpace.Vec
-            or descriptor.blayout != _ir.TileLayout.row_major
-            or descriptor.slayout != _ir.TileLayout.none_box
+        if not isinstance(descriptor, _ir.BufferType):
+            raise ValueError("torch_codegen requires a Buffer descriptor")
+        if descriptor.memory_space == _ir.MemorySpace.Vec:
+            if (
+                descriptor.blayout != _ir.TileLayout.row_major
+                or descriptor.slayout != _ir.TileLayout.none_box
+            ):
+                raise ValueError("torch_codegen requires dense row-major Vec Buffer descriptors")
+        elif (
+            descriptor.memory_space
+            not in (_ir.MemorySpace.Mat, _ir.MemorySpace.Left, _ir.MemorySpace.Right, _ir.MemorySpace.Acc)
+            or descriptor.fractal not in (512, 1024)
+            or descriptor.blayout not in (_ir.TileLayout.row_major, _ir.TileLayout.col_major)
+            or descriptor.slayout not in (_ir.TileLayout.row_major, _ir.TileLayout.col_major)
+            or any(extent < 0 for extent in descriptor.valid_shape)
         ):
-            raise ValueError("torch_codegen supports only dense row-major Vec Buffer descriptors")
+            raise ValueError("torch_codegen requires static boxed matrix Buffer descriptors")
         return descriptor
+
+    @staticmethod
+    def _matrix_descriptor_args(descriptor: _ir.BufferType) -> str:
+        return (
+            f"{tuple(descriptor.shape)!r}, {_torch_dtype(descriptor.dtype)}, "
+            f"{tuple(descriptor.valid_shape)!r}, "
+            f"{descriptor.blayout == _ir.TileLayout.row_major}, "
+            f"{descriptor.slayout == _ir.TileLayout.row_major}, {descriptor.fractal}"
+        )
+
+    def _visit_buffer_call(self, op: _ir.Call, arg_strs: list[str]) -> bool:
+        op_name = op.op.name
+        if op_name == _ir.get_op("buffer.alloc").name:
+            descriptor = self._buffer_descriptor(op)
+            if descriptor.memory_space == _ir.MemorySpace.Vec:
+                self._expr_result = (
+                    f"_buffer_alloc({tuple(descriptor.shape)!r}, {_torch_dtype(descriptor.dtype)}, "
+                    f"{tuple(descriptor.valid_shape)!r}, {arg_strs[0]})"
+                )
+            else:
+                address = arg_strs[1] if len(arg_strs) == 2 else "None"
+                self._expr_result = (
+                    f"_matrix_alloc({self._matrix_pools_name}, {descriptor.memory_space.value}, {address}, "
+                    f"{self._matrix_descriptor_args(descriptor)})"
+                )
+        elif op_name == _ir.get_op("buffer.subview").name:
+            descriptor = self._buffer_descriptor(op)
+            valid = arg_strs[2] if len(arg_strs) == 3 else repr(tuple(descriptor.valid_shape))
+            self._expr_result = (
+                f"_buffer_subview({arg_strs[0]}, {arg_strs[1]}, {tuple(descriptor.shape)!r}, {valid})"
+            )
+        elif op_name == _ir.get_op("buffer.reshape").name:
+            descriptor = self._buffer_descriptor(op)
+            if descriptor.memory_space == _ir.MemorySpace.Vec:
+                self._expr_result = (
+                    f"_buffer_set_valid({arg_strs[0]}.view({_torch_dtype(descriptor.dtype)})"
+                    f".view({tuple(descriptor.shape)!r}), {tuple(descriptor.valid_shape)!r})"
+                )
+            else:
+                self._expr_result = (
+                    f"_matrix_reshape({arg_strs[0]}, {self._matrix_descriptor_args(descriptor)})"
+                )
+        else:
+            return False
+        return True
 
     def visit_call(self, op: _ir.Call) -> None:
         op_name = op.op.name
@@ -1508,25 +1702,9 @@ class TorchCodegen(_ir.IRVisitor):
         arg_strs = [self._visit_expr_str(a) for a in op.args]
         kw = dict(op.kwargs) if op.kwargs else {}
 
-        if op_name == _ir.get_op("buffer.alloc").name:
-            descriptor = self._buffer_descriptor(op)
-            self._expr_result = (
-                f"_buffer_alloc({tuple(descriptor.shape)!r}, {_torch_dtype(descriptor.dtype)}, "
-                f"{tuple(descriptor.valid_shape)!r}, {arg_strs[0]})"
-            )
-        elif op_name == _ir.get_op("buffer.subview").name:
-            descriptor = self._buffer_descriptor(op)
-            valid = arg_strs[2] if len(arg_strs) == 3 else repr(tuple(descriptor.valid_shape))
-            self._expr_result = (
-                f"_buffer_subview({arg_strs[0]}, {arg_strs[1]}, {tuple(descriptor.shape)!r}, {valid})"
-            )
-        elif op_name == _ir.get_op("buffer.reshape").name:
-            descriptor = self._buffer_descriptor(op)
-            self._expr_result = (
-                f"_buffer_set_valid({arg_strs[0]}.view({_torch_dtype(descriptor.dtype)})"
-                f".view({tuple(descriptor.shape)!r}), {tuple(descriptor.valid_shape)!r})"
-            )
-        elif op_name == _ir.get_op("tensor.view").name:
+        if self._visit_buffer_call(op, arg_strs):
+            return
+        if op_name == _ir.get_op("tensor.view").name:
             if len(arg_strs) >= 2:
                 result_view = getattr(op.type, "tensor_view", None)
                 is_dn = result_view is not None and result_view.layout == _ir.TensorLayout.DN
@@ -1645,9 +1823,10 @@ class TorchCodegen(_ir.IRVisitor):
 
     def visit_yield_stmt(self, op: _ir.YieldStmt) -> None:
         if self._yield_targets and op.value:
-            for target, val_expr in zip(self._yield_targets, op.value):
-                val = self._visit_expr_str(val_expr)
-                self._emit(f"{target} = {val}")
+            # Region yields assign simultaneously. Sequential writes corrupt swaps
+            # when a later operand reads an earlier target (including scalar carries).
+            values = [self._visit_expr_str(value) for value in op.value]
+            self._emit(f"{', '.join(self._yield_targets)} = {', '.join(values)}")
 
     def visit_for_stmt(self, op: _ir.ForStmt) -> None:
         loop_var = self._name_of(op.loop_var)
@@ -1661,11 +1840,7 @@ class TorchCodegen(_ir.IRVisitor):
         self._yield_targets = iter_arg_names
 
         self._emit(f"for {loop_var} in range({start}, {stop}, {step}):")
-        self._indent += 1
-        self.visit_stmt(op.body)
-        if not op.iter_args and not self._has_body_content(op.body):
-            self._emit("pass")
-        self._indent -= 1
+        self._emit_body(op.body)
 
         self._yield_targets = old_targets
         self._alias_return_vars(op.return_vars, iter_arg_names)
@@ -1678,9 +1853,7 @@ class TorchCodegen(_ir.IRVisitor):
 
         cond = self._visit_expr_str(op.condition)
         self._emit(f"while {cond}:")
-        self._indent += 1
-        self.visit_stmt(op.body)
-        self._indent -= 1
+        self._emit_body(op.body)
 
         self._yield_targets = old_targets
         self._alias_return_vars(op.return_vars, iter_arg_names)
@@ -1694,19 +1867,11 @@ class TorchCodegen(_ir.IRVisitor):
         self._yield_targets = return_var_names
 
         self._emit(f"if {cond}:")
-        self._indent += 1
-        self.visit_stmt(op.then_body)
-        if not self._has_body_content(op.then_body):
-            self._emit("pass")
-        self._indent -= 1
+        self._emit_body(op.then_body)
 
         if op.else_body is not None:
             self._emit("else:")
-            self._indent += 1
-            self.visit_stmt(op.else_body)
-            if not self._has_body_content(op.else_body):
-                self._emit("pass")
-            self._indent -= 1
+            self._emit_body(op.else_body)
 
         self._yield_targets = old_targets
 

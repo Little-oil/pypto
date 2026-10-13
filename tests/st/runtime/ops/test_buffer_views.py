@@ -20,8 +20,6 @@ _PLANNERS = (passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP, passes.Mem
 
 @pl.jit.incore
 def _view_kernel(source: pl.Tensor, out: pl.InOut[pl.Tensor]):
-    # Views exercise the low-level recipe beyond the initial default rollout.
-    pl.func_attr({"buffer_ir_selected": True})
     loaded = pl.load(source, [0, 0], [16, 32])
     first = pl.reshape(loaded, [8, 64])
     out = pl.store(first, [0, 0], out)
@@ -68,6 +66,7 @@ _SOURCE = (torch.arange(512, dtype=torch.float32).reshape(16, 32) * 13 - 1777) /
         for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.int32)
     ]
 )
+@pytest.mark.platforms("a2a3", "a2a3sim", reason="Default Buffer rollout is limited to a2/a3.")
 def test_public_buffer_views(case_run, request):
     case_run.assert_passed()
     assert case_run.case.get_enable_buffer_ir()

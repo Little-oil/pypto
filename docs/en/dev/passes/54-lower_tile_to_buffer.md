@@ -17,15 +17,57 @@ results and dependencies. Final structural, SSA, type and call checks cover the
 whole program. A selected kernel's compilation, verification or execution error
 propagates; there is no catch-and-recompile fallback.
 
-The first rollout accepts straight-line static rank-2 dense Vec FP32 kernels made
-from ordinary packed ND GM loads, `add`, `mul` and stores. Tiles have full static
-valid extents and 32-byte-aligned rows. GM return aliases must resolve to parameters
-whose types match the declared results, including TensorView metadata; kernels
-with mismatched return views retain Tile IR. The accepted target is a2/a3 with PYPTO, DSA_RP and PTOAS planners.
-A5 retains Tile IR until its default rollout has clean runtime acceptance. Reductions, other arithmetic, control flow,
-views, slots, helper ABIs and cross-core resources remain Tile in the normal
-pipeline. Existing production recipes may support more through explicit low-level
-pass pipelines; their availability alone does not widen default acceptance.
+The default a2/a3 rollout accepts static rank-2 dense Vec and ordinary cube kernels
+with PYPTO, DSA_RP and PTOAS planners. Physical rows must be 32-byte aligned;
+valid extents may be static partial rectangles within the physical shape.
+Elementwise Tile operands and their destination must have matching physical shapes
+and valid extents; matching valid extents alone do not qualify.
+
+| Operations | Element types |
+| ---------- | ------------- |
+| Ordinary packed ND GM load/store | FP16, BF16, FP32, INT32 |
+| add, mul | FP16, FP32, INT32 |
+| sub, div, maximum, minimum, abs, exp, sqrt, neg, relu, log, recip | FP32 |
+| adds, subs, muls, divs, maximums, minimums, lrelu, full | FP32 |
+
+Scalar parameters use the existing scalar ABI; element operands receive explicit
+conversion during lowering. `full` followed by store also qualifies without a
+load. BF16 transfer support does not include BF16 arithmetic or fill. `recip`
+requires a distinct destination, enforced by storage legalization and verification.
+Precision attributes retain their existing native policy. GM return aliases must
+resolve to parameters whose types match the declared results, including TensorView
+metadata; kernels with mismatched return views retain Tile IR.
+
+Structured If/For/While regions may carry Tiles, scalars and aliases of one GM
+parameter. Both branch arms must resolve a GM result to the same parameter;
+loop backedges must preserve the initial GM alias. For loops require an INDEX
+induction variable and a provably positive constant step. Dynamic/negative steps,
+changing GM aliases, region-local returns, unsigned scalar arithmetic and device
+helper calls remain outside the default contract. Tile carry copies are planned
+before lowering; scalar yields assign simultaneously, including swaps in Torch
+numerical debugging. Block and subblock queries use their existing Buffer recipes.
+
+Static dense Vec reshape preserves equal physical bytes and supports repeated
+views of one planned allocation. Static nonnegative MemRef offsets must be
+32-byte aligned. Lowering verifies allocation capacity and window bounds; a
+selected malformed window fails instead of falling back to Tile IR.
+
+The ordinary cube path uses GM -> Mat -> Left/Right -> Acc -> GM, with
+`move`, `extract`, `transpose_view`, `matmul` and `matmul_acc`. FP16/BF16/FP32
+operands accumulate in FP32; INT8 operands accumulate in INT32. Literal and
+runtime `init_cond` select initializing or accumulating writes. Wider Acc valid
+regions use a product-shaped descriptor over the same storage. Matrix region
+carries must preserve one storage alias; arbitrary matrix carry copies, MX,
+FIFO, slots, scaled/quantized writeback and workspace operations remain excluded.
+Torch debugging models fractal layouts and shared addressed matrix storage,
+including transpose relabels and product views. Only complete untouched Acc
+boxes have defined preservation outside a partially valid product.
+
+A5 retains Tile IR until its default rollout has clean runtime acceptance.
+Reductions, slice/assemble/reinterpret views, runtime valid shapes, slots, helper ABIs
+and cross-core resources remain Tile in the normal pipeline. Existing production
+recipes may support more through explicit low-level pass pipelines; their
+availability alone does not widen default acceptance.
 
 ```text
 Default / True: load -> add -> mul -> store  => Buffer
