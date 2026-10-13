@@ -174,5 +174,24 @@ std::string StoreL2HintToString(StoreL2Hint hint) {
   throw TypeError("Unknown StoreL2Hint value: " + std::to_string(static_cast<int>(hint)));
 }
 
+std::string CachePolicyToString(CachePolicy policy) {
+  switch (policy) {
+    case CachePolicy::kDefault:
+      return "default";
+    case CachePolicy::kBypass:
+      return "bypass";
+  }
+  throw TypeError("Unknown CachePolicy value: " + std::to_string(static_cast<int>(policy)));
+}
+
+CachePolicy StringToCachePolicy(const std::string& str) {
+  if (str == "default") {
+    return CachePolicy::kDefault;
+  } else if (str == "bypass") {
+    return CachePolicy::kBypass;
+  }
+  throw TypeError("Unknown CachePolicy string: " + str);
+}
+
 }  // namespace ir
 }  // namespace pypto

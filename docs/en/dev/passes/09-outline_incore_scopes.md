@@ -279,19 +279,29 @@ automatically):
   same rule applies to the sibling `OutlineHierarchyScopes` and
   `OutlineClusterScopes` passes (which share the outlining utility).
 
-**L2 declarations become parameter indices**: the parser records
-`pl.set_l2_hint(t, load=..., store=...)` in `load_l2_hint_vars` and
-`store_l2_hint_vars`, each a `vector<pair<VarPtr, int>>`. Outlining resolves the
-captured Vars to parameter indices and emits `load_l2_hint` / `store_l2_hint`
-function attrs (`vector<pair<int32_t, int>>`), sorted by index. It consumes the
-scope attrs; they do not propagate to the generated call or parent function.
-
-The shared outlining utility validates each direction's ISA encoding and
-rejects declarations on uncaptured tensors, nonallocating load declarations
-on tensors the scope writes, and store declarations on read-only tensors.
-[ConvertTensorToTileOps](11-convert_tensor_to_tile_ops.md) later stamps the
-access kwargs and erases these temporary parameter-index attrs before passes
-change the signature. See [L2 Cache Hints](../language/05-l2-hints.md).
+**Cache-policy declarations become param indices**: a
+`pl.set_cache_policy(t, pl.CachePolicy.BYPASS)` statement in the scope body is
+hoisted by the parser onto the scope's `cache_policy_vars` attr
+(`std::vector<std::pair<VarPtr, int>>`, keyed by Var identity). This pass
+resolves each Var through the same captured-input index map the `no_dep_args`
+translation uses and re-emits the list as the outlined function's `cache_policy`
+attr — `std::vector<std::pair<int32_t, int>>` (param index, `CachePolicy` as
+int), sorted by index so declaration order and capture order cannot change the
+IR. The scope attr is **consumed here and never propagated**: from this point the
+function attr is the single carrier, until
+[`ConvertTensorToTileOps`](11-convert_tensor_to_tile_ops.md) turns it into a
+`cache` kwarg on each `tile.load` and erases it. Param indices are only valid
+across that window — later passes both append to
+([`InjectGMPipeBuffer`](25-inject_gm_pipe_buffer.md),
+[`MaterializeDistTensorCtx`](48-materialize_dist_tensor_ctx.md)) and prepend onto
+([`MaterializeValidShapeSymbols`](53-materialize_valid_shape_symbols.md)) param
+lists. Two user errors are rejected here with `CHECK_SPAN`: a declaration naming
+a tensor the scope body does not capture (it is neither read nor written, so no parameter
+carries the policy), and `BYPASS` on a parameter `InferParamDirections` resolved
+to `Out` / `InOut` (a bypassing read of bytes the same kernel writes is a
+coherency bug). The translation lives in the shared outlining utility, so the
+sibling `OutlineHierarchyScopes` path stamps the attr the same way. See
+[GM Cache-Access Policy](../language/05-cache-policy.md).
 
 ## Example
 

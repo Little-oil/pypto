@@ -684,8 +684,8 @@ class StructuralEqualImpl {
           }
         }
       } else if (lhs_val.type() == typeid(std::vector<std::pair<VarPtr, int>>)) {
-        // ``kAttrLoadL2HintVars`` on ScopeStmts: (Var, ``LoadL2Hint``-as-int)
-        // pairs written by the DSL parser for ``pl.set_l2_hint(...)``.
+        // ``kAttrCachePolicyVars`` on ScopeStmts: (Var, ``CachePolicy``-as-int)
+        // pairs written by the DSL parser for ``pl.set_cache_policy(...)``.
         // The Var half goes through the same Var-mapping path as the Var-list
         // arm above, so an SSA rename still matches; the int half is compared
         // directly.
@@ -706,8 +706,8 @@ class StructuralEqualImpl {
           }
         }
       } else if (lhs_val.type() == typeid(std::vector<std::pair<int32_t, int>>)) {
-        // ``kAttrLoadL2HintParams`` on an outlined Function: (param index,
-        // ``LoadL2Hint``-as-int) pairs. Both halves are plain integers, so a
+        // ``kAttrCachePolicyParams`` on an outlined Function: (param index,
+        // ``CachePolicy``-as-int) pairs. Both halves are plain integers, so a
         // element-wise vector compare is exact.
         const auto& lhs_pairs =
             AnyCast<std::vector<std::pair<int32_t, int>>>(lhs_val, "comparing kwarg: " + lhs_key);

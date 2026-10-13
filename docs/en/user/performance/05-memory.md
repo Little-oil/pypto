@@ -216,33 +216,80 @@ than grown. The runtime says so itself when it fails — *"raise `ring_task_wind
 **How to confirm:** the metadata line of a fresh `scope_stats.jsonl` shows the new sizes,
 and the peak that was pinned at capacity is no longer pinned.
 
-## Choosing L2 Hints for Streaming Operands
+## Keeping a streaming operand out of the cache
 
-For operands with little reuse, request nonallocating loads to avoid displacing
-hot data. Declare defaults on a tensor when accesses are implicit:
+Not every buffer a kernel reads deserves cache. A weight matrix that each byte is
+read from exactly once cannot hit, yet it still sweeps the last-level cache and
+evicts the small activation working set that *does* get reread. Two operands, one
+cache, opposite needs.
+
+The compiler cannot tell them apart — reuse is not reliably visible to it, and a
+wrong guess is a silent multi-percent regression rather than an error. So you
+declare it:
 
 ```python
 with pl.at(level=pl.Level.CORE_GROUP):
-    pl.set_l2_hint(weights, load=pl.LoadL2Hint.NotAllocClean)
-    pl.set_l2_hint(out, store=pl.StoreL2Hint.NormalLastVictim)
+    pl.set_cache_policy(weights, pl.CachePolicy.BYPASS)
+    # every read of `weights` in this scope is now declared streaming;
+    # the activations keep the default cached path.
     acc = pl.matmul(activations, weights, out_dtype=pl.FP32)
-    out = pl.assemble(out, acc, [0, 0])
 ```
 
-For tile programming, specify `l2_hint` directly on `pl.load` / `pl.store`.
-An explicit hint overrides the corresponding scope declaration, including an
-explicit zero-valued `NormalFirstVictim`. Load and store enums differ.
+`pl.set_cache_policy` is a standalone statement at the top level of a
+`pl.at(level=pl.Level.CORE_GROUP, ...)` or `pl.spmd(...)` body — anywhere among
+that body's own statements, not necessarily the first line. It covers every read
+of that tensor in the scope, so tensor-level code needs no change at the access
+sites — which matters because those reads are implicit: `pl.matmul`,
+`pl.assemble` and subscript slicing issue loads without a call you could
+annotate.
 
-A5 forwards the precise ISA hint to `l2CacheCtl`. A2/A3 supports all load
-`NotAlloc*` names through the runtime no-cache address alias, with the same
-behavior for Keep/Clean/Drop; its normal and store hints have no distinct
-hardware effect. Avoid concurrent cached writes to bytes read through an
-uncached alias. A scope NotAlloc load declaration on a tensor the scope writes
-is rejected. Cache behavior and performance depend on the device and workload.
+A declaration on a non-`CORE_GROUP` `pl.at` scope parses and is carried, but
+nothing lowers it into a load today, so it has no effect — those scopes do not
+become device kernels.
 
-This uses stock PTOAS v0.65. See [L2 Cache Hints](../../dev/language/05-l2-hints.md)
-for encodings, scope restrictions, compiler carriers and migration from the
-removed `CachePolicy` API.
+When you *are* writing tile-level code and already name the load, put it there
+instead:
+
+```python
+tile = pl.load(weights, [n0, k0], [256, 512], cache=pl.CachePolicy.BYPASS)
+```
+
+An explicit `cache=` on a load always wins over the scope declaration, in both
+directions — so `cache=pl.CachePolicy.DEFAULT` opts one access back into the
+cache inside an otherwise-bypassing scope.
+
+**Cost:** correctness is yours to guarantee. `BYPASS` asserts two things: this
+tensor has no reuse worth caching, *and* nothing writes those bytes while the
+kernel runs. Mixing a cached write with a bypassing read of the same bytes is a
+coherency bug, which is why this is never a default and never inferred. The
+compiler rejects the case it can see — declaring `BYPASS` on a tensor the scope
+writes is an error — but it cannot prove the general case.
+
+**Requires PTOAS >= v0.64, and pays off on a2a3 only.** There, a `BYPASS` read
+compiles to a load issued against the page's uncached alias, using the offset
+the device's driver reports for it; a device that exposes no such alias reports
+zero, which leaves the read ordinary and correct. A5 does not map GM twice, so a
+declaration is accepted there and currently changes nothing. A read that declares
+nothing is unaffected on every target, byte for byte.
+
+### Explicit L2 hints
+
+On A5, `pl.LoadL2Hint` and `pl.StoreL2Hint` expose PTO-ISA hint names for the
+`l2_hint=` argument of `pl.load` and `pl.store`. For example,
+`pl.LoadL2Hint.NormalLastVictim` requests a lower eviction priority.
+Load and store encodings differ, so the enum must match the operation. The
+caller can choose six load modes and four store modes. A load cannot combine
+non-`None` `cache` and `l2_hint`; `l2_hint=None` preserves existing behavior,
+including inheritance from `pl.set_cache_policy`.
+
+PyPTO forwards these hints to the PTO-ISA template parameters when finalizing
+generated C++. It uses the existing PTOAS v0.65 release; no assembler changes
+are required. Synchronization and memory planning still see ordinary transfers.
+A2/A3 rejects every explicit `l2_hint`; use `CachePolicy.BYPASS` for its
+existing runtime-offset bypass path. On A5, that old BYPASS declaration remains
+accepted with no effect and is not mapped to an ISA hint. Select the A5 mode
+explicitly. See [GM cache policy](../../dev/language/05-cache-policy.md)
+for architecture restrictions, precedence, and the complete hint table.
 
 ## See also
 

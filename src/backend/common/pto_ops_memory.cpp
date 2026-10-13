@@ -111,8 +111,14 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   INTERNAL_CHECK_SPAN(!shapes_tuple->elements_.empty(), op->span_)
       << "tile.load shapes tuple must have at least one element";
 
-  const int hint = op->GetKwarg<int>("l2_hint", 0);
-  const bool emit_hint = op->HasKwarg("l2_hint");
+  // The declared GM cache-access policy (pypto #2680). PTOAS >= v0.64 carries a
+  // streaming read as a `cache_policy` attribute on `pto.tload` plus an optional
+  // byte `offset` it adds to that one load's source address. On a2a3 the offset
+  // is the driver-owned distance to the page's uncached alias, threaded in as a
+  // synthetic kernel parameter (see PTOCodegen::GetL2CacheOffsetArgSSA); the
+  // attribute alone declares the policy but moves no address. Both are attached
+  // below, alongside the MX layout attribute when it applies.
+  const auto policy = static_cast<ir::CachePolicy>(op->GetKwarg<int>("cache", 0));
 
   std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
   std::string tile_buf = codegen.GetCurrentResultTarget();
@@ -167,7 +173,11 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
   tload_line << tile_buf << " : " << tile_buf_type << ")";
 
-  if (emit_hint) {
+  std::vector<std::string> attrs;
+  if (op->HasKwarg("l2_hint")) {
+    const int hint = op->GetKwarg<int>("l2_hint", 0);
+    CHECK_SPAN(codegen.GetBackendHandler()->GetPtoTargetArch() == "a5", op->span_)
+        << "load l2_hint is only supported on A5; use cache=CachePolicy.BYPASS on A2/A3";
     // Stock PTOAS preserves these comments. PyPTO finalization uses them to
     // select this transfer's ISA overload; PTOAS still sees the real load's
     // memory effects and pipe for planning and synchronization.
@@ -175,11 +185,37 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
                  ir::LoadL2HintToString(static_cast<ir::LoadL2Hint>(hint)) + "\"");
   }
   if (is_mx_load) {
-    tload_line << " {layout = #pto.layout<" << pto_layout << ">}";
+    attrs.push_back("layout = #pto.layout<" + pto_layout + ">");
+  }
+  if (policy == ir::CachePolicy::kBypass) {
+    attrs.emplace_back("cache_policy = #pto.load_cache_policy<l2_bypass>");
   }
 
+  // Default-valued attributes are omitted so an undeclared load keeps its
+  // byte-identical PTO form. PTOAS expects all present attributes in one dict
+  // (same contract as tile.store below).
+  if (!attrs.empty()) {
+    tload_line << " {";
+    for (size_t i = 0; i < attrs.size(); ++i) {
+      if (i != 0) tload_line << ", ";
+      tload_line << attrs[i];
+    }
+    tload_line << "}";
+  }
+
+  // The offset operand follows the attribute dict, and PTOAS applies it only to
+  // a load that also declared l2_bypass. It is empty on an architecture with no
+  // address alias to reach, which leaves the declaration carried by the
+  // attribute alone -- and PTOAS v0.64 lowers a bare attribute to an ordinary
+  // TLOAD, so that declaration costs nothing and does nothing.
+  if (policy == ir::CachePolicy::kBypass) {
+    const std::string l2_cache_offset = codegen.GetL2CacheOffsetArgSSA();
+    if (!l2_cache_offset.empty()) {
+      tload_line << " offset = " << l2_cache_offset << " : i64";
+    }
+  }
   codegen.Emit(tload_line.str());
-  if (emit_hint) {
+  if (op->HasKwarg("l2_hint")) {
     codegen.Emit("emitc.verbatim \"// __pypto_l2_hint_end\"");
   }
 
@@ -357,6 +393,8 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
     tstore_line << "}";
   }
   if (op->HasKwarg("l2_hint")) {
+    CHECK_SPAN(codegen.GetBackendHandler()->GetPtoTargetArch() == "a5", op->span_)
+        << "store l2_hint is only supported on A5";
     codegen.Emit("emitc.verbatim \"// __pypto_l2_hint_begin store " +
                  ir::StoreL2HintToString(static_cast<ir::StoreL2Hint>(op->GetKwarg<int>("l2_hint", 0))) +
                  "\"");

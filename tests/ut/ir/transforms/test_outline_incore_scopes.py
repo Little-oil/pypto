@@ -3492,51 +3492,16 @@ class TestGraphFunctionTypeIsPreserved:
         assert main.func_type == ir.FunctionType.Orchestration
 
 
-@pytest.mark.parametrize(
-    "hint", [pl.LoadL2Hint.NotAllocKeep, pl.LoadL2Hint.NotAllocClean, pl.LoadL2Hint.NotAllocDrop]
-)
-def test_scope_rejects_nonallocating_load_hint_on_written_tensor(hint):
-    @pl.program
-    class InPlace:
-        @pl.function
-        def main(self, x: pl.InOut[pl.Tensor[[32, 32], pl.FP32]]) -> pl.Tensor[[32, 32], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP):
-                pl.set_l2_hint(x, load=hint)
-                t = pl.load(x, [0, 0], [32, 32])
-                x = pl.store(t, [0, 0], x)
-            return x
-
-    with pytest.raises(ValueError, match="not allowed on a tensor this scope writes"):
-        passes.outline_incore_scopes()(passes.convert_to_ssa()(InPlace))
-
-
-def test_scope_rejects_store_hint_on_readonly_tensor():
-    @pl.program
-    class ReadOnly:
-        @pl.function
-        def main(
-            self, x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]
-        ) -> pl.Tensor[[32, 32], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP):
-                pl.set_l2_hint(x, store=pl.StoreL2Hint.NormalPersistent)
-                t = pl.load(x, [0, 0], [32, 32])
-                out = pl.store(t, [0, 0], out)
-            return out
-
-    with pytest.raises(ValueError, match="requires a tensor this scope writes"):
-        passes.outline_incore_scopes()(passes.convert_to_ssa()(ReadOnly))
-
-
-class TestOutlineLoadL2Hint:
-    """``pl.set_l2_hint(t, policy)`` lowering: ``ScopeStmt.attrs['load_l2_hint_vars']``
+class TestOutlineCachePolicy:
+    """``pl.set_cache_policy(t, policy)`` lowering: ``ScopeStmt.attrs['cache_policy_vars']``
     holds the captured Vars the declaration names, and the outliner translates
     them into positional indices into the outlined function's params, re-emitted
-    as the function attr ``load_l2_hint``.
+    as the function attr ``cache_policy``.
 
     The Var form is *consumed* here — it must not survive onto the synthesised
     call or onto either function. Param indices are a carrier with a deliberately
     short life: they stay valid only until ConvertTensorToTileOps (pass 11) turns
-    them into per-``tile.load`` ``l2_hint`` kwargs, because passes after that both
+    them into per-``tile.load`` ``cache`` kwargs, because passes after that both
     append to param lists (InjectGMPipeBuffer, MaterializeDistTensorCtx) and
     prepend onto them (MaterializeValidShapeSymbols).
 
@@ -3569,16 +3534,16 @@ class TestOutlineLoadL2Hint:
                 out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
             ) -> pl.Tensor[[256, 256], pl.FP32]:
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
-                    pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
+                    pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
                     c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
                     out = pl.assemble(out, c, [0, 0])
                 return out
 
         mm = self._kernel(self._outline(Before), "mm")
         # Capture order is a, b, out — so b's declaration lands at index 1,
-        # paired with LoadL2Hint.NotAllocClean's underlying int (the form the
-        # ``tile.load`` ``l2_hint`` kwarg is registered with).
-        assert dict(mm.attrs)["load_l2_hint"] == [(1, int(pl.LoadL2Hint.NotAllocClean))]
+        # paired with CachePolicy.BYPASS's underlying int (the form the
+        # ``tile.load`` ``cache`` kwarg is registered with).
+        assert dict(mm.attrs)["cache_policy"] == [(1, int(pl.CachePolicy.BYPASS))]
         assert mm.params[1].name_hint.startswith("b"), "index 1 must be the declared tensor's slot"
 
     def test_scope_attr_is_consumed_by_outlining(self):
@@ -3594,7 +3559,7 @@ class TestOutlineLoadL2Hint:
                 out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
             ) -> pl.Tensor[[256, 256], pl.FP32]:
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
-                    pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
+                    pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
                     c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
                     out = pl.assemble(out, c, [0, 0])
                 return out
@@ -3604,14 +3569,14 @@ class TestOutlineLoadL2Hint:
         # Not on the synthesised dispatch: the declaration is a property of the
         # callee's parameters, and nothing at the call site consumes it.
         call = TestOutlineNoDepArgs._outlined_user_call(After)
-        assert "load_l2_hint_vars" not in call.attrs
-        assert "load_l2_hint" not in call.attrs
+        assert "cache_policy_vars" not in call.attrs
+        assert "cache_policy" not in call.attrs
         # Not on the orchestrator either — only the outlined kernel carries it.
         main = self._kernel(After, "main")
-        assert "load_l2_hint_vars" not in dict(main.attrs)
-        assert "load_l2_hint" not in dict(main.attrs)
+        assert "cache_policy_vars" not in dict(main.attrs)
+        assert "cache_policy" not in dict(main.attrs)
         # And the Var form is gone from the kernel: indices replaced it.
-        assert "load_l2_hint_vars" not in dict(self._kernel(After, "mm").attrs)
+        assert "cache_policy_vars" not in dict(self._kernel(After, "mm").attrs)
 
     def test_declarations_are_recorded_in_param_index_order(self):
         """Declaration order is irrelevant; the attr is sorted by param index.
@@ -3633,15 +3598,15 @@ class TestOutlineLoadL2Hint:
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
                     # Written b-then-a; a is captured first, so the attr must
                     # come back a-then-b.
-                    pl.set_l2_hint(b, load=pl.LoadL2Hint.NotAllocClean)
-                    pl.set_l2_hint(a, load=pl.LoadL2Hint.NotAllocClean)
+                    pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+                    pl.set_cache_policy(a, pl.CachePolicy.BYPASS)
                     c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
                     out = pl.assemble(out, c, [0, 0])
                 return out
 
         mm = self._kernel(self._outline(Before), "mm")
-        bypass = int(pl.LoadL2Hint.NotAllocClean)
-        assert dict(mm.attrs)["load_l2_hint"] == [(0, bypass), (1, bypass)]
+        bypass = int(pl.CachePolicy.BYPASS)
+        assert dict(mm.attrs)["cache_policy"] == [(0, bypass), (1, bypass)]
 
     def test_default_policy_is_allowed_on_a_written_tensor(self):
         """Only BYPASS carries the no-concurrent-write promise, so only BYPASS
@@ -3658,13 +3623,13 @@ class TestOutlineLoadL2Hint:
                 out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
             ) -> pl.Tensor[[256, 256], pl.FP32]:
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
-                    pl.set_l2_hint(out, load=pl.LoadL2Hint.NormalFirstVictim)
+                    pl.set_cache_policy(out, pl.CachePolicy.DEFAULT)
                     c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
                     out = pl.assemble(out, c, [0, 0])
                 return out
 
         mm = self._kernel(self._outline(Before), "mm")
-        assert dict(mm.attrs)["load_l2_hint"] == [(2, int(pl.LoadL2Hint.NormalFirstVictim))]
+        assert dict(mm.attrs)["cache_policy"] == [(2, int(pl.CachePolicy.DEFAULT))]
 
     def test_declaration_on_an_uncaptured_tensor_is_rejected(self):
         """A tensor the scope body never reads has no parameter to resolve to."""
@@ -3678,7 +3643,7 @@ class TestOutlineLoadL2Hint:
                 w: pl.Tensor[[64], pl.FP32],
             ) -> pl.Tensor[[64], pl.FP32]:
                 with pl.at(level=pl.Level.CORE_GROUP):
-                    pl.set_l2_hint(w, load=pl.LoadL2Hint.NotAllocClean)
+                    pl.set_cache_policy(w, pl.CachePolicy.BYPASS)
                     y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
                 return y
 
@@ -3699,7 +3664,7 @@ class TestOutlineLoadL2Hint:
                 out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
             ) -> pl.Tensor[[256, 256], pl.FP32]:
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
-                    pl.set_l2_hint(out, load=pl.LoadL2Hint.NotAllocClean)
+                    pl.set_cache_policy(out, pl.CachePolicy.BYPASS)
                     c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
                     out = pl.assemble(out, c, [0, 0])
                 return out
@@ -3719,7 +3684,7 @@ class TestOutlineLoadL2Hint:
                 k: pl.Tensor[[64, 64], pl.FP32],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="kk"):
-                    pl.set_l2_hint(k, load=pl.LoadL2Hint.NotAllocClean)
+                    pl.set_cache_policy(k, pl.CachePolicy.BYPASS)
                     t: pl.Tensor[[64, 64], pl.FP32] = pl.add(k, x)
                     k = pl.assemble(k, t, [0, 0])
                 return k

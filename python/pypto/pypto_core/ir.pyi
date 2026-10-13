@@ -392,7 +392,7 @@ class PadValue(enum.Enum):
     """Min value padding."""
 
 class LoadL2Hint(enum.IntEnum):
-    """Per-transfer L2 hint with PTO-ISA encodings."""
+    """A5 per-load L2 hint with PTO-ISA encodings."""
 
     NormalFirstVictim = 0
     NormalLastVictim = 1
@@ -402,12 +402,30 @@ class LoadL2Hint(enum.IntEnum):
     NotAllocDrop = 6
 
 class StoreL2Hint(enum.IntEnum):
-    """Per-transfer L2 hint with PTO-ISA encodings."""
+    """A5 per-store L2 hint with PTO-ISA encodings."""
 
     NormalFirstVictim = 0
     NormalLastVictim = 1
     NormalPersistent = 2
     NotAllocClean = 4
+
+class CachePolicy(enum.IntEnum):
+    """GM cache-access policy declared for a tensor read.
+
+    A semantic contract the author states, never a hint the compiler invents.
+    Stored as ``int`` in the ``tile.load`` ``cache`` kwarg.
+    """
+
+    DEFAULT = 0
+    """Ordinary cached GM access."""
+
+    BYPASS = 1
+    """Streaming access declared to bypass the cache.
+
+    Asserts this tensor has no reuse worth caching and that nothing writes
+    those bytes while the kernel runs — mixing a cached write and a bypassing
+    read of the same bytes is a coherency bug.
+    """
 
 class CompactMode(enum.Enum):
     """Partial-tile compact mode enumeration."""

@@ -55,15 +55,16 @@ using DeserializerContext = serialization::detail::DeserializerContext;
 // A missing field silently defaults to empty (backward compat with older .pto blobs).
 // A present field with an unexpected type raises — silently treating malformed data
 // as "no comments" would hide serializer/deserializer mismatches.
-/// Reject a L2-hint int that names no declared policy.
+/// Reject a cache-policy int that names no declared policy.
 ///
 /// A `.pto` file is external input, so an out-of-range value is a user-facing
 /// error, not an internal invariant: fail at the boundary with the value in
 /// hand rather than letting an unknown policy reach a pass or codegen.
-static void CheckL2HintValue(int hint, const std::string& key) {
-  const bool store = key == kAttrStoreL2HintVars || key == kAttrStoreL2HintParams;
-  CHECK(store ? IsValidStoreL2Hint(hint) : IsValidLoadL2Hint(hint))
-      << "L2 hint attr '" << key << "' has invalid " << (store ? "store" : "load") << " encoding " << hint;
+static void CheckCachePolicyValue(int policy, const std::string& context) {
+  CHECK(policy == static_cast<int>(CachePolicy::kDefault) || policy == static_cast<int>(CachePolicy::kBypass))
+      << context << " has unknown CachePolicy value " << policy << "; expected "
+      << static_cast<int>(CachePolicy::kDefault) << " (default) or " << static_cast<int>(CachePolicy::kBypass)
+      << " (bypass)";
 }
 
 static std::vector<std::string> DeserializeLeadingComments(const msgpack::object& fields_obj) {
@@ -310,8 +311,8 @@ static std::vector<std::pair<std::string, std::any>> DeserializeKwargs(const msg
         }
         kwargs.emplace_back(key, std::move(idxs));
       } else if (type_name == "VarPolicyList") {
-        // kAttrLoadL2HintVars — (tensor Var, LoadL2Hint-as-int) pairs from
-        // `pl.set_l2_hint`. The Var half resolves through the node table so
+        // kAttrCachePolicyVars — (tensor Var, CachePolicy-as-int) pairs from
+        // `pl.set_cache_policy`. The Var half resolves through the node table so
         // identity round-trips; a nil Var reconstructs a null VarPtr.
         if (!has_value_obj || value_obj_inner.type != msgpack::type::ARRAY) {
           throw TypeError("VarPolicyList kwarg '" + key + "' must have ARRAY value");
@@ -349,12 +350,12 @@ static std::vector<std::pair<std::string, std::any>> DeserializeKwargs(const msg
             throw TypeError("VarPolicyList kwarg '" + key +
                             "' entries must have both 'var' and 'policy' fields");
           }
-          CheckL2HintValue(policy, key);
+          CheckCachePolicyValue(policy, "VarPolicyList kwarg '" + key + "'");
           entries.emplace_back(std::move(var), policy);
         }
         kwargs.emplace_back(key, std::move(entries));
       } else if (type_name == "IndexPolicyList") {
-        // kAttrLoadL2HintParams — (param index, LoadL2Hint-as-int) pairs written
+        // kAttrCachePolicyParams — (param index, CachePolicy-as-int) pairs written
         // by the outliner and erased by ConvertTensorToTileOps.
         if (!has_value_obj || value_obj_inner.type != msgpack::type::ARRAY) {
           throw TypeError("IndexPolicyList kwarg '" + key + "' must have ARRAY value");
@@ -390,7 +391,7 @@ static std::vector<std::pair<std::string, std::any>> DeserializeKwargs(const msg
             throw TypeError("IndexPolicyList kwarg '" + key +
                             "' entries must have both 'index' and 'policy' fields");
           }
-          CheckL2HintValue(policy, key);
+          CheckCachePolicyValue(policy, "IndexPolicyList kwarg '" + key + "'");
           entries.emplace_back(index, policy);
         }
         kwargs.emplace_back(key, std::move(entries));

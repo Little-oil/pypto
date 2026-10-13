@@ -9254,13 +9254,76 @@ def test_store_rejects_load_l2_hint_enum():
         pl.store(src, [0, 0], dst, l2_hint=cast(Any, pl.LoadL2Hint.NotAllocKeep))
 
 
-def test_removed_cache_policy_api_is_not_exposed():
-    assert not hasattr(pl, "CachePolicy")
-    assert not hasattr(pl, "set_cache_policy")
-    assert not hasattr(ir, "CachePolicy")
+@pytest.mark.parametrize("cache", [ir.CachePolicy.DEFAULT, ir.CachePolicy.BYPASS])
+def test_load_rejects_cache_and_l2_hint_together(cache):
     src = ir.Var("src", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown())
-    with pytest.raises(TypeError, match="cache"):
-        cast(Any, tile.load)(src, [0, 0], [32, 32], cache=1)
+    with pytest.raises(ValueError, match="cannot specify both cache and l2_hint"):
+        tile.load(src, [0, 0], [32, 32], cache=int(cache), l2_hint=0)
+
+
+@pytest.mark.parametrize("cache", [pl.CachePolicy.DEFAULT, pl.CachePolicy.BYPASS])
+def test_dsl_load_rejects_cache_and_l2_hint_together(cache):
+    src = pl.Tensor(expr=ir.Var("src", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown()))
+    with pytest.raises(ValueError, match="tile.load cannot specify both cache and l2_hint"):
+        pl.load(src, [0, 0], [32, 32], cache=cache, l2_hint=pl.LoadL2Hint.NormalFirstVictim)
+
+
+@pytest.mark.parametrize("hint", [*pl.LoadL2Hint, *pl.StoreL2Hint])
+def test_dsl_load_rejects_l2_hint_enum_as_cache_policy(hint):
+    """Overlapping numeric encodings must not turn a hardware hint into BYPASS."""
+    src = pl.Tensor(expr=ir.Var("src", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown()))
+    with pytest.raises(TypeError, match="load cache must be CachePolicy, not an L2 hint"):
+        pl.load(src, [0, 0], [32, 32], cache=cast(Any, hint))
+
+
+@pytest.mark.parametrize(
+    "hint,encoding",
+    [
+        (pl.LoadL2Hint.NormalFirstVictim, 0),
+        (pl.LoadL2Hint.NormalLastVictim, 1),
+        (pl.LoadL2Hint.NormalPersistent, 2),
+        (pl.LoadL2Hint.NotAllocKeep, 4),
+        (pl.LoadL2Hint.NotAllocClean, 5),
+        (pl.LoadL2Hint.NotAllocDrop, 6),
+    ],
+)
+def test_dsl_load_preserves_isa_hint_encoding(hint, encoding):
+    src = pl.Tensor(expr=ir.Var("src", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown()))
+    call = pl.load(src, [0, 0], [32, 32], l2_hint=hint).unwrap()
+    assert isinstance(call, ir.Call)
+    assert int(hint) == encoding
+    assert dict(call.kwargs)["l2_hint"] == encoding
+    assert "cache" not in dict(call.kwargs)
+
+
+@pytest.mark.parametrize(
+    "hint,encoding",
+    [
+        (pl.StoreL2Hint.NormalFirstVictim, 0),
+        (pl.StoreL2Hint.NormalLastVictim, 1),
+        (pl.StoreL2Hint.NormalPersistent, 2),
+        (pl.StoreL2Hint.NotAllocClean, 4),
+    ],
+)
+def test_dsl_store_preserves_isa_hint_encoding(hint, encoding):
+    src = pl.Tile(expr=_partial_tile([32, 32], [32, 32]))
+    dst = pl.Tensor(expr=ir.Var("dst", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown()))
+    call = pl.store(src, [0, 0], dst, l2_hint=hint).unwrap()
+    assert isinstance(call, ir.Call)
+    assert int(hint) == encoding
+    assert dict(call.kwargs)["l2_hint"] == encoding
+
+
+def test_omitted_l2_hint_stays_absent():
+    src = pl.Tensor(expr=ir.Var("src", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown()))
+    dst = pl.Tensor(expr=ir.Var("dst", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown()))
+    value = pl.load(src, [0, 0], [32, 32])
+    load_call = value.unwrap()
+    store_call = pl.store(value, [0, 0], dst).unwrap()
+    assert isinstance(load_call, ir.Call)
+    assert isinstance(store_call, ir.Call)
+    assert "l2_hint" not in dict(load_call.kwargs)
+    assert "l2_hint" not in dict(store_call.kwargs)
 
 
 if __name__ == "__main__":

@@ -792,6 +792,20 @@ inline std::vector<std::pair<std::string, std::any>> WithManualDepEdgesAttr(
   return attrs;
 }
 
+/**
+ * @brief GM cache-access policy for a tensor read.
+ *
+ * A semantic contract the author states, never a hint the compiler invents:
+ * ``kBypass`` asserts the kernel streams this tensor with no reuse worth
+ * caching and that nothing writes those bytes while it runs. Mixing a cached
+ * write and a bypassing read of the same bytes is a coherency bug, so this is
+ * never a default and never inferred.
+ */
+enum class CachePolicy : uint8_t {
+  kDefault = 0,  ///< Ordinary cached GM access
+  kBypass = 1,   ///< Streaming access, declared to bypass the cache
+};
+
 /** @brief Per-transfer L2 hints; values match PTO-ISA TLoadL2Hint. */
 enum class LoadL2Hint : uint8_t {
   NormalFirstVictim = 0,
@@ -813,19 +827,43 @@ enum class StoreL2Hint : uint8_t {
 std::string LoadL2HintToString(LoadL2Hint hint);
 std::string StoreL2HintToString(StoreL2Hint hint);
 
-/** @brief Scope declarations: (captured tensor Var, exact ISA hint encoding). */
-inline constexpr const char* kAttrLoadL2HintVars = "load_l2_hint_vars";
-inline constexpr const char* kAttrStoreL2HintVars = "store_l2_hint_vars";
+/**
+ * @brief Convert CachePolicy to string ("default" / "bypass")
+ */
+std::string CachePolicyToString(CachePolicy policy);
 
-/** @brief Outlined declarations: (param index, hint), consumed by tensor lowering. */
-inline constexpr const char* kAttrLoadL2HintParams = "load_l2_hint";
-inline constexpr const char* kAttrStoreL2HintParams = "store_l2_hint";
+/**
+ * @brief Convert string to CachePolicy
+ *
+ * @throws TypeError if the string does not name a known policy
+ */
+CachePolicy StringToCachePolicy(const std::string& str);
 
-inline bool IsNotAllocLoadL2Hint(int hint) { return hint == 4 || hint == 5 || hint == 6; }
-inline bool IsValidLoadL2Hint(int hint) {
-  return hint == 0 || hint == 1 || hint == 2 || IsNotAllocLoadL2Hint(hint);
-}
-inline bool IsValidStoreL2Hint(int hint) { return hint == 0 || hint == 1 || hint == 2 || hint == 4; }
+/**
+ * @brief Reserved attr key set on a ``ScopeStmt`` by the DSL parser for
+ * ``pl.set_cache_policy(t, policy)``. Holds
+ * ``std::vector<std::pair<VarPtr, int>>`` (Var, ``CachePolicy``-as-int)
+ * referencing outer-scope tensor Vars captured by the scope body.
+ *
+ * ``OutlineIncoreScopes`` / ``OutlineHierarchyScopes`` translate the Var list
+ * into positional indices into the outlined function's params and re-emit it
+ * as the function attr ``kAttrCachePolicyParams``; the scope attr never
+ * survives outlining. Never appears on a ``Call``.
+ */
+inline constexpr const char* kAttrCachePolicyVars = "cache_policy_vars";
+
+/**
+ * @brief Reserved attr key on an outlined ``Function`` carrying the resolved
+ * cache-policy declarations. Holds ``std::vector<std::pair<int32_t, int>>``
+ * (param index, ``CachePolicy``-as-int), sorted by index.
+ *
+ * Written by ``OutlineIncoreScopes`` (pass 9) and consumed by
+ * ``ConvertTensorToTileOps`` (pass 11), which turns each entry into a
+ * ``cache`` kwarg on the matching ``tile.load`` and erases the attr. Param
+ * indices are only valid across that window: later passes append to and
+ * prepend onto param lists.
+ */
+inline constexpr const char* kAttrCachePolicyParams = "cache_policy";
 
 /**
  * @brief Reserved attr key on a ``Call`` for the per-call selective tensor
@@ -977,7 +1015,7 @@ void ForEachAttrExpr(const std::any& value, F&& fn) {
       if (v) fn(ExprPtr(v));
     }
   } else if (const auto* var_ints = std::any_cast<std::vector<std::pair<VarPtr, int>>>(&value)) {
-    // ``kAttrLoadL2HintVars``: the Var half is a real reference the scope
+    // ``kAttrCachePolicyVars``: the Var half is a real reference the scope
     // carries from parse to outlining, so it must be reported (and, in
     // ``MapAttrExprs``, rewritten) like any other. The int half names a policy,
     // not a value.

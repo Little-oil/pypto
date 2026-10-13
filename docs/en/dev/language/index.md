@@ -9,7 +9,7 @@ The Python DSL as the compiler sees it.
 | [Manual Dependency Primitives](02-manual_dependencies.md) | `pl.manual_scope`, explicit `deps=` edges, dispatch predicates, array-carry fences |
 | [Functions and Program Structure](03-functions.md) | Function types, parameter directions, cross-module reuse, printing IR |
 | [Integrating Hand-Written C++ Kernels](04-external-kernels.md) | Calling an existing hand-written C++ InCore kernel from a PyPTO program |
-| [L2 Cache Hints](05-l2-hints.md) | `l2_hint` / `pl.set_l2_hint` — per-transfer and scope load/store control, target behavior, and compiler carriers |
+| [GM Cache-Access Policy and L2 Hints](05-cache-policy.md) | Existing `CachePolicy` declarations and per-transfer `l2_hint` controls on A5 |
 
 ## See Also
 

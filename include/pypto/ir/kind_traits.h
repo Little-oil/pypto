@@ -398,7 +398,7 @@ std::optional<std::any> MapAttrExprs(const std::any& value, F&& remap) {
     return std::any(std::move(next));
   }
   if (const auto* var_ints = std::any_cast<std::vector<std::pair<VarPtr, int>>>(&value)) {
-    // ``kAttrLoadL2HintVars``: ``(Var, LoadL2Hint-as-int)`` pairs. Only the
+    // ``kAttrCachePolicyVars``: ``(Var, CachePolicy-as-int)`` pairs. Only the
     // Var half is a reference; the int rides through untouched. Without this
     // arm the declaration would still name the pre-SSA Var after ConvertToSSA,
     // and the scope outliner would reject it as an uncaptured tensor.
