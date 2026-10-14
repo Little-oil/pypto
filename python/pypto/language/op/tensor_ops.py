@@ -401,10 +401,9 @@ def set_cache_policy(tensor: Tensor, policy: CachePolicy) -> None:
     ``cache_policy`` attribute on ``pto.tload`` plus the device's no-cache alias
     offset, which the assembler adds to that one load's source address; the
     offset comes from the driver through the dispatch payload, and a device that
-    reports no alias reports zero, leaving the read ordinary and correct. Other
-    architectures do not map GM twice — A5 expresses the policy on the load
-    instruction instead — and PTOAS lowers the bare attribute to an ordinary
-    load, so a declaration there is accepted and currently does nothing.
+    reports no alias reports zero, leaving the read ordinary and correct.
+    On A5 the backend selects ISA NotAllocKeep for BYPASS and maps the six
+    additional NORMAL_* / NOT_ALLOC_* policies to their corresponding ISA modes.
     ``CachePolicy.DEFAULT`` emits nothing, so a read that declares no policy
     generates exactly the code it did before.
 
@@ -412,7 +411,8 @@ def set_cache_policy(tensor: Tensor, policy: CachePolicy) -> None:
         tensor: The tensor whose reads the policy applies to. Must be a
             ``Tensor`` value bound outside the scope and read inside it.
         policy: ``CachePolicy.BYPASS`` to declare a streaming, non-cached read;
-            ``CachePolicy.DEFAULT`` for an ordinary cached read.
+            ``CachePolicy.DEFAULT`` for an ordinary cached read, or an explicit
+            NORMAL_* / NOT_ALLOC_* policy on A5.
 
     Returns:
         Nothing. The marker is consumed at parse time and produces no value.

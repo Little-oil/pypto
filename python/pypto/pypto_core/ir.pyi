@@ -392,7 +392,7 @@ class PadValue(enum.Enum):
     """Min value padding."""
 
 class LoadL2Hint(enum.IntEnum):
-    """A5 per-load L2 hint with PTO-ISA encodings."""
+    """Internal load ISA encodings used by cache-policy finalization."""
 
     NormalFirstVictim = 0
     NormalLastVictim = 1
@@ -402,7 +402,7 @@ class LoadL2Hint(enum.IntEnum):
     NotAllocDrop = 6
 
 class StoreL2Hint(enum.IntEnum):
-    """A5 per-store L2 hint with PTO-ISA encodings."""
+    """Internal store ISA encodings used by cache-policy finalization."""
 
     NormalFirstVictim = 0
     NormalLastVictim = 1
@@ -410,10 +410,10 @@ class StoreL2Hint(enum.IntEnum):
     NotAllocClean = 4
 
 class CachePolicy(enum.IntEnum):
-    """GM cache-access policy declared for a tensor read.
+    """Semantic GM cache policy, lowered according to the backend and direction.
 
     A semantic contract the author states, never a hint the compiler invents.
-    Stored as ``int`` in the ``tile.load`` ``cache`` kwarg.
+    Stored as ``int`` in transfer ``cache`` kwargs. New modes require A5.
     """
 
     DEFAULT = 0
@@ -426,6 +426,13 @@ class CachePolicy(enum.IntEnum):
     those bytes while the kernel runs — mixing a cached write and a bypassing
     read of the same bytes is a coherency bug.
     """
+
+    NORMAL_FIRST_VICTIM = 2
+    NORMAL_LAST_VICTIM = 3
+    NORMAL_PERSISTENT = 4
+    NOT_ALLOC_KEEP = 5
+    NOT_ALLOC_CLEAN = 6
+    NOT_ALLOC_DROP = 7
 
 class CompactMode(enum.Enum):
     """Partial-tile compact mode enumeration."""

@@ -500,6 +500,12 @@ void BindIR(nb::module_& m) {
       .value("BYPASS", CachePolicy::kBypass,
              "Streaming access declared to bypass the cache: asserts this tensor has no reuse "
              "worth caching and that nothing writes those bytes while the kernel runs")
+      .value("NORMAL_FIRST_VICTIM", CachePolicy::kNormalFirstVictim)
+      .value("NORMAL_LAST_VICTIM", CachePolicy::kNormalLastVictim)
+      .value("NORMAL_PERSISTENT", CachePolicy::kNormalPersistent)
+      .value("NOT_ALLOC_KEEP", CachePolicy::kNotAllocKeep)
+      .value("NOT_ALLOC_CLEAN", CachePolicy::kNotAllocClean)
+      .value("NOT_ALLOC_DROP", CachePolicy::kNotAllocDrop)
       .export_values();
 
   // TensorView - struct for tensor view information - must be before TensorType

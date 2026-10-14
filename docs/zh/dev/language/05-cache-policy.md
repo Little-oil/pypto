@@ -8,66 +8,57 @@
 显式书写，粒度二选一，并且从 DSL 一路原样传递到代码生成（codegen）。
 
 > **要求 PTOAS >= v0.64**（`toolchain/versions.env` 中的 `PTOAS_VERSION`），并且
-> **只在 a2a3 上真正生效**。`BYPASS` 声明会变成 `pto.tload` 上的一个 `cache_policy`
+> **在 A2/A3 上**，`BYPASS` 声明会变成 `pto.tload` 上的一个 `cache_policy`
 > 属性，外加一个携带该设备 uncached 别名距离的 `offset` 操作数，由汇编器加到该条
 > load 的源地址上。参见[codegen 发射什么](#codegen-发射什么)与[架构差异](#架构差异)。
 
-## A5 上显式的单次搬运 L2 hint
+## 统一的 CachePolicy 接口
 
-`pl.load(..., l2_hint=pl.LoadL2Hint.NormalLastVictim)` 和
-`pl.store(..., l2_hint=pl.StoreL2Hint.NotAllocClean)` 为这次搬运记录显式的
-PTO-ISA hint。新增参数只支持 A5；A2/A3 继续使用原有的
-`CachePolicy.DEFAULT` / `BYPASS` 接口。默认值 `l2_hint=None` 不记录 hint，
-保留原有缓存策略和作用域继承规则。显式选择的零值 hint 会被保留。
+`pl.load` 和 `pl.store` 都使用 `cache=pl.CachePolicy...`。
+原有 `DEFAULT=0`、`BYPASS=1` 的枚举值不变，增加六种 A5 策略。
+前端枚举表达语义，不等于 ISA 位编码；后端根据架构和读写方向转换。
 
-| LoadL2Hint | 编码 | StoreL2Hint | 编码 |
-| ---------- | ---- | ----------- | ---- |
-| NormalFirstVictim | 0 | NormalFirstVictim | 0 |
-| NormalLastVictim | 1 | NormalLastVictim | 1 |
-| NormalPersistent | 2 | NormalPersistent | 2 |
-| NotAllocKeep | 4 | — | — |
-| NotAllocClean | 5 | NotAllocClean | 4 |
-| NotAllocDrop | 6 | — | — |
+| CachePolicy | A5 load ISA 模式 | A5 store ISA 模式 |
+| ----------- | ---------------- | ----------------- |
+| DEFAULT | 普通 TLOAD，默认模式 0 | 普通 TSTORE，默认模式 0 |
+| BYPASS | NotAllocKeep (4) | NotAllocClean (4) |
+| NORMAL_FIRST_VICTIM | NormalFirstVictim (0) | NormalFirstVictim (0) |
+| NORMAL_LAST_VICTIM | NormalLastVictim (1) | NormalLastVictim (1) |
+| NORMAL_PERSISTENT | NormalPersistent (2) | NormalPersistent (2) |
+| NOT_ALLOC_KEEP | NotAllocKeep (4) | 拒绝：仅支持 load |
+| NOT_ALLOC_CLEAN | NotAllocClean (5) | NotAllocClean (4) |
+| NOT_ALLOC_DROP | NotAllocDrop (6) | 拒绝：仅支持 load |
 
-DSL 要求使用与搬运方向对应的枚举。PyPTO IR 在 `l2_hint` kwarg 中保存原始整数
-编码，校验允许的值，并在打印时恢复枚举。这些 hint 仅支持单次访问；
-`pl.set_cache_policy` 仍只接受 `CachePolicy`。
+FirstVictim 倾向更早替换，LastVictim 倾向更晚替换；Persistent 使用驻留缓存行，
+仍可以被其他驻留缓存行替换。非分配读取从 GM 获取数据：Keep 保持已有缓存行状态，
+Clean 保留已有缓存行但标记为干净，后续淘汰无需回写，Drop 丢弃同地址已有缓存行。
+store 仅提供 Clean 这一种非分配模式。
+
+A2/A3 的 load DEFAULT/BYPASS 保留原实现：BYPASS 将运行时 nocache offset
+传给 PTOAS，再调整对应 load 的源地址。A2/A3 的 store 只支持 DEFAULT；
+新增六种策略在 A2/A3 上报错，不会静默近似成其他模式。
 
 ```python
-# A2/A3: existing per-load nocache address alias.
+# The backend chooses the implementation of semantic BYPASS.
 streamed = pl.load(x, [0, 0], [32, 32], cache=pl.CachePolicy.BYPASS)
 
-# A5: choose the exact load/store ISA modes for these transfers.
-retained = pl.load(x, [0, 0], [32, 32], l2_hint=pl.LoadL2Hint.NormalPersistent)
-out = pl.store(retained, [0, 0], out, l2_hint=pl.StoreL2Hint.NotAllocClean)
+# Explicit A5 load and store policies use the same frontend enum.
+retained = pl.load(x, [0, 0], [32, 32], cache=pl.CachePolicy.NORMAL_PERSISTENT)
+out = pl.store(retained, [0, 0], out, cache=pl.CachePolicy.NOT_ALLOC_CLEAN)
 ```
 
-**接入方式：** 不需要修改 PTOAS。PyPTO 保留普通的 `pto.tload` /
-`pto.tstore` 操作供 PTOAS 分析同步和内存分配，并用 `emitc.verbatim` 标记
-包围每次带 hint 的搬运。在处理生成的 C++ 时，PyPTO 消费这些标记，将所选
-PTO-ISA 模板参数放在最前面，包括显式选择的零值 hint。现有 store 的 phase、
-atomic 和量化参数保持不变。
+`cache=None` 不记录策略；显式 load 策略优先于 `pl.set_cache_policy`。
+作用域接口接受同一枚举，仅控制读取，非分配策略要求张量在该作用域内只读。
+store 由 `pl.store` 的参数控制，不继承作用域声明。
 
-该路径支持当前固定的 PTOAS v0.65，以及 PyPTO 和 PTOAS 两种内存规划方式。
-带标记的搬运缺失、格式错误或无法唯一匹配时会报错；调试重编译路径使用同一
-处理逻辑。使用 `skip_ptoas=True` 时，PTO 文件会保留标记：单独运行 PTOAS
-得到的中间 C++ 仍需经过 PyPTO 的最终处理。
+**接入方式：** IR 在 `cache` kwarg 中保存语义整数。A2/A3 使用 PTOAS 原有的
+bypass 属性和显式 offset 操作数。A5 保留真实的 `pto.tload` / `pto.tstore`
+供同步及内存规划分析，通过 `emitc.verbatim` 标记在生成 C++ 后选择 ISA 重载。
+显式 NORMAL_FIRST_VICTIM 保留 ISA 零值，store 的 phase、atomic 和量化参数保持不变。
+包装入口与调试重编译使用相同处理；`skip_ptoas=True` 的 PTOAS 输出仍需此处理。
+非默认策略保留 Tile 路线，强制 Buffer lowering 会拒绝尚不支持的搬运策略。
 
-在 A5 上，显式 `l2_hint` 优先于该次搬运的作用域缓存声明。一个 load 的 `cache`
-和 `l2_hint` 不能同时为非 `None`。A2/A3 拒绝所有显式的 load 或 store `l2_hint`，
-包括零值；在该架构上使用原有 `CachePolicy` 接口。Buffer lowering 在搬运描述支持
-hint 前会拒绝显式 hint。
-
-两种代码生成机制分别如下：
-
-| 接口 | A2/A3 | A5 |
-| ---- | ----- | -- |
-| `cache=CachePolicy.DEFAULT` | 普通 load | 普通 load |
-| `cache=CachePolicy.BYPASS` 或作用域 BYPASS | 包装入口读取一次运行时 offset；PTOAS 给对应 load 的源地址加 offset，再执行普通 `TLOAD` | 保留原有行为：接受声明，但不产生效果 |
-| 显式 `l2_hint` | 拒绝 | 将所选 `TLoadL2Hint` 或 `TStoreL2Hint` 传给 ISA，由 ISA 控制 `l2CacheCtl` |
-
-A5 的 BYPASS 声明不会自动转换成 `NotAllocClean=5` 或其他 hint。A5 模式由调用方显式
-选择。本次扩展不修改 PTOAS、simpler 或 GitHub workflow。
+不需要修改 PTOAS、simpler 或 workflow。
 
 ## CachePolicy 的书写面
 
@@ -75,6 +66,7 @@ A5 的 BYPASS 声明不会自动转换成 `NotAllocClean=5` 或其他 hint。A5 
 | ------ | ---- | ---- | -------- |
 | `pl.set_cache_policy(t, policy)` | 所在作用域（scope）内对 `t` 的每一次读取 | `pl.at(...)` / `pl.spmd(...)` body 顶层的一条独立语句 | 张量编程 —— GM 读取是隐式的（`pl.matmul`、`pl.assemble`、切片），没有 load 调用可供标注 |
 | `pl.load(..., cache=policy)` | 单次读取 | load 上的一个 kwarg | Tile 编程 —— 该次访问本来就由你显式写出 |
+| `pl.store(..., cache=policy)` | 单次写入 | store 上的一个 kwarg | 显式配置 A5 store 缓存策略 |
 
 `pl.slice` / `tensor.slice` 刻意**不**提供 `cache=` kwarg：slice 计算的是地址描述符
 （address descriptor），并不搬运数据。策略属于真正发起 GM 读取的那个 op。
@@ -136,7 +128,7 @@ with pl.at(level=pl.Level.CORE_GROUP):
     rest = pl.load(b, [32, 0], [32, 32])                              # BYPASS (declared)
 ```
 
-A5 load 显式指定 `l2_hint` 时使用该 hint，不继承作用域策略。未显式指定 hint 时，
+显式 load 策略优先于作用域声明。对于其他访问，
 body 中已经存在的 load（手写的，或由更早的 pass 产生的）与编译器合成的 load 适用同一
 条规则：除非该 load 自己写了 `cache=`，否则声明对它生效。
 
@@ -239,7 +231,7 @@ with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
 
 ## codegen 发射什么
 
-一次 `BYPASS` 读取会变成发射出的那条 load 上的一个属性，外加一个操作数 —— 从张量地址
+在 A2/A3 上，一次 `BYPASS` 读取会变成发射出的那条 load 上的一个属性，外加一个操作数 —— 从张量地址
 到同一批字节的 uncached 别名之间的距离：
 
 ```mlir
@@ -303,7 +295,7 @@ PTOAS >= v0.64 会把这一对变成对源描述符**副本**的地址运算 —
 | 该属性按 **load** 发射，而不是按张量 | 它是指令的性质；若两条 load 只有第一条带 hint，第二条仍会在 L2 中分配（被取代的 `[CacheBypassUnsupported]` 诊断刻意是"每张量一次"—— 粒度正好相反） |
 | offset 参数**每个 kernel 只追加一次** | 一个运行时取值服务于全部绕过缓存的 load，入口处读一次即可 |
 | 它与 MX 的 `layout` 合并进**同一个**属性字典且排在其后，操作数则跟在字典之后 | PTOAS 要求所有存在的属性在同一个字典里；把 `layout` 留在前面可使未声明策略的 MX load 保持逐字节一致 |
-| a5 只发射属性，**不**发射 offset | 那里没有第二份映射可寻址（见[架构差异](#架构差异)），也没有可供读取距离的入口 |
+| A5 使用 ISA hint，不使用 offset | 后端选择指令的缓存控制模式 |
 
 ### 架构差异
 
@@ -313,10 +305,9 @@ PTOAS >= v0.64 会把这一对变成对源描述符**副本**的地址运算 —
 | ---- | -------------------------------- |
 | a2a3 设备 | load 对 uncached 别名发起，即 `addr + get_l2_cache_offset(args)`。这正是该特性存在的场景 |
 | 无别名的 a2a3 设备 | 驱动返回 `0`，`addr + 0` 即原地址，读取照常带缓存 —— 结果正确，只是少了一项优化。模拟器天然如此 |
-| a5 | codegen 只发射属性、不发射 offset，而 PTOAS v0.64 把裸属性降级为普通 `TLOAD`。该声明被接受，但**不产生任何效果** |
+| a5 | BYPASS 使用 ISA NotAllocKeep，不使用运行时地址偏移 |
 
-A5 通过 ISA 指令的缓存控制字段表达 L2 策略；使用上文的显式 `l2_hint` 接口选择。
-原有 `cache_policy` 属性不会转换成该字段，因此旧 BYPASS 声明在那里仍生成普通 load。
+A5 使用相同的 CachePolicy 接口，由后端转换为 ISA 缓存控制模式。
 
 ### 更旧的汇编器
 
@@ -329,7 +320,7 @@ A5 通过 ISA 指令的缓存控制字段表达 L2 策略；使用上文的显�
 - 只有 **InCore** kernel 的 load 会接收该声明：把 GM 读取变成 `tile.load` 的是
   `ConvertTensorToTileOps`，而它变换的是 InCore 函数。请把策略声明在会成为设备 kernel
   的那个作用域上（`CORE_GROUP` 的 `pl.at`，或 `pl.spmd` 内联 body）。
-- 该策略管辖的是**读**。没有对应的 store 侧机制；对被写张量声明 `BYPASS` 会被拒绝，
+- 作用域声明管辖的是**读**；A5 的 store 使用显式参数。对被写张量声明 `BYPASS` 会被拒绝，
   而不会被重新解释为别的含义。
 
 ## 实现位置索引

@@ -8,75 +8,68 @@ The policy is a *contract the author states*, never a hint the compiler infers.
 It is therefore written explicitly, at one of two granularities, and is carried
 unchanged from the DSL to codegen.
 
-> **Requires PTOAS >= v0.64** (`PTOAS_VERSION` in `toolchain/versions.env`), and
-> **has an effect on a2a3 only**. A `BYPASS` declaration becomes a
+> **Requires PTOAS >= v0.64** (`PTOAS_VERSION` in `toolchain/versions.env`).
+> **On A2/A3**, a `BYPASS` declaration becomes a
 > `cache_policy` attribute on `pto.tload` plus an `offset` operand carrying that
 > device's no-cache alias distance, which the assembler adds to that one load's
 > source address. See [What codegen emits](#what-codegen-emits) and
 > [Architectures](#architectures).
 
-## Explicit per-transfer L2 hints on A5
+## Unified CachePolicy interface
 
-`pl.load(..., l2_hint=pl.LoadL2Hint.NormalLastVictim)` and
-`pl.store(..., l2_hint=pl.StoreL2Hint.NotAllocClean)` record an explicit PTO-ISA
-hint on that transfer. The new parameter is supported on A5 only; A2/A3
-continues to use the existing `CachePolicy.DEFAULT` / `BYPASS` interface.
-The default `l2_hint=None` records no hint and preserves the existing cache
-policy and scope inheritance. An explicit zero-valued hint is preserved.
+Use `cache=pl.CachePolicy...` for both `pl.load` and `pl.store`.
+`DEFAULT=0` and `BYPASS=1` retain their public values. Six additional semantic
+policies select A5 modes. Public enum values are not ISA bit encodings:
+backend code generation selects the load or store ISA enum.
 
-| LoadL2Hint | Encoding | StoreL2Hint | Encoding |
-| ---------- | -------- | ----------- | -------- |
-| NormalFirstVictim | 0 | NormalFirstVictim | 0 |
-| NormalLastVictim | 1 | NormalLastVictim | 1 |
-| NormalPersistent | 2 | NormalPersistent | 2 |
-| NotAllocKeep | 4 | — | — |
-| NotAllocClean | 5 | NotAllocClean | 4 |
-| NotAllocDrop | 6 | — | — |
+| CachePolicy | A5 load ISA mode | A5 store ISA mode |
+| ----------- | ---------------- | ----------------- |
+| DEFAULT | Ordinary TLOAD, default mode 0 | Ordinary TSTORE, default mode 0 |
+| BYPASS | NotAllocKeep (4) | NotAllocClean (4) |
+| NORMAL_FIRST_VICTIM | NormalFirstVictim (0) | NormalFirstVictim (0) |
+| NORMAL_LAST_VICTIM | NormalLastVictim (1) | NormalLastVictim (1) |
+| NORMAL_PERSISTENT | NormalPersistent (2) | NormalPersistent (2) |
+| NOT_ALLOC_KEEP | NotAllocKeep (4) | Rejected: load-only |
+| NOT_ALLOC_CLEAN | NotAllocClean (5) | NotAllocClean (4) |
+| NOT_ALLOC_DROP | NotAllocDrop (6) | Rejected: load-only |
 
-The DSL requires the enum appropriate to the transfer direction. PyPTO IR
-stores its exact integer encoding in the `l2_hint` kwarg, validates the allowed
-values, and restores the enum when printing. These hints are per-access only;
-`pl.set_cache_policy` continues to accept only `CachePolicy`.
+FirstVictim favors earlier replacement, LastVictim favors later replacement,
+and Persistent uses resident cache lines, which other resident lines can still
+replace. The not-allocate read modes fetch from GM: Keep preserves existing
+cache-line state, Clean retains an existing line but marks it clean so eviction
+requires no writeback, and Drop discards an existing line at the same address.
+The store interface exposes only the Clean non-allocate mode.
+
+On A2/A3, load DEFAULT/BYPASS keeps the existing implementation: BYPASS carries
+the runtime nocache offset to PTOAS, which adjusts that load's source address.
+Only DEFAULT is supported for stores. The six additional policies are rejected
+on A2/A3 instead of silently approximating A5 semantics.
 
 ```python
-# A2/A3: existing per-load nocache address alias.
+# The backend chooses the implementation of semantic BYPASS.
 streamed = pl.load(x, [0, 0], [32, 32], cache=pl.CachePolicy.BYPASS)
 
-# A5: choose the exact load/store ISA modes for these transfers.
-retained = pl.load(x, [0, 0], [32, 32], l2_hint=pl.LoadL2Hint.NormalPersistent)
-out = pl.store(retained, [0, 0], out, l2_hint=pl.StoreL2Hint.NotAllocClean)
+# Explicit A5 load and store policies use the same frontend enum.
+retained = pl.load(x, [0, 0], [32, 32], cache=pl.CachePolicy.NORMAL_PERSISTENT)
+out = pl.store(retained, [0, 0], out, cache=pl.CachePolicy.NOT_ALLOC_CLEAN)
 ```
 
-**Integration:** no PTOAS changes are required. PyPTO keeps ordinary
-`pto.tload` / `pto.tstore` operations for PTOAS synchronization and memory
-planning, and surrounds each hinted transfer with `emitc.verbatim` markers.
-When finalizing the generated C++, PyPTO consumes the markers and prepends
-the selected PTO-ISA template parameter, including an explicit zero-valued
-hint. Existing store phase, atomic, and quantization arguments are preserved.
+`cache=None` omits the policy. An explicit per-load policy overrides
+`pl.set_cache_policy`; the scope interface accepts the same enum and governs
+reads only. Non-allocating scope declarations require read-only tensors.
+Stores are controlled explicitly on `pl.store`, not by scope declarations.
 
-This works with the pinned PTOAS v0.65 release and with either PyPTO or PTOAS
-memory planning. A missing, malformed, or ambiguous marked transfer is an
-error. The debug rebuild path uses the same finalization. With
-`skip_ptoas=True`, the PTO file retains these markers: running PTOAS alone
-produces intermediate C++ that still needs PyPTO's finalization.
+**Integration:** the IR carries semantic integer `cache` kwargs. A2/A3 uses
+PTOAS's existing bypass attribute and explicit offset operand. On A5, PyPTO
+keeps real `pto.tload` / `pto.tstore` operations for synchronization and memory
+planning, with `emitc.verbatim` markers selecting the ISA overload during C++
+finalization. The explicit NORMAL_FIRST_VICTIM policy retains ISA encoding zero.
+Store phase, atomic and quantization arguments remain intact. The wrapper and
+debug rebuild share finalization; PTOAS-only output from `skip_ptoas=True`
+still needs this finalization. Non-default policies stay on the Tile path;
+forced Buffer lowering rejects unsupported transfer policies.
 
-On A5, an explicit `l2_hint` overrides a scope cache declaration for that
-transfer. A load cannot specify non-`None` values for both `cache` and
-`l2_hint`. A2/A3 rejects every explicit load or store `l2_hint`, including
-zero; use the existing `CachePolicy` interface there. Buffer lowering rejects
-explicit hints until its transfer recipe supports them.
-
-The two codegen mechanisms remain separate:
-
-| Interface | A2/A3 | A5 |
-| --------- | ----- | -- |
-| `cache=CachePolicy.DEFAULT` | Ordinary load | Ordinary load |
-| `cache=CachePolicy.BYPASS` or scope BYPASS | Wrapper reads the runtime offset once; PTOAS adds it to the selected load's source address before ordinary `TLOAD` | Existing declaration remains accepted and has no effect |
-| Explicit `l2_hint` | Rejected | Selected `TLoadL2Hint` or `TStoreL2Hint` is passed to ISA, which controls `l2CacheCtl` |
-
-In particular, an A5 BYPASS declaration is not automatically converted to
-`NotAllocClean=5` or any other hint. The caller chooses the A5 mode explicitly.
-This extension does not change PTOAS, simpler, or GitHub workflows.
+No PTOAS, simpler or workflow changes are required.
 
 ## CachePolicy surfaces
 
@@ -84,6 +77,7 @@ This extension does not change PTOAS, simpler, or GitHub workflows.
 | ------- | ----------- | ---------- | -------- |
 | `pl.set_cache_policy(t, policy)` | every read of `t` in the enclosing scope | a standalone statement at the top level of a `pl.at(...)` / `pl.spmd(...)` body | Tensor programming — the GM reads are implicit (`pl.matmul`, `pl.assemble`, slicing) and there is no load call to annotate |
 | `pl.load(..., cache=policy)` | one read | a kwarg on the load | Tile programming — you already name the access |
+| `pl.store(..., cache=policy)` | one write | a kwarg on the store | Explicit A5 store cache control |
 
 `pl.slice` / `tensor.slice` deliberately take **no** `cache=` kwarg: a slice
 computes an address descriptor, it moves no data. The policy belongs to the op
@@ -148,8 +142,8 @@ with pl.at(level=pl.Level.CORE_GROUP):
     rest = pl.load(b, [32, 0], [32, 32])                              # BYPASS (declared)
 ```
 
-A5 loads with an explicit `l2_hint` use that hint instead of the scope policy.
-For loads without an explicit hint, a load already present in the body
+An explicit per-load cache policy overrides the scope policy on every backend.
+A load already present in the body
 (hand-written, or produced by an earlier pass) is stamped by the same rule as
 a load the compiler synthesises: the
 declaration applies unless that load states its own `cache=`.
@@ -263,7 +257,7 @@ with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
 
 ## What codegen emits
 
-A `BYPASS` read becomes one attribute on the emitted load and one operand — the
+On A2/A3, a `BYPASS` read becomes one attribute on the emitted load and one operand — the
 distance from the tensor's address to the uncached alias of the same bytes:
 
 ```mlir
@@ -335,7 +329,7 @@ Five properties of the emit are worth stating, because each one is asserted in
 | The attribute is emitted **per load**, not per tensor | It is a property of the instruction; a hint on only the first of two loads would leave the second one allocating in L2 (the superseded `[CacheBypassUnsupported]` diagnostic was deliberately once-per-tensor — the opposite granularity) |
 | The offset parameter is appended **once per kernel** | One runtime value serves every bypassing load, read once at entry |
 | It joins the MX `layout` in **one** attribute dict, after it, and the operand follows the dict | PTOAS takes all present attributes in a single dict; keeping `layout` first leaves an MX load that declares no policy byte-identical |
-| a5 emits the attribute and **no** offset | There is no second mapping to address (see [Architectures](#architectures)), and no accessor to read a distance from |
+| A5 uses ISA hints without an offset | The backend selects the instruction cache-control mode |
 
 ### Architectures
 
@@ -345,12 +339,9 @@ The double mapping is an a2a3 property, and so is everything built on it:
 | ------ | -------------------------------------- |
 | a2a3 device | The load is issued against the uncached alias, `addr + get_l2_cache_offset(args)`. This is the case the feature exists for |
 | a2a3 device with no alias | The driver reports `0`, `addr + 0` is the ordinary address, and the read is cached — correct, one optimisation short. The simulator is this case by construction |
-| a5 | Codegen emits the attribute and no offset, and PTOAS v0.64 lowers a bare attribute to an ordinary `TLOAD`. The declaration is accepted and **does nothing** |
+| a5 | BYPASS selects ISA NotAllocKeep, without a runtime address offset |
 
-A5 expresses L2 control through the ISA instruction's cache-control field.
-Use the explicit `l2_hint` interface above to select it. The existing
-`cache_policy` attribute is not converted into that field, so the old BYPASS
-declaration still generates an ordinary load there.
+A5 uses the same CachePolicy interface and lowers it to ISA cache-control modes.
 
 ### Older assemblers
 
@@ -366,7 +357,7 @@ an error that names both versions.
   `ConvertTensorToTileOps` is what turns GM reads into `tile.load`, and it
   transforms InCore functions. Declare the policy on the scope that becomes the
   device kernel (a `CORE_GROUP` `pl.at`, or a `pl.spmd` inline body).
-- The policy governs **reads**. There is no store-side counterpart; `BYPASS` on
+- Scope declarations govern **reads**; per-store policies are supported on A5. `BYPASS` on
   a written tensor is rejected rather than reinterpreted.
 
 ## Implementation map

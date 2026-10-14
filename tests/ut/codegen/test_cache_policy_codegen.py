@@ -63,6 +63,28 @@ M, K, N = 256, 128, 256
 ROWS, COLS = 32, 128
 
 
+_LOAD_HINTS = {
+    pl.CachePolicy.DEFAULT: None,
+    pl.CachePolicy.BYPASS: "NotAllocKeep",
+    pl.CachePolicy.NORMAL_FIRST_VICTIM: "NormalFirstVictim",
+    pl.CachePolicy.NORMAL_LAST_VICTIM: "NormalLastVictim",
+    pl.CachePolicy.NORMAL_PERSISTENT: "NormalPersistent",
+    pl.CachePolicy.NOT_ALLOC_KEEP: "NotAllocKeep",
+    pl.CachePolicy.NOT_ALLOC_CLEAN: "NotAllocClean",
+    pl.CachePolicy.NOT_ALLOC_DROP: "NotAllocDrop",
+}
+_STORE_HINTS = {
+    pl.CachePolicy.DEFAULT: None,
+    pl.CachePolicy.BYPASS: "NotAllocClean",
+    pl.CachePolicy.NORMAL_FIRST_VICTIM: "NormalFirstVictim",
+    pl.CachePolicy.NORMAL_LAST_VICTIM: "NormalLastVictim",
+    pl.CachePolicy.NORMAL_PERSISTENT: "NormalPersistent",
+    pl.CachePolicy.NOT_ALLOC_CLEAN: "NotAllocClean",
+}
+_LOAD_POLICIES = list(_LOAD_HINTS)
+_STORE_POLICIES = list(_STORE_HINTS)
+
+
 @pytest.fixture(autouse=True)
 def _setup_backend_and_log_level():
     """Pin the backend and make WARN-level output visible for every test here.
@@ -337,21 +359,14 @@ def test_one_parameter_serves_every_declared_load():
     assert _signature_line(mlir).count(f"{OFFSET_PARAM}: i64") == 1, _signature_line(mlir)
 
 
-def test_a5_declares_the_policy_without_an_address_offset():
-    """A5 does not map GM twice, so there is no alias for an offset to reach.
-
-    Its runtime exposes no ``get_l2_cache_offset`` either, so emitting the
-    parameter would produce a kernel wrapper that cannot compile. PTOAS v0.64
-    lowers the bare attribute to an ordinary load, so the declaration is
-    accepted there and does nothing — which is a property of the target, not a
-    missing operand.
-    """
+def test_a5_bypass_uses_isa_without_an_address_offset():
+    """The same semantic BYPASS uses ISA NotAllocKeep on A5, not an address alias."""
     backend.reset_for_testing()
     backend.set_backend_type(BackendType.Ascend950)
     mlir = _incore_mlir(TwoBypassingLoadsOfOneTensor)
-
-    assert _hinted_tloads(mlir), f"a5 must still carry the declaration:\n{mlir}"
-    assert OFFSET_PARAM not in mlir, f"a5 must take no address offset:\n{mlir}"
+    assert "__pypto_l2_hint_begin load NotAllocKeep" in mlir
+    assert BYPASS_ATTR not in mlir
+    assert OFFSET_PARAM not in mlir
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +413,7 @@ def test_no_cache_bypass_warning_is_emitted(program_cls, capfd):
     assert _warnings(capfd) == []
 
 
-@pytest.mark.parametrize("load_hint", list(pl.LoadL2Hint))
+@pytest.mark.parametrize("load_hint", _LOAD_POLICIES)
 def test_explicit_load_hint_is_not_silently_dropped(load_hint):
     @pl.program
     class HintedLoad:
@@ -406,17 +421,20 @@ def test_explicit_load_hint_is_not_silently_dropped(load_hint):
         def kernel(
             self, x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]
         ) -> pl.Tensor[[32, 32], pl.FP32]:
-            t = pl.load(x, [0, 0], [32, 32], l2_hint=load_hint)
+            t = pl.load(x, [0, 0], [32, 32], cache=load_hint)
             out = pl.store(t, [0, 0], out)
             return out
 
     backend.reset_for_testing()
     backend.set_backend_type(BackendType.Ascend950)
     mlir = _incore_mlir(HintedLoad)
-    assert f"__pypto_l2_hint_begin load {load_hint.name}" in mlir
+    if _LOAD_HINTS[load_hint] is None:
+        assert "__pypto_l2_hint_begin load" not in mlir
+    else:
+        assert f"__pypto_l2_hint_begin load {_LOAD_HINTS[load_hint]}" in mlir
 
 
-@pytest.mark.parametrize("store_hint", list(pl.StoreL2Hint))
+@pytest.mark.parametrize("store_hint", _STORE_POLICIES)
 def test_explicit_store_hint_is_not_silently_dropped(store_hint):
     @pl.program
     class HintedStore:
@@ -425,13 +443,16 @@ def test_explicit_store_hint_is_not_silently_dropped(store_hint):
             self, x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]
         ) -> pl.Tensor[[32, 32], pl.FP32]:
             t = pl.load(x, [0, 0], [32, 32])
-            out = pl.store(t, [0, 0], out, l2_hint=store_hint)
+            out = pl.store(t, [0, 0], out, cache=store_hint)
             return out
 
     backend.reset_for_testing()
     backend.set_backend_type(BackendType.Ascend950)
     mlir = _incore_mlir(HintedStore)
-    assert f"__pypto_l2_hint_begin store {store_hint.name}" in mlir
+    if _STORE_HINTS[store_hint] is None:
+        assert "__pypto_l2_hint_begin store" not in mlir
+    else:
+        assert f"__pypto_l2_hint_begin store {_STORE_HINTS[store_hint]}" in mlir
 
 
 def test_explicit_hint_overrides_scope_cache_declaration():
@@ -442,7 +463,7 @@ def test_explicit_hint_overrides_scope_cache_declaration():
             self, x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]
         ) -> pl.Tensor[[32, 32], pl.FP32]:
             pl.func_attr({"cache_policy": [(0, 1)]})
-            t = pl.load(x, [0, 0], [32, 32], l2_hint=pl.LoadL2Hint.NormalFirstVictim)
+            t = pl.load(x, [0, 0], [32, 32], cache=pl.CachePolicy.NORMAL_FIRST_VICTIM)
             return pl.store(t, [0, 0], out)
 
     backend.reset_for_testing()
@@ -453,7 +474,64 @@ def test_explicit_hint_overrides_scope_cache_declaration():
     assert OFFSET_PARAM not in mlir
 
 
-@pytest.mark.parametrize("hint", list(pl.LoadL2Hint))
+@pytest.mark.parametrize("policy", _LOAD_POLICIES)
+def test_extended_scope_cache_policy_roundtrips_and_reaches_a5(policy):
+    program = pl.parse_program(f"""
+@pl.program
+class ScopedPolicy:
+    @pl.function
+    def main(self, x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]
+             ) -> pl.Tensor[[32, 32], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="scoped"):
+            pl.set_cache_policy(x, pl.CachePolicy.{policy.name})
+            value = pl.load(x, [0, 0], [32, 32])
+            out = pl.store(value, [0, 0], out)
+        return out
+""")
+    restored = ir.deserialize(ir.serialize(program))
+    assert ir.python_print(restored) == ir.python_print(program)
+    assert f"pl.set_cache_policy(x, pl.CachePolicy.{policy.name})" in ir.python_print(restored)
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend950)
+    mlir = _incore_mlir(restored)
+    expected = _LOAD_HINTS[policy]
+    if expected is None:
+        assert "__pypto_l2_hint_begin load" not in mlir
+    else:
+        assert f"__pypto_l2_hint_begin load {expected}" in mlir
+    assert OFFSET_PARAM not in mlir
+    assert BYPASS_ATTR not in mlir
+
+
+@pytest.mark.parametrize("policy", _LOAD_POLICIES)
+def test_scope_nonallocating_policies_reject_written_tensors(policy):
+    program = pl.parse_program(f"""
+@pl.program
+class ReadWritePolicy:
+    @pl.function
+    def main(self, x: pl.Tensor[[32, 32], pl.FP32]) -> pl.Tensor[[32, 32], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="read_write"):
+            pl.set_cache_policy(x, pl.CachePolicy.{policy.name})
+            value = pl.load(x, [0, 0], [32, 32])
+            x = pl.store(value, [0, 0], x)
+        return x
+""")
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend950)
+    nonallocating = (
+        pl.CachePolicy.BYPASS,
+        pl.CachePolicy.NOT_ALLOC_KEEP,
+        pl.CachePolicy.NOT_ALLOC_CLEAN,
+        pl.CachePolicy.NOT_ALLOC_DROP,
+    )
+    if policy in nonallocating:
+        with pytest.raises(ValueError, match="is not allowed on a tensor this scope writes"):
+            _incore_mlir(program)
+    else:
+        assert "pto.tload" in _incore_mlir(program)
+
+
+@pytest.mark.parametrize("hint", _LOAD_POLICIES[2:])
 def test_a2a3_rejects_all_explicit_load_hints(hint):
     @pl.program
     class HintedLoad:
@@ -461,15 +539,15 @@ def test_a2a3_rejects_all_explicit_load_hints(hint):
         def kernel(
             self, x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]
         ) -> pl.Tensor[[32, 32], pl.FP32]:
-            t = pl.load(x, [0, 0], [32, 32], l2_hint=hint)
+            t = pl.load(x, [0, 0], [32, 32], cache=hint)
             return pl.store(t, [0, 0], out)
 
-    message = "load l2_hint is only supported on A5; use cache=CachePolicy.BYPASS"
+    message = "is only supported on A5"
     with pytest.raises(ValueError, match=message):
         _incore_mlir(HintedLoad)
 
 
-@pytest.mark.parametrize("hint", list(pl.StoreL2Hint))
+@pytest.mark.parametrize("hint", _STORE_POLICIES[1:])
 def test_a2a3_rejects_all_explicit_store_hints(hint):
     @pl.program
     class HintedStore:
@@ -478,15 +556,15 @@ def test_a2a3_rejects_all_explicit_store_hints(hint):
             self, x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]
         ) -> pl.Tensor[[32, 32], pl.FP32]:
             t = pl.load(x, [0, 0], [32, 32])
-            return pl.store(t, [0, 0], out, l2_hint=hint)
+            return pl.store(t, [0, 0], out, cache=hint)
 
-    with pytest.raises(ValueError, match="store l2_hint is only supported on A5"):
+    with pytest.raises(ValueError, match="is only supported on A5"):
         _incore_mlir(HintedStore)
 
 
 @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])
-@pytest.mark.parametrize("load_hint", list(pl.LoadL2Hint))
-@pytest.mark.parametrize("store_hint", list(pl.StoreL2Hint))
+@pytest.mark.parametrize("load_hint", _LOAD_POLICIES)
+@pytest.mark.parametrize("store_hint", _STORE_POLICIES)
 def test_l2_hints_reach_isa_with_stock_ptoas(tmp_path, planner, load_hint, store_hint):
     if find_ptoas_binary() is None:
         pytest.skip("PTOAS is not available")
@@ -497,8 +575,8 @@ def test_l2_hints_reach_isa_with_stock_ptoas(tmp_path, planner, load_hint, store
         def kernel(
             self, x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]
         ) -> pl.Tensor[[32, 32], pl.FP32]:
-            t = pl.load(x, [0, 0], [32, 32], l2_hint=load_hint)
-            return pl.store(t, [0, 0], out, l2_hint=store_hint)
+            t = pl.load(x, [0, 0], [32, 32], cache=load_hint)
+            return pl.store(t, [0, 0], out, cache=store_hint)
 
     backend.reset_for_testing()
     backend.set_backend_type(BackendType.Ascend950)
@@ -506,8 +584,14 @@ def test_l2_hints_reach_isa_with_stock_ptoas(tmp_path, planner, load_hint, store
         optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(HintedTransfers)
     mlir = codegen.PTOCodegen().generate(optimized, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS)
     cpp = pto_backend._compile_pto_module(mlir, "hinted_transfers", str(tmp_path), planner)
-    assert f"TLOAD<pto::TLoadL2Hint::{load_hint.name}>" in cpp
-    assert f"TSTORE<pto::TStoreL2Hint::{store_hint.name}>" in cpp
+    if _LOAD_HINTS[load_hint] is None:
+        assert "TLOAD(" in cpp
+    else:
+        assert f"TLOAD<pto::TLoadL2Hint::{_LOAD_HINTS[load_hint]}>" in cpp
+    if _STORE_HINTS[store_hint] is None:
+        assert "TSTORE(" in cpp
+    else:
+        assert f"TSTORE<pto::TStoreL2Hint::{_STORE_HINTS[store_hint]}>" in cpp
     assert "get_l2_cache_offset" not in cpp
     assert OFFSET_PARAM not in mlir
     assert BYPASS_ATTR not in mlir
@@ -516,7 +600,7 @@ def test_l2_hints_reach_isa_with_stock_ptoas(tmp_path, planner, load_hint, store
 
 
 @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])
-@pytest.mark.parametrize("load_hint", [pl.LoadL2Hint.NormalFirstVictim, pl.LoadL2Hint.NormalLastVictim])
+@pytest.mark.parametrize("load_hint", [pl.CachePolicy.NORMAL_FIRST_VICTIM, pl.CachePolicy.NORMAL_LAST_VICTIM])
 def test_l2_hints_stay_with_transfers_in_control_flow(tmp_path, planner, load_hint):
     if find_ptoas_binary() is None:
         pytest.skip("PTOAS is not available")
@@ -533,10 +617,10 @@ def test_l2_hints_stay_with_transfers_in_control_flow(tmp_path, planner, load_hi
             for i, (out_iter,) in pl.range(2, init_values=(out,)):
                 offset = i * 32
                 if flag == 0:
-                    tile = pl.load(x, [offset, 0], [32, 32], l2_hint=load_hint)
+                    tile = pl.load(x, [offset, 0], [32, 32], cache=load_hint)
                 else:
                     tile = pl.load(x, [offset, 0], [32, 32])
-                updated = pl.store(tile, [offset, 0], out_iter, l2_hint=pl.StoreL2Hint.NotAllocClean)
+                updated = pl.store(tile, [offset, 0], out_iter, cache=pl.CachePolicy.NOT_ALLOC_CLEAN)
                 result = pl.yield_(updated)
             return result
 
@@ -546,7 +630,7 @@ def test_l2_hints_stay_with_transfers_in_control_flow(tmp_path, planner, load_hi
         optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(HintedControlFlow)
     mlir = codegen.PTOCodegen().generate(optimized, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS)
     cpp = pto_backend._compile_pto_module(mlir, "hinted_control_flow", str(tmp_path), planner)
-    assert cpp.count(f"TLOAD<pto::TLoadL2Hint::{load_hint.name}>") == 1
+    assert cpp.count(f"TLOAD<pto::TLoadL2Hint::{_LOAD_HINTS[load_hint]}>") == 1
     assert cpp.count("TLOAD(") == 1
     assert cpp.count("TSTORE<pto::TStoreL2Hint::NotAllocClean>") == 1
     assert "__pypto_l2_hint" not in cpp
@@ -580,7 +664,7 @@ def test_store_l2_hint_preserves_epilogue_with_stock_ptoas(tmp_path, planner, wi
                 atomic=pl.AtomicType.Add,
                 pre_quant=1.0 / 1024,
                 pre_relu=with_relu,
-                l2_hint=pl.StoreL2Hint.NormalPersistent,
+                cache=pl.CachePolicy.NORMAL_PERSISTENT,
             )
 
     backend.reset_for_testing()
@@ -619,7 +703,7 @@ def test_store_l2_hint_preserves_phase_in_pto_ir(planner):
             rhs = pl.load(y, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
             acc = pl.tile.gemv(lhs, rhs, acc_phase=pl.AccPhase.Final)
             return pl.store(
-                acc, [0, 0], out, st_phase=pl.STPhase.Final, l2_hint=pl.StoreL2Hint.NormalPersistent
+                acc, [0, 0], out, st_phase=pl.STPhase.Final, cache=pl.CachePolicy.NORMAL_PERSISTENT
             )
 
     backend.reset_for_testing()

@@ -18,6 +18,7 @@ import pytest
 from pypto import DataType, ir
 from pypto.ir.op import tile
 from pypto.language.parser.diagnostics import InvalidOperationError
+from pypto.pypto_core.ir import LoadL2Hint, StoreL2Hint
 
 _OP_TILE_EXTRACT = ir.get_op("tile.extract").name
 _OP_TILE_FILLPAD_EXPAND = ir.get_op("tile.fillpad_expand").name
@@ -9226,104 +9227,78 @@ class TestB03TriAndGatherOps:
             )
 
 
-@pytest.mark.parametrize("hint", [-1, 3, 7, 255, 256])
-def test_load_rejects_invalid_l2_hint(hint):
+@pytest.mark.parametrize("policy", [-1, 8, 255, 256])
+def test_load_rejects_invalid_cache_policy(policy):
     src = ir.Var("src", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown())
-    with pytest.raises(ValueError, match="l2_hint must encode LoadL2Hint"):
-        tile.load(src, [0, 0], [32, 32], l2_hint=hint)
+    with pytest.raises(ValueError, match="invalid CachePolicy value"):
+        tile.load(src, [0, 0], [32, 32], cache=policy)
 
 
-@pytest.mark.parametrize("hint", [-1, 3, 5, 6, 255, 256])
-def test_store_rejects_invalid_l2_hint(hint):
+@pytest.mark.parametrize("policy", [-1, 8, 255, 256])
+def test_store_rejects_invalid_cache_policy(policy):
     src = _partial_tile([32, 32], [32, 32])
     dst = ir.Var("dst", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown())
-    with pytest.raises(ValueError, match="l2_hint must encode StoreL2Hint"):
-        tile.store(src, [0, 0], dst, l2_hint=hint)
+    with pytest.raises(ValueError, match="invalid CachePolicy value"):
+        tile.store(src, [0, 0], dst, cache=policy)
 
 
-def test_load_rejects_store_l2_hint_enum():
-    src = pl.Tensor(expr=ir.Var("src", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown()))
-    with pytest.raises(TypeError, match="load l2_hint must be LoadL2Hint"):
-        pl.load(src, [0, 0], [32, 32], l2_hint=cast(Any, pl.StoreL2Hint.NotAllocClean))
-
-
-def test_store_rejects_load_l2_hint_enum():
+@pytest.mark.parametrize("policy", [pl.CachePolicy.NOT_ALLOC_KEEP, pl.CachePolicy.NOT_ALLOC_DROP])
+def test_store_rejects_load_only_cache_policy(policy):
     src = pl.Tile(expr=_partial_tile([32, 32], [32, 32]))
     dst = pl.Tensor(expr=ir.Var("dst", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown()))
-    with pytest.raises(TypeError, match="store l2_hint must be StoreL2Hint"):
-        pl.store(src, [0, 0], dst, l2_hint=cast(Any, pl.LoadL2Hint.NotAllocKeep))
+    with pytest.raises(ValueError, match="load-only CachePolicy"):
+        pl.store(src, [0, 0], dst, cache=policy)
 
 
-@pytest.mark.parametrize("cache", [ir.CachePolicy.DEFAULT, ir.CachePolicy.BYPASS])
-def test_load_rejects_cache_and_l2_hint_together(cache):
-    src = ir.Var("src", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown())
-    with pytest.raises(ValueError, match="cannot specify both cache and l2_hint"):
-        tile.load(src, [0, 0], [32, 32], cache=int(cache), l2_hint=0)
-
-
-@pytest.mark.parametrize("cache", [pl.CachePolicy.DEFAULT, pl.CachePolicy.BYPASS])
-def test_dsl_load_rejects_cache_and_l2_hint_together(cache):
+@pytest.mark.parametrize("policy", list(pl.CachePolicy))
+def test_dsl_load_preserves_semantic_cache_policy(policy):
     src = pl.Tensor(expr=ir.Var("src", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown()))
-    with pytest.raises(ValueError, match="tile.load cannot specify both cache and l2_hint"):
-        pl.load(src, [0, 0], [32, 32], cache=cache, l2_hint=pl.LoadL2Hint.NormalFirstVictim)
-
-
-@pytest.mark.parametrize("hint", [*pl.LoadL2Hint, *pl.StoreL2Hint])
-def test_dsl_load_rejects_l2_hint_enum_as_cache_policy(hint):
-    """Overlapping numeric encodings must not turn a hardware hint into BYPASS."""
-    src = pl.Tensor(expr=ir.Var("src", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown()))
-    with pytest.raises(TypeError, match="load cache must be CachePolicy, not an L2 hint"):
-        pl.load(src, [0, 0], [32, 32], cache=cast(Any, hint))
+    call = pl.load(src, [0, 0], [32, 32], cache=policy).unwrap()
+    assert isinstance(call, ir.Call)
+    assert dict(call.kwargs)["cache"] == int(policy)
+    assert "l2_hint" not in dict(call.kwargs)
 
 
 @pytest.mark.parametrize(
-    "hint,encoding",
-    [
-        (pl.LoadL2Hint.NormalFirstVictim, 0),
-        (pl.LoadL2Hint.NormalLastVictim, 1),
-        (pl.LoadL2Hint.NormalPersistent, 2),
-        (pl.LoadL2Hint.NotAllocKeep, 4),
-        (pl.LoadL2Hint.NotAllocClean, 5),
-        (pl.LoadL2Hint.NotAllocDrop, 6),
-    ],
+    "policy",
+    [p for p in pl.CachePolicy if p not in (pl.CachePolicy.NOT_ALLOC_KEEP, pl.CachePolicy.NOT_ALLOC_DROP)],
 )
-def test_dsl_load_preserves_isa_hint_encoding(hint, encoding):
-    src = pl.Tensor(expr=ir.Var("src", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown()))
-    call = pl.load(src, [0, 0], [32, 32], l2_hint=hint).unwrap()
-    assert isinstance(call, ir.Call)
-    assert int(hint) == encoding
-    assert dict(call.kwargs)["l2_hint"] == encoding
-    assert "cache" not in dict(call.kwargs)
-
-
-@pytest.mark.parametrize(
-    "hint,encoding",
-    [
-        (pl.StoreL2Hint.NormalFirstVictim, 0),
-        (pl.StoreL2Hint.NormalLastVictim, 1),
-        (pl.StoreL2Hint.NormalPersistent, 2),
-        (pl.StoreL2Hint.NotAllocClean, 4),
-    ],
-)
-def test_dsl_store_preserves_isa_hint_encoding(hint, encoding):
+def test_dsl_store_preserves_semantic_cache_policy(policy):
     src = pl.Tile(expr=_partial_tile([32, 32], [32, 32]))
     dst = pl.Tensor(expr=ir.Var("dst", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown()))
-    call = pl.store(src, [0, 0], dst, l2_hint=hint).unwrap()
+    call = pl.store(src, [0, 0], dst, cache=policy).unwrap()
     assert isinstance(call, ir.Call)
-    assert int(hint) == encoding
-    assert dict(call.kwargs)["l2_hint"] == encoding
+    assert dict(call.kwargs)["cache"] == int(policy)
+    assert "l2_hint" not in dict(call.kwargs)
 
 
-def test_omitted_l2_hint_stays_absent():
+def test_dsl_cache_rejects_raw_isa_enums():
     src = pl.Tensor(expr=ir.Var("src", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown()))
-    dst = pl.Tensor(expr=ir.Var("dst", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown()))
+    value = pl.load(src, [0, 0], [32, 32])
+    for hint in (LoadL2Hint.NotAllocClean, StoreL2Hint.NotAllocClean):
+        with pytest.raises(TypeError, match="cache must be CachePolicy"):
+            pl.load(src, [0, 0], [32, 32], cache=cast(Any, hint))
+        with pytest.raises(TypeError, match="cache must be CachePolicy"):
+            pl.store(value, [0, 0], src, cache=cast(Any, hint))
+
+
+def test_cache_policy_keeps_legacy_values_and_single_frontend_enum():
+    assert int(pl.CachePolicy.DEFAULT) == 0
+    assert int(pl.CachePolicy.BYPASS) == 1
+    assert len(list(pl.CachePolicy)) == 8
+    assert not hasattr(pl, "LoadL2Hint")
+    assert not hasattr(pl, "StoreL2Hint")
+
+
+def test_omitted_cache_policy_stays_absent():
+    src = pl.Tensor(expr=ir.Var("src", ir.TensorType([32, 32], DataType.FP32), ir.Span.unknown()))
     value = pl.load(src, [0, 0], [32, 32])
     load_call = value.unwrap()
-    store_call = pl.store(value, [0, 0], dst).unwrap()
+    store_call = pl.store(value, [0, 0], src).unwrap()
     assert isinstance(load_call, ir.Call)
     assert isinstance(store_call, ir.Call)
-    assert "l2_hint" not in dict(load_call.kwargs)
-    assert "l2_hint" not in dict(store_call.kwargs)
+    assert "cache" not in dict(load_call.kwargs)
+    assert "cache" not in dict(store_call.kwargs)
 
 
 if __name__ == "__main__":

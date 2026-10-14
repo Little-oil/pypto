@@ -61,6 +61,14 @@ SLOTNUM_LOCAL_SLOT_NUM = 4
 SLOTNUM_BUFFER_SIZE = SLOTNUM_SLOT_SIZE * SLOTNUM_LOCAL_SLOT_NUM
 
 
+_LOAD_POLICIES = list(pl.CachePolicy)
+_STORE_POLICIES = [
+    policy
+    for policy in pl.CachePolicy
+    if policy not in (pl.CachePolicy.NOT_ALLOC_KEEP, pl.CachePolicy.NOT_ALLOC_DROP)
+]
+
+
 @pl.program
 class V2CUDProgram:
     """V2C updown-split cross-core program.
@@ -920,9 +928,9 @@ def _l2_hint_case(load_hint, store_hint, planner):
         out: pl.Out[pl.Tensor[[64, 32], pl.FP32]],
     ) -> pl.Tensor[[64, 32], pl.FP32]:
         for i, (out_iter,) in pl.range(2, init_values=(out,)):
-            a = pl.load(x, [i * 32, 0], [32, 32], l2_hint=load_hint)
+            a = pl.load(x, [i * 32, 0], [32, 32], cache=load_hint)
             b = pl.load(y, [i * 32, 0], [32, 32])
-            updated = pl.store(pl.add(a, b), [i * 32, 0], out_iter, l2_hint=store_hint)
+            updated = pl.store(pl.add(a, b), [i * 32, 0], out_iter, cache=store_hint)
             out = pl.yield_(updated)
         return out
 
@@ -953,8 +961,8 @@ def _l2_hint_case(load_hint, store_hint, planner):
 @st.cases(
     *[
         _l2_hint_case(load_hint, store_hint, planner)
-        for load_hint in pl.LoadL2Hint
-        for store_hint in pl.StoreL2Hint
+        for load_hint in _LOAD_POLICIES
+        for store_hint in _STORE_POLICIES
         for planner in (MemoryPlanner.PYPTO, MemoryPlanner.PTOAS)
     ]
 )

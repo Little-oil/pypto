@@ -79,6 +79,46 @@ static std::string MakeStoreFPCodegenPTO(const std::string& pto_op_name, const C
   return "";
 }
 
+// CachePolicy is semantic: preserve its public encodings and translate only
+// here, where both the architecture and transfer direction are known.
+static std::optional<std::string> GetIsaCacheHint(const CallPtr& op, codegen::PTOCodegen& codegen,
+                                                  bool store) {
+  const auto policy = static_cast<ir::CachePolicy>(op->GetKwarg<int>("cache", 0));
+  if (policy == ir::CachePolicy::kDefault) return std::nullopt;
+  if (codegen.GetBackendHandler()->GetPtoTargetArch() != "a5") {
+    CHECK_SPAN(!store && policy == ir::CachePolicy::kBypass, op->span_)
+        << (store ? "store" : "load") << " cache policy " << ir::CachePolicyToString(policy)
+        << " is only supported on A5; A2/A3 supports load DEFAULT/BYPASS and store DEFAULT";
+    return std::nullopt;
+  }
+  switch (policy) {
+    case ir::CachePolicy::kNormalFirstVictim:
+      return store ? ir::StoreL2HintToString(ir::StoreL2Hint::NormalFirstVictim)
+                   : ir::LoadL2HintToString(ir::LoadL2Hint::NormalFirstVictim);
+    case ir::CachePolicy::kNormalLastVictim:
+      return store ? ir::StoreL2HintToString(ir::StoreL2Hint::NormalLastVictim)
+                   : ir::LoadL2HintToString(ir::LoadL2Hint::NormalLastVictim);
+    case ir::CachePolicy::kNormalPersistent:
+      return store ? ir::StoreL2HintToString(ir::StoreL2Hint::NormalPersistent)
+                   : ir::LoadL2HintToString(ir::LoadL2Hint::NormalPersistent);
+    case ir::CachePolicy::kBypass:
+      return store ? ir::StoreL2HintToString(ir::StoreL2Hint::NotAllocClean)
+                   : ir::LoadL2HintToString(ir::LoadL2Hint::NotAllocKeep);
+    case ir::CachePolicy::kNotAllocKeep:
+      CHECK_SPAN(!store, op->span_) << "store does not support CachePolicy.NOT_ALLOC_KEEP";
+      return ir::LoadL2HintToString(ir::LoadL2Hint::NotAllocKeep);
+    case ir::CachePolicy::kNotAllocClean:
+      return store ? ir::StoreL2HintToString(ir::StoreL2Hint::NotAllocClean)
+                   : ir::LoadL2HintToString(ir::LoadL2Hint::NotAllocClean);
+    case ir::CachePolicy::kNotAllocDrop:
+      CHECK_SPAN(!store, op->span_) << "store does not support CachePolicy.NOT_ALLOC_DROP";
+      return ir::LoadL2HintToString(ir::LoadL2Hint::NotAllocDrop);
+    case ir::CachePolicy::kDefault:
+      break;
+  }
+  INTERNAL_UNREACHABLE_SPAN(op->span_) << "Internal error: invalid cache policy";
+}
+
 // tile.load: emit pto.subview + pto.tload
 static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
@@ -119,6 +159,7 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   // attribute alone declares the policy but moves no address. Both are attached
   // below, alongside the MX layout attribute when it applies.
   const auto policy = static_cast<ir::CachePolicy>(op->GetKwarg<int>("cache", 0));
+  const auto isa_hint = GetIsaCacheHint(op, codegen, false);
 
   std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
   std::string tile_buf = codegen.GetCurrentResultTarget();
@@ -174,20 +215,16 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   tload_line << tile_buf << " : " << tile_buf_type << ")";
 
   std::vector<std::string> attrs;
-  if (op->HasKwarg("l2_hint")) {
-    const int hint = op->GetKwarg<int>("l2_hint", 0);
-    CHECK_SPAN(codegen.GetBackendHandler()->GetPtoTargetArch() == "a5", op->span_)
-        << "load l2_hint is only supported on A5; use cache=CachePolicy.BYPASS on A2/A3";
+  if (isa_hint) {
     // Stock PTOAS preserves these comments. PyPTO finalization uses them to
     // select this transfer's ISA overload; PTOAS still sees the real load's
     // memory effects and pipe for planning and synchronization.
-    codegen.Emit("emitc.verbatim \"// __pypto_l2_hint_begin load " +
-                 ir::LoadL2HintToString(static_cast<ir::LoadL2Hint>(hint)) + "\"");
+    codegen.Emit("emitc.verbatim \"// __pypto_l2_hint_begin load " + *isa_hint + "\"");
   }
   if (is_mx_load) {
     attrs.push_back("layout = #pto.layout<" + pto_layout + ">");
   }
-  if (policy == ir::CachePolicy::kBypass) {
+  if (policy == ir::CachePolicy::kBypass && !isa_hint) {
     attrs.emplace_back("cache_policy = #pto.load_cache_policy<l2_bypass>");
   }
 
@@ -203,19 +240,17 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
     tload_line << "}";
   }
 
-  // The offset operand follows the attribute dict, and PTOAS applies it only to
-  // a load that also declared l2_bypass. It is empty on an architecture with no
-  // address alias to reach, which leaves the declaration carried by the
-  // attribute alone -- and PTOAS v0.64 lowers a bare attribute to an ordinary
-  // TLOAD, so that declaration costs nothing and does nothing.
-  if (policy == ir::CachePolicy::kBypass) {
+  // A2/A3 BYPASS uses an explicit byte offset after the attribute dict. PTOAS
+  // adds it to the source address of this l2_bypass load. A5 uses the ISA hint
+  // above and does not enter this address-offset path.
+  if (policy == ir::CachePolicy::kBypass && !isa_hint) {
     const std::string l2_cache_offset = codegen.GetL2CacheOffsetArgSSA();
     if (!l2_cache_offset.empty()) {
       tload_line << " offset = " << l2_cache_offset << " : i64";
     }
   }
   codegen.Emit(tload_line.str());
-  if (op->HasKwarg("l2_hint")) {
+  if (isa_hint) {
     codegen.Emit("emitc.verbatim \"// __pypto_l2_hint_end\"");
   }
 
@@ -392,15 +427,12 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
     }
     tstore_line << "}";
   }
-  if (op->HasKwarg("l2_hint")) {
-    CHECK_SPAN(codegen.GetBackendHandler()->GetPtoTargetArch() == "a5", op->span_)
-        << "store l2_hint is only supported on A5";
-    codegen.Emit("emitc.verbatim \"// __pypto_l2_hint_begin store " +
-                 ir::StoreL2HintToString(static_cast<ir::StoreL2Hint>(op->GetKwarg<int>("l2_hint", 0))) +
-                 "\"");
+  const auto isa_hint = GetIsaCacheHint(op, codegen, true);
+  if (isa_hint) {
+    codegen.Emit("emitc.verbatim \"// __pypto_l2_hint_begin store " + *isa_hint + "\"");
   }
   codegen.Emit(tstore_line.str());
-  if (op->HasKwarg("l2_hint")) {
+  if (isa_hint) {
     codegen.Emit("emitc.verbatim \"// __pypto_l2_hint_end\"");
   }
 

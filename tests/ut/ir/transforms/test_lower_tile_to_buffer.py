@@ -598,26 +598,26 @@ class TypedTransfers:
 @pytest.mark.parametrize(
     "load_hint,store_hint",
     [
-        (pl.LoadL2Hint.NormalFirstVictim, None),
-        (pl.LoadL2Hint.NormalPersistent, None),
-        (None, pl.StoreL2Hint.NormalFirstVictim),
-        (None, pl.StoreL2Hint.NormalPersistent),
+        (pl.CachePolicy.NORMAL_FIRST_VICTIM, None),
+        (pl.CachePolicy.NORMAL_PERSISTENT, None),
+        (None, pl.CachePolicy.NORMAL_FIRST_VICTIM),
+        (None, pl.CachePolicy.NORMAL_PERSISTENT),
     ],
 )
 @pytest.mark.parametrize("force_buffer", [False, True])
-def test_buffer_selection_preserves_explicit_l2_hint(load_hint, store_hint, force_buffer):
+def test_buffer_selection_preserves_nondefault_cache_policy(load_hint, store_hint, force_buffer):
     @pl.program
     class Hinted:
         @pl.function(type=pl.FunctionType.InCore)
         def kernel(
             self, source: pl.Tensor[[16, 32], pl.FP32], output: pl.Out[pl.Tensor[[16, 32], pl.FP32]]
         ) -> pl.Tensor[[16, 32], pl.FP32]:
-            value = pl.load(source, [0, 0], [16, 32], l2_hint=load_hint)
-            out = pl.store(value, [0, 0], output, l2_hint=store_hint)
+            value = pl.load(source, [0, 0], [16, 32], cache=load_hint)
+            out = pl.store(value, [0, 0], output, cache=store_hint)
             return out
 
     if force_buffer:
-        with pytest.raises(ValueError, match="explicit l2_hint requires a Buffer transfer recipe"):
+        with pytest.raises(ValueError, match="non-default cache requires a Buffer transfer recipe"):
             _lower(passes.MemoryPlanner.PYPTO, program=Hinted)
     else:
         with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):

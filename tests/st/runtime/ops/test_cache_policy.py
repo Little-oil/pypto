@@ -119,7 +119,7 @@ def _cache_policy_case(cache, planner, scope):
 @st.cases(
     *[
         _cache_policy_case(cache, planner, scope)
-        for cache in pl.CachePolicy
+        for cache in (pl.CachePolicy.DEFAULT, pl.CachePolicy.BYPASS)
         for planner in (MemoryPlanner.PYPTO, MemoryPlanner.PTOAS)
         for scope in (False, True)
     ]
