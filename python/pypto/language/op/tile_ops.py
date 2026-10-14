@@ -545,7 +545,7 @@ def store(
         >>> # INT32 accumulator dequantized and ReLU'd straight into FP16 GM
         >>> result = store(acc_i32, [0, 0], out_f16, pre_quant=1.0 / 1024, pre_relu=True)
     """
-    if cache is not None and not isinstance(cache, CachePolicy):
+    if cache is not None and type(cache) is not CachePolicy:
         raise TypeError(f"store cache must be CachePolicy, got {type(cache).__name__}")
     normalized_offsets = _normalize_intlike(offsets)
     normalized_shapes = _normalize_intlike(shapes) if shapes is not None else None
