@@ -526,9 +526,12 @@ def store(
             ``maximum(tile, 0) * pre_quant`` and not
             ``maximum(tile * pre_quant, 0)``. The two agree for every positive
             scale and differ at every element for a negative one.
-        cache: Optional cache policy. A5 supports DEFAULT, BYPASS, NORMAL_*
-            and NOT_ALLOC_CLEAN. NOT_ALLOC_KEEP/DROP are load-only.
-            A2/A3 supports DEFAULT stores only.
+        cache: Optional cache policy. A5 Vec-to-GM stores support DEFAULT,
+            BYPASS, NORMAL_* and NOT_ALLOC_CLEAN. A5 Acc-to-GM stores support
+            only DEFAULT and NORMAL_FIRST_VICTIM with the pinned PTO-ISA;
+            other policies are rejected, including for ReLU and quantized
+            writeback. NOT_ALLOC_KEEP/DROP are load-only. A2/A3 supports
+            DEFAULT stores only.
 
     Returns:
         Tensor wrapping the store operation
