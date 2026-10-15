@@ -86,6 +86,8 @@ struct IterArgCarryPlan {
 
 using namespace pypto::ir;  // NOLINT(build/namespaces)
 
+using GraphConfigScalarSlots = std::map<std::string, std::unordered_set<size_t>>;
+
 CoreType InferFunctionCoreType(const FunctionPtr& func) {
   // After ExpandMixedKernel runs (part of the Default pipeline), every InCore
   // function reaching codegen has been split into AIC, AIV, or Group / Spmd
@@ -132,7 +134,7 @@ const char* ParamDirectionToRuntimeName(ParamDirection dir) {
 // Template / boilerplate generation helpers
 // ---------------------------------------------------------------------------
 
-std::string GenerateIncludes(bool include_optional, bool include_vector = false) {
+std::string GenerateIncludes(bool include_optional, bool include_vector, bool include_graph) {
   std::ostringstream oss;
   oss << "#include <stddef.h>\n";
   oss << "#include <stdint.h>\n";
@@ -150,7 +152,11 @@ std::string GenerateIncludes(bool include_optional, bool include_vector = false)
   // (`simpler::tmr::Tensor` / `simpler::hbg::Tensor`). Orchestration works in
   // that type, not in the 72-byte boundary `ChipTensor` (simpler#1974), and
   // `orchestration_api.h` does not reach the shim on its own.
-  oss << "#include \"tensor.h\"\n\n";
+  oss << "#include \"tensor.h\"\n";
+  if (include_graph) {
+    oss << "#include \"host_build_graph/graph_boundary_match.h\"\n";
+  }
+  oss << "\n";
   return oss.str();
 }
 
@@ -357,11 +363,20 @@ class OrchestrationStmtCodegen : public CodegenBase {
   void SetTaskVarPrefix(std::string prefix) { task_var_prefix_ = std::move(prefix); }
 
   void SetGraphScalarParams(const std::vector<VarPtr>& params) {
+    size_t scalar_index = 0;
     for (const auto& param : params) {
+      if (AsTensorTypeLike(param->GetType())) continue;
       if (As<ScalarType>(param->GetType())) {
-        graph_scalar_params_.insert(param.get());
+        graph_scalar_params_.emplace(param.get(), scalar_index);
       }
+      ++scalar_index;
     }
+  }
+
+  const std::unordered_set<size_t>& GetGraphScalarValueReads() const { return graph_scalar_value_reads_; }
+
+  void SetGraphConfigScalarSlots(GraphConfigScalarSlots slots) {
+    graph_config_scalar_slots_ = std::move(slots);
   }
 
   /// Reserve identifiers the emitted C++ function already declares outside the
@@ -586,7 +601,10 @@ class OrchestrationStmtCodegen : public CodegenBase {
     if (auto var = AsVarLike(expr); var && graph_scalar_params_.count(var.get())) {
       auto scalar_type = As<ScalarType>(var->GetType());
       INTERNAL_CHECK_SPAN(scalar_type, expr->span_) << "Internal error: Graph scalar must have ScalarType";
-      return GetVarName(var) + ".to<" + scalar_type->dtype_.ToCTypeString() + ">()";
+      const size_t slot = graph_scalar_params_.at(var.get());
+      graph_scalar_value_reads_.insert(slot);
+      return "from_u64<" + scalar_type->dtype_.ToCTypeString() + ">(_pypto_graph_config.scalar_" +
+             std::to_string(slot) + ")";
     }
     return CodegenBase::GenerateExprString(expr);
   }
@@ -2279,6 +2297,14 @@ class OrchestrationStmtCodegen : public CodegenBase {
     params.reserve(callee_func->params_.size());
     auto push_call_arg = [&](size_t arg_idx) {
       params.push_back(BuildOneArgParam(call, callee_name, call_arg_directions, arg_idx));
+      // Graph arguments retain their value category: to_u64(float_var) is an
+      // rvalue and would declare a changing float static instead of dynamic.
+      // The runtime performs the scalar bit encoding itself.
+      if (callee_func->func_type_ == FunctionType::Graph && As<ScalarType>(call->args_[arg_idx]->GetType())) {
+        if (auto var = AsVarLike(call->args_[arg_idx])) {
+          params.back().value = GetVarName(var);
+        }
+      }
       if (!dump_var_set.empty()) {
         if (auto v = AsVarLike(call->args_[arg_idx])) {
           params.back().dump = dump_var_set.count(v.get()) > 0;
@@ -3669,15 +3695,31 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // `rt_submit_graph(GraphFunction, const GraphTaskArgs&)` — the boundary
     // container is its own `Arg` instantiation, sized by GRAPH_MAX_*_ARGS.
     EmitTaskParamsDecl(task_var, "GraphTaskArgs");
+    const auto slots_it = graph_config_scalar_slots_.find(callee_func->name_);
+    INTERNAL_CHECK_SPAN(slots_it != graph_config_scalar_slots_.end(), call->span_)
+        << "Internal error: Graph scalar usage was not collected for '" << callee_func->name_ << "'";
+    const std::string config_var = task_var + "_config";
+    EmitIndentedLine(GraphFunctionSymbol(callee_func->name_) + "Config " + config_var + ";");
+    size_t scalar_index = 0;
     for (const auto& p : params) {
       INTERNAL_CHECK_SPAN(p.direction != ArgDirection::Output, call->span_)
           << "Internal error: Graph function '" << callee_func->name_
           << "' has a runtime-allocated output argument; a recorded graph's boundary tensors must "
              "already exist so replay can patch their addresses.";
-      EmitIndentedLine(task_var + "." + ArgDirectionToMethodName(p.direction) + "(" + p.value + ");");
+      const char* method = ArgDirectionToMethodName(p.direction);
+      if (p.direction == ArgDirection::Scalar) {
+        if (slots_it->second.count(scalar_index)) {
+          EmitIndentedLine(config_var + ".scalar_" + std::to_string(scalar_index) + " = to_u64(" + p.value +
+                           ");");
+        }
+        ++scalar_index;
+      }
+      EmitIndentedLine(task_var + "." + method + "(" + p.value + ");");
     }
     EmitSelectiveDumpCall(task_var, params);
-    EmitIndentedLine("rt_submit_graph(&" + GraphFunctionSymbol(callee_func->name_) + ", " + task_var + ");");
+    EmitIndentedLine(config_var + ".boundary = pypto_graph_boundary_layout(" + task_var + ");");
+    EmitIndentedLine("rt_submit_graph(&" + GraphFunctionSymbol(callee_func->name_) + ", " + task_var + ", " +
+                     config_var + ");");
     ++task_counter_;
   }
 
@@ -4628,7 +4670,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
   int* next_func_id_;
   std::unordered_map<const Var*, std::string> emit_name_map_;
   // Only Graph boundary scalars are wrappers; body-local scalars hold values.
-  std::unordered_set<const Var*> graph_scalar_params_;
+  std::unordered_map<const Var*, size_t> graph_scalar_params_;
+  // Value reads freeze host computation into a Graph definition. Its caller
+  // must declare those slots static so changed values invalidate replay.
+  mutable std::unordered_set<size_t> graph_scalar_value_reads_;
+  GraphConfigScalarSlots graph_config_scalar_slots_;
   std::set<std::string> declared_var_names_;
   std::set<std::string> param_name_set_;
   std::map<std::string, int> param_name_to_orch_index_;
@@ -4873,10 +4919,41 @@ std::string GenerateGraphFunctions(const ProgramPtr& program, const FunctionPtr&
                                    std::map<std::string, int>* func_name_to_id,
                                    std::map<std::string, CoreType>* func_name_to_core_type,
                                    std::map<std::string, std::vector<std::string>>* func_name_to_signature,
-                                   int* next_func_id) {
+                                   int* next_func_id, GraphConfigScalarSlots* static_scalar_slots) {
   std::ostringstream oss;
+  const auto graph_functions = CollectReferencedGraphFunctions(program, entry);
+  if (graph_functions.empty()) return "";
+  // Reuse the runtime's bounded alias-partition algorithm. Absolute addresses and
+  // a uniform slide of a partition do not affect the recorded dependency layout.
+  // Shapes, storage sizes and relative view offsets do, so they join the Config.
+  oss << R"(
+static std::vector<uint64_t> pypto_graph_boundary_layout(const GraphTaskArgs& args) {
+    std::array<uint16_t, GRAPH_MAX_TENSOR_ARGS> reps{};
+    // The runtime reports malformed boundaries at submission. Do not read
+    // uninitialized partition entries while preparing their Config.
+    if (args.has_error() || !graph_alias_partition(args, reps.data())) return {};
+    std::vector<uint64_t> layout;
+    layout.reserve(1 + args.tensor_count() * (8 + 2 * MAX_TENSOR_DIMS));
+    layout.push_back(args.tensor_count());
+    for (int32_t i = 0; i < args.tensor_count(); ++i) {
+        const auto& tensor = args.tensor(i).ref();
+        const auto& representative = args.tensor(reps[i]).ref();
+        layout.insert(layout.end(), {
+            tensor.buffer.size, static_cast<uint64_t>(tensor.ndims),
+            static_cast<uint64_t>(tensor.dtype), static_cast<uint64_t>(args.tag(i)),
+            static_cast<uint64_t>(tensor.manual_dep), static_cast<uint64_t>(tensor.is_contiguous),
+            static_cast<uint64_t>(reps[i]), tensor.start_offset - representative.start_offset});
+        for (int32_t dim = 0; dim < tensor.ndims; ++dim) {
+            layout.push_back(tensor.shapes[dim]);
+            layout.push_back(tensor.strides[dim]);
+        }
+    }
+    return layout;
+}
+
+)";
   int graph_index = 0;
-  for (const auto& graph_func : CollectReferencedGraphFunctions(program, entry)) {
+  for (const auto& graph_func : graph_functions) {
     CodegenEffectiveUseCollector use_collector;
     use_collector.VisitStmt(graph_func->body_);
 
@@ -4915,10 +4992,33 @@ std::string GenerateGraphFunctions(const ProgramPtr& program, const FunctionPtr&
     body_codegen.PrepareCrossScopeTaskIdHoists(graph_func->body_);
     body_codegen.SetInitialIndent(4);
     body_codegen.VisitStmt(graph_func->body_);
+    (*static_scalar_slots)[graph_func->name_] = body_codegen.GetGraphScalarValueReads();
 
-    // Signature fixed by `using GraphFunction = void (*)(const GraphTaskArgs &)`
-    // in the runtime's orchestration_api.h; `rt_submit_graph` takes that pointer.
-    oss << "static void " << GraphFunctionSymbol(graph_func->name_) << "(const GraphTaskArgs& args) {\n";
+    // Construction values belong to Config; boundary scalar handles only forward
+    // per-invocation values. Compare the same encoded bits that participate in the
+    // key, including signed zero and NaN payloads of floating-point parameters.
+    const auto& read_slots = (*static_scalar_slots)[graph_func->name_];
+    const std::set<size_t> ordered_slots(read_slots.begin(), read_slots.end());
+    const std::string config_type = GraphFunctionSymbol(graph_func->name_) + "Config";
+    oss << "struct " << config_type << " : simpler::hbg::ConfigBase {\n";
+    oss << "    std::vector<uint64_t> boundary;\n";
+    std::string equality = "boundary == other.boundary";
+    for (size_t slot : ordered_slots) {
+      const std::string field = "scalar_" + std::to_string(slot);
+      oss << "    uint64_t " << field << " = 0;\n";
+      equality += " && " + field + " == other." + field;
+    }
+    oss << "    uint64_t hash() const {\n        uint64_t h = 0;\n";
+    oss << "        for (uint64_t field : boundary) h = simpler::hbg::config_hash_field(h, field);\n";
+    for (size_t slot : ordered_slots) {
+      oss << "        h = simpler::hbg::config_hash_field(h, scalar_" << slot << ");\n";
+    }
+    oss << "        return h;\n    }\n";
+    oss << "    bool operator==(const " << config_type << "& other) const { return " << equality
+        << "; }\n};\n\n";
+    oss << "static void " << GraphFunctionSymbol(graph_func->name_) << "(const GraphTaskArgs& args";
+    if (!ordered_slots.empty()) oss << ", const " << config_type << "& _pypto_graph_config";
+    oss << ") {\n";
 
     int tensor_index = 0;
     int scalar_index = 0;
@@ -5072,9 +5172,16 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   // so the outermost ``SIMPLER_SCOPE()`` is now emitted by the scope handler at the
   // base indent (4) rather than by a hardcoded wrapper below; the body lands at 8.
   stmt_codegen.SetInitialIndent(4);
+  // Generate Graph bodies first: their actual value reads determine which
+  // boundary slots the entry must declare static for safe replay.
+  GraphConfigScalarSlots graph_config_scalar_slots;
+  const std::string graph_functions =
+      GenerateGraphFunctions(program, func, &func_name_to_id, &func_name_to_core_type,
+                             &func_name_to_signature, &next_func_id, &graph_config_scalar_slots);
+  stmt_codegen.SetGraphConfigScalarSlots(std::move(graph_config_scalar_slots));
   stmt_codegen.VisitStmt(func->body_);
 
-  oss << GenerateIncludes(false, stmt_codegen.NeedsVectorInclude());
+  oss << GenerateIncludes(false, stmt_codegen.NeedsVectorInclude(), !graph_functions.empty());
 
   oss << "extern \"C\" {\n\n";
 
@@ -5082,8 +5189,7 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
 
   // Each Graph function referenced by this entry is emitted once, ahead of the
   // entry that launches it, so the call site can take its address.
-  oss << GenerateGraphFunctions(program, func, &func_name_to_id, &func_name_to_core_type,
-                                &func_name_to_signature, &next_func_id);
+  oss << graph_functions;
 
   oss << "__attribute__((visibility(\"default\")))\n";
   oss << "void aicpu_orchestration_entry(const ChipTaskArgs& orch_args) {\n";

@@ -42,7 +42,7 @@ import inspect
 import textwrap
 import types
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -181,8 +181,8 @@ class SpecializeContext:
     param_names: list[str]
     tensor_meta: dict[str, TensorMeta]
     scalar_dtypes: dict[str, DataType]
-    dep_names: list[str] = field(default_factory=list)
-    py_globals: Mapping[str, Any] = field(default_factory=dict)
+    dep_names: list[str] = field(default_factory=list[str])
+    py_globals: Mapping[str, Any] = field(default_factory=dict[str, Any])
     orig_file: str | None = None
     orig_start_line: int = 1
     orig_col_offset: int = 0
@@ -201,7 +201,7 @@ class SpecializeContext:
     external_include_dirs: tuple[str, ...] = ()
     # Also appended at the tail (see above): ``call name -> generated function
     # name`` for the deps this function reaches under a different name.
-    dep_func_names: dict[str, str] = field(default_factory=dict)
+    dep_func_names: dict[str, str] = field(default_factory=dict[str, str])
     # Name of the ``def`` inside ``source`` — the Python ``__name__``. It differs
     # from ``func_name`` whenever the JIT layer had to uniquify the generated
     # name (two deps sharing a ``__name__``). Anything that looks the definition
@@ -210,7 +210,7 @@ class SpecializeContext:
     source_func_name: str | None = None
     # Also appended at the tail (see above): ``pl.constexpr`` param name -> the
     # generated-source text its call-site value folds to.
-    constexpr_values: dict[str, str] = field(default_factory=dict)
+    constexpr_values: dict[str, str] = field(default_factory=dict[str, str])
     # Also appended at the tail (see above): ``(call name, ordinal) -> generated
     # function name``, where the ordinal is the call's position among
     # same-named calls in source order. A dep called at two different
@@ -218,7 +218,7 @@ class SpecializeContext:
     # resolve to different generated functions and the call name alone no
     # longer identifies the callee. Empty when every call site of a name
     # reaches the same function, which ``dep_func_names`` already covers.
-    dep_call_variants: dict[tuple[str, int], str] = field(default_factory=dict)
+    dep_call_variants: dict[tuple[str, int], str] = field(default_factory=dict[tuple[str, int], str])
 
     @property
     def source_def_name(self) -> str:
@@ -298,49 +298,51 @@ def func_name_lookup(func: Any) -> Mapping[str, Any]:
 
 @functools.lru_cache(maxsize=1)
 def _pl_symbol_index() -> tuple[dict[int, str], dict[Any, str]]:
-    """``pl``'s public namespace, indexed for rendering a value back to source.
+    """Index public ``pl`` and ``pld`` values by their canonical source paths.
 
-    Returns ``(enum_classes, values)``: ``id(EnumClass) -> "Mem"`` for every enum
-    type ``pl`` exports (members render as ``pl.Mem.Vec``), and ``value ->
-    "pl.INT8"`` for every exported singleton that is not an enum member -- in
-    practice the ``DataType`` constants. Names are visited in sorted order and
-    the first wins, so an alias pair resolves deterministically to the shorter
-    spelling (``pl.Mem``, not ``pl.MemorySpace``) -- the same one the IR printer
-    emits, which keeps generated and round-tripped source consistent.
+    Returns ``(enum_classes, values)``: ``id(EnumClass) -> "pl.Mem"`` for
+    exported enum types, and ``value -> "pl.INT8"`` for exported singletons
+    (in practice the ``DataType`` constants). Visit ``pl`` first to preserve
+    existing spellings for shared exports such as ``AtomicType``. Within each
+    namespace, sorted names make alias selection deterministic (``pl.Mem``
+    precedes ``pl.MemorySpace``), matching the IR printer.
 
     Callables, classes and modules are excluded: a body naming one is not naming
     a *value* the DSL can consume, and folding it would only turn a clear
     "undefined name" into a confusing type error further in.
     """
     import pypto.language as pl  # noqa: PLC0415 — avoids a circular import at module load
+    from pypto.language import distributed as pld  # noqa: PLC0415 — same circular import
 
     enum_classes: dict[int, str] = {}
     values: dict[Any, str] = {}
-    for attr in sorted(dir(pl)):
-        if attr.startswith("_"):
-            continue
-        value = getattr(pl, attr, None)
-        if isinstance(value, type):
-            if issubclass(value, enum.Enum):
-                enum_classes.setdefault(id(value), attr)
-            continue
-        # Enum members go through their class (above); literals render as
-        # literals; callables and modules are not values.
-        if isinstance(value, (enum.Enum, types.ModuleType, bool, int, float, str)) or callable(value):
-            continue
-        try:
-            values.setdefault(value, f"pl.{attr}")
-        except TypeError:
-            continue  # unhashable — not reachable by value lookup
+    for prefix, namespace in (("pl", pl), ("pld", pld)):
+        for attr in sorted(dir(namespace)):
+            if attr.startswith("_"):
+                continue
+            value = getattr(namespace, attr, None)
+            path = f"{prefix}.{attr}"
+            if isinstance(value, type):
+                if issubclass(value, enum.Enum):
+                    enum_classes.setdefault(id(value), path)
+                continue
+            # Enum members go through their class (above); literals render as
+            # literals; callables and modules are not values.
+            if isinstance(value, (enum.Enum, types.ModuleType, bool, int, float, str)) or callable(value):
+                continue
+            try:
+                values.setdefault(value, path)
+            except TypeError:
+                continue  # unhashable — not reachable by value lookup
     return enum_classes, values
 
 
 def _pl_symbol_path(value: Any) -> str | None:
-    """The ``pl.`` path that evaluates to ``value``, or None if there is none."""
+    """The ``pl.`` or ``pld.`` path that evaluates to ``value``, or None."""
     enum_classes, values = _pl_symbol_index()
     if isinstance(value, enum.Enum):
-        cls_name = enum_classes.get(id(type(value)))
-        return f"pl.{cls_name}.{value.name}" if cls_name else None
+        cls_path = enum_classes.get(id(type(value)))
+        return f"{cls_path}.{value.name}" if cls_path else None
     try:
         return values.get(value)
     except TypeError:
@@ -351,8 +353,8 @@ def _render_free_value(value: Any) -> ast.expr | None:
     """Render ``value`` as generated-source AST, or None when it cannot be written.
 
     Covers what a DSL body actually passes to an operator: literals, the ``pl``
-    enum and ``DataType`` constants, and (possibly nested) lists/tuples of those
-    -- a shape held in a module constant, for instance. A sequence renders only
+    and ``pld`` enum and ``DataType`` constants, and (possibly nested) lists/tuples
+    of those -- a shape held in a module constant, for instance. A sequence renders only
     when every element does, so a half-rendered list can never reach the parser.
     """
     if isinstance(value, type):
@@ -368,7 +370,7 @@ def _render_free_value(value: Any) -> ast.expr | None:
         # that predates this function.
         return ast.Constant(value=value)
     if isinstance(value, (list, tuple)):
-        elements = [_render_free_value(element) for element in value]
+        elements = [_render_free_value(element) for element in cast("Sequence[Any]", value)]
         if any(element is None for element in elements):
             return None
         rendered = cast("list[ast.expr]", elements)
@@ -568,7 +570,9 @@ def _array_dtype_str(dt: DataType) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _collect_dynamic_dims(
+# Cross-module private helper: production (jit/decorator.py) and the test suite
+# reach it by underscore import; pyright's unused analysis discounts those.
+def _collect_dynamic_dims(  # pyright: ignore[reportUnusedFunction]
     func_def: ast.FunctionDef,
     param_names: set[str],
 ) -> set[tuple[str, int]]:
@@ -629,7 +633,11 @@ def _resolve_dep_call_targets(
     return targets
 
 
-def _collect_dynvar_names(func_def: ast.FunctionDef) -> dict[str, str]:
+# Cross-module private helper: production (jit/decorator.py) and the test suite
+# reach it by underscore import; pyright's unused analysis discounts those.
+def _collect_dynvar_names(  # pyright: ignore[reportUnusedFunction]
+    func_def: ast.FunctionDef,
+) -> dict[str, str]:
     """Collect dynvar assignments from pl.dynamic(...) calls in the function body.
 
     Returns a dict mapping Python variable name → string literal passed to
@@ -663,7 +671,9 @@ def _collect_dynvar_names(func_def: ast.FunctionDef) -> dict[str, str]:
     return result
 
 
-def _collect_annotation_dynamic_dims(
+# Cross-module private helper: production (jit/decorator.py) and the test suite
+# reach it by underscore import; pyright's unused analysis discounts those.
+def _collect_annotation_dynamic_dims(  # pyright: ignore[reportUnusedFunction]
     func: Any,
     param_names: set[str],
 ) -> tuple[set[tuple[str, int]], dict[str, str], dict[str, str]]:
@@ -1273,7 +1283,7 @@ class _BodyTransformer(ast.NodeTransformer):
             if visited is None:
                 pass
             elif isinstance(visited, list):
-                result.extend(visited)
+                result.extend(cast("list[ast.stmt]", visited))
             else:
                 result.append(visited)
         return result or [ast.Pass()]
@@ -1526,8 +1536,8 @@ def _fold_const_names(node: ast.expr, py_globals: Mapping[str, Any]) -> ast.expr
     """
 
     class _Folder(ast.NodeTransformer):
-        def visit_Name(self, name: ast.Name) -> ast.expr:
-            return _fold_free_name(name.id, py_globals, name) or name
+        def visit_Name(self, node: ast.Name) -> ast.expr:
+            return _fold_free_name(node.id, py_globals, node) or node
 
     return _Folder().visit(copy.deepcopy(node))
 
@@ -1939,7 +1949,7 @@ class Specializer:
         # synthesized statements read as (0, 0), and zipped against the reparsed
         # generated statements in _build_source_map after assembly.
         self._fn_origin: list[tuple[SpecializeContext, list[tuple[int, int]]]] = []
-        # Set by _build_params when any param uses pld.DistributedTensor; the
+        # Set when a parameter or transformed body references pld; the
         # corresponding ``import pypto.language.distributed as pld`` is then
         # emitted in the generated module preamble so the source is
         # self-contained (mirrors the ``import pypto.language as pl`` line).
@@ -2118,7 +2128,7 @@ class Specializer:
         # constants that fold into ``Array`` extents), never Python builtins.
         # Type-form annotations never need builtins, so stripping them keeps the
         # best-effort eval from running anything beyond pure type construction.
-        ann_globals = {**ctx.py_globals, "__builtins__": {}}
+        ann_globals: dict[str, Any] = {**ctx.py_globals, "__builtins__": {}}
         scalar_dtype_strs = {
             name: _scalar_dtype_source(text, ann_globals) for name, text in scalar_dtype_strs.items()
         }
@@ -2195,12 +2205,19 @@ class Specializer:
             if item is None:
                 continue
             if isinstance(item, list):
-                flat_body.extend(item)
+                flat_body.extend(cast("list[ast.stmt]", item))
             else:
                 flat_body.append(item)
 
         if not flat_body:
             flat_body = [ast.Pass()]
+
+        if any(
+            isinstance(node, ast.Name) and node.id == "pld" and isinstance(node.ctx, ast.Load)
+            for stmt in flat_body
+            for node in ast.walk(stmt)
+        ):
+            self._needs_pld_import = True
 
         # Reconstruct a minimal FunctionDef to unparse
         new_func = ast.FunctionDef(

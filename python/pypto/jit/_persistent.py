@@ -11,27 +11,29 @@
 
 import logging
 import os
+import re
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextvars import ContextVar
 from dataclasses import fields, is_dataclass
 from enum import Enum
 from functools import cache, lru_cache
 from pathlib import Path
 from time import perf_counter_ns
-from typing import Any
+from typing import Any, cast
 
 from pypto._cache_config import CacheConfig, record_bypass, record_stats, time_stage
 from pypto._identity import digest_record, fingerprint_extra_sources
 from pypto.pypto_core import DataType
 
-from ._artifact_manifest import ArtifactKey, ArtifactSpec, ArtifactState, BuildKind
+from ._artifact_manifest import ArtifactKey, ArtifactSpec, ArtifactState, BuildKind, check_directory
 from ._toolchain import capture_toolchain
 from .artifact_cache import ArtifactLookup, ArtifactStore, BuildFailure, LookupStatus
 from .cache import CacheKey
 
 logger = logging.getLogger(__name__)
+_MAX_READY_CANDIDATES = 32
 _count_initial_lookup: ContextVar[bool] = ContextVar("jit_count_initial_lookup", default=False)
 
 
@@ -62,7 +64,7 @@ def _record(value: Any) -> Any:
     if is_dataclass(value) and not isinstance(value, type):
         return (type(value).__qualname__, {f.name: _record(getattr(value, f.name)) for f in fields(value)})
     if type(value) in (list, tuple, CacheKey):
-        return tuple(_record(item) for item in value)
+        return tuple(_record(item) for item in cast("Sequence[Any]", value))
     # nanobind enum types do not derive from Python's enum.Enum.
     if type(value).__module__.startswith("pypto.pypto_core") and isinstance(
         getattr(value, "name", None), str
@@ -93,6 +95,70 @@ class JITArtifactStore(ArtifactStore):
             _count_initial_lookup.set(False)
             _event(result.status)
         return result
+
+    def lookup_ready(self, key: ArtifactKey, generated: ArtifactSpec) -> ArtifactLookup:
+        """Use a GENERATED hint first, then published READY metadata if needed.
+
+        Hints only select a slot. The selected READY payload is fully validated
+        before it can be used; no cached Python is executed.
+        """
+        from pypto.runtime._prebuilt import ready_spec  # noqa: PLC0415
+
+        first = ArtifactLookup(LookupStatus.MISS)
+        try:
+            spec = ready_spec(self._slot(key, generated), generated, metadata_only=True)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError, UnicodeError):
+            pass
+        else:
+            first = self.lookup(key, spec)
+            if first.handle is not None:
+                return first
+        fallback = self._lookup_ready_candidates(key, generated)
+        return first if fallback.status is LookupStatus.MISS else fallback
+
+    def _lookup_ready_candidates(self, key: ArtifactKey, generated: ArtifactSpec) -> ArtifactLookup:
+        """Find an orphan READY stage within one exact artifact key, without writes."""
+        from pypto.runtime._prebuilt import ready_spec  # noqa: PLC0415
+
+        parent = self._slot(key, generated).parent.parent
+        try:
+            check_directory(parent)
+            with os.scandir(parent) as entries:
+                candidates: list[str] = []
+                for entry in entries:
+                    if re.fullmatch(r"[0-9a-f]{64}", entry.name) and entry.is_dir(follow_symlinks=False):
+                        candidates.append(entry.name)
+                        if len(candidates) > _MAX_READY_CANDIDATES:
+                            return ArtifactLookup(
+                                LookupStatus.INVALID, reason=f"Too many READY candidates under {parent}"
+                            )
+        except FileNotFoundError:
+            return ArtifactLookup(LookupStatus.MISS)
+        except ValueError as exc:
+            return ArtifactLookup(LookupStatus.INVALID, reason=str(exc))
+        except OSError as exc:
+            return ArtifactLookup(LookupStatus.STORAGE_ERROR, reason=str(exc))
+        hit: ArtifactLookup | None = None
+        failure = ArtifactLookup(LookupStatus.MISS)
+        for digest in sorted(candidates):
+            directory = parent / digest / ArtifactState.BINARY_READY.value
+            try:
+                check_directory(directory)
+                spec = ready_spec(directory, generated, metadata_only=True)
+            except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError, UnicodeError):
+                continue
+            if spec.digest != digest:
+                continue
+            candidate = self.lookup(key, spec)
+            if candidate.handle is not None:
+                if hit is not None:
+                    return ArtifactLookup(
+                        LookupStatus.INVALID, reason=f"Ambiguous READY stages under {parent}"
+                    )
+                hit = candidate
+            elif candidate.status is not LookupStatus.MISS:
+                failure = candidate
+        return hit if hit is not None else failure
 
     def get_or_build(self, key: ArtifactKey, spec: ArtifactSpec, builder: Callable[[Path], Any]) -> Any:
         binary = spec.state is ArtifactState.BINARY_READY
@@ -172,18 +238,22 @@ def resolve_persistent(
         reason = extra.failure or "; ".join(f"{f.component}: {f.reason}" for f in identity.failures)
         _bypass(reason)
         return build()
+    specialization: str | None = None
+    specialization_failure: str | None = None
     with time_stage("lookup_ns"):
         kind = BuildKind.DISTRIBUTED if distributed else BuildKind.SINGLE_CHIP
         source_before = source()
         try:
             specialization = _specialization_digest(object_key)
         except Exception as exc:
-            identity_failure = f"Specialization identity unavailable: {exc}"
-        else:
-            identity_failure = None
-    if identity_failure is not None:
-        _bypass(identity_failure)
+            specialization_failure = f"Specialization identity unavailable: {exc}"
+    if specialization_failure is not None:
+        # Same fallback as an unusable toolchain identity above: record the
+        # bypass and fall back to a plain, uncached build. Outside the timing
+        # block, so the uncached build is not charged to lookup_ns.
+        _bypass(specialization_failure)
         return build()
+    assert specialization is not None  # bound exactly when the digest succeeded
     with time_stage("lookup_ns"):
         semantic = _semantic_environment()
         compatible = (
@@ -220,6 +290,18 @@ def resolve_persistent(
             if distributed
             else ("compiled_meta.json", "kernel_config.py"),
         )
+        ready = store.lookup_ready(key, spec)
+        _event(ready.status)
+        if ready.handle is not None:
+            record_stats(ready_hits=1)
+            compiled = restore_artifact(
+                store,
+                ready.handle,
+                private_root / f"run-{uuid.uuid4().hex}",
+                _validated_manifest=ready.manifest,
+            )
+            owner._artifact_objects[compatible] = compiled
+            return compiled
         initial = store.lookup(key, spec)
         _event(initial.status)
         handle = initial.handle
@@ -228,7 +310,12 @@ def resolve_persistent(
             _event(ready.status)
             record_stats(**{"ready_hits" if ready.handle is not None else "generated_hits": 1})
             handle = ready.handle or handle
-            compiled = restore_artifact(store, handle, private_root / f"run-{uuid.uuid4().hex}")
+            compiled = restore_artifact(
+                store,
+                handle,
+                private_root / f"run-{uuid.uuid4().hex}",
+                _validated_manifest=ready.manifest if ready.handle is not None else initial.manifest,
+            )
             owner._artifact_objects[compatible] = compiled
             return compiled
         record_stats(misses=1)

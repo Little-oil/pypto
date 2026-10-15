@@ -67,8 +67,8 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 import torch
-from pypto import ir
 from pypto.ir import DistributedConfig
+from pypto.runtime import RunConfig
 
 SIZE = 64
 MAX_RECV = 4
@@ -118,130 +118,121 @@ def _build_host_all_to_all_v_multicore_reuse_program(
     cores = core_num
     stride = signal_stride
 
-    @pl.program
-    class HostTensorAllToAllVMulticoreReuse:
-        """N-rank HOST-orchestrated ``all_to_all_v``, twice through one signal."""
+    @pl.jit.incore
+    def stage_step(
+        inp: pl.Tensor[[total, SIZE], pl.FP32],
+        stage: pl.Out[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+    ) -> pld.DistributedTensor[[total, SIZE], pl.FP32]:
+        for row in pl.range(total):
+            chunk = pl.load(inp, [row, 0], [1, SIZE])
+            stage = pl.store(chunk, [row, 0], stage)
+        return stage
 
-        @pl.function(type=pl.FunctionType.InCore)
-        def stage_step(
-            self,
-            inp: pl.Tensor[[total, SIZE], pl.FP32],
-            stage: pl.Out[pld.DistributedTensor[[total, SIZE], pl.FP32]],
-        ):
-            for row in pl.range(total):
-                chunk = pl.load(inp, [row, 0], [1, SIZE])
-                stage = pl.store(chunk, [row, 0], stage)
+    @pl.jit
+    def stage_orch(
+        inp: pl.Tensor[[total, SIZE], pl.FP32],
+        stage: pl.Out[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+    ) -> pld.DistributedTensor[[total, SIZE], pl.FP32]:
+        return stage_step(inp, stage)
 
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def stage_orch(
-            self,
-            inp: pl.Tensor[[total, SIZE], pl.FP32],
-            stage: pl.Out[pld.DistributedTensor[[total, SIZE], pl.FP32]],
-        ):
-            self.stage_step(inp, stage)
+    @pl.jit.incore
+    def fill_counts_step(
+        counts_row: pl.Tensor[[nr, 1], pl.INT32],
+        counts: pl.Out[pld.DistributedTensor[[nr, 1], pl.INT32]],
+    ) -> pld.DistributedTensor[[nr, 1], pl.INT32]:
+        for d in pl.range(nr):
+            v = pl.read(counts_row, [d, 0])
+            pl.write(counts, [d, 0], v)
+        return counts
 
-        @pl.function(type=pl.FunctionType.InCore)
-        def fill_counts_step(
-            self,
-            counts_row: pl.Tensor[[nr, 1], pl.INT32],
-            counts: pl.Out[pld.DistributedTensor[[nr, 1], pl.INT32]],
-        ):
-            for d in pl.range(nr):
-                v = pl.read(counts_row, [d, 0])
-                pl.write(counts, [d, 0], v)
+    @pl.jit
+    def fill_counts_orch(
+        counts_row: pl.Tensor[[nr, 1], pl.INT32],
+        counts: pl.Out[pld.DistributedTensor[[nr, 1], pl.INT32]],
+    ) -> pld.DistributedTensor[[nr, 1], pl.INT32]:
+        return fill_counts_step(counts_row, counts)
 
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def fill_counts_orch(
-            self,
-            counts_row: pl.Tensor[[nr, 1], pl.INT32],
-            counts: pl.Out[pld.DistributedTensor[[nr, 1], pl.INT32]],
-        ):
-            self.fill_counts_step(counts_row, counts)
+    @pl.jit.incore
+    def consume_step(
+        data: pld.DistributedTensor[[total, SIZE], pl.FP32],
+        recv_counts: pld.DistributedTensor[[nr, 1], pl.INT32],
+        out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
+        recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
+    ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
+        # Same partition-the-slot discipline as the single-round program: a
+        # pl.Out tensor is write-only on the device, so every row must be
+        # written or it returns undefined memory instead of window content.
+        for src in pl.range(nr):
+            n_rows_i32 = pl.read(recv_counts, [src, 0])
+            pl.write(recv_out, [src, 0], n_rows_i32)
+            n_rows = pl.cast(n_rows_i32, pl.INDEX)
+            base = src * mr
+            for r in pl.range(n_rows):
+                flat_row = base + r
+                chunk = pl.load(data, [flat_row, 0], [1, SIZE])
+                out = pl.store(chunk, [flat_row, 0], out)
+            for r in pl.range(n_rows, mr):
+                flat_row = base + r
+                chunk = pl.load(data, [flat_row, 0], [1, SIZE])
+                out = pl.store(chunk, [flat_row, 0], out)
+        return out, recv_out
 
-        @pl.function(type=pl.FunctionType.InCore)
-        def consume_step(
-            self,
-            data: pld.DistributedTensor[[total, SIZE], pl.FP32],
-            recv_counts: pld.DistributedTensor[[nr, 1], pl.INT32],
-            out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
-            recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
-        ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
-            # Same partition-the-slot discipline as the single-round program: a
-            # pl.Out tensor is write-only on the device, so every row must be
-            # written or it returns undefined memory instead of window content.
-            for src in pl.range(nr):
-                n_rows_i32 = pl.read(recv_counts, [src, 0])
-                pl.write(recv_out, [src, 0], n_rows_i32)
-                n_rows = pl.cast(n_rows_i32, pl.INDEX)
-                base = src * mr
-                for r in pl.range(n_rows):
-                    flat_row = base + r
-                    chunk = pl.load(data, [flat_row, 0], [1, SIZE])
-                    out = pl.store(chunk, [flat_row, 0], out)
-                for r in pl.range(n_rows, mr):
-                    flat_row = base + r
-                    chunk = pl.load(data, [flat_row, 0], [1, SIZE])
-                    out = pl.store(chunk, [flat_row, 0], out)
-            return out, recv_out
+    @pl.jit
+    def consume_orch(
+        data: pld.DistributedTensor[[total, SIZE], pl.FP32],
+        recv_counts: pld.DistributedTensor[[nr, 1], pl.INT32],
+        out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
+        recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
+    ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
+        return consume_step(data, recv_counts, out, recv_out)
 
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def consume_orch(
-            self,
-            data: pld.DistributedTensor[[total, SIZE], pl.FP32],
-            recv_counts: pld.DistributedTensor[[nr, 1], pl.INT32],
-            out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
-            recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
-        ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
-            return self.consume_step(data, recv_counts, out, recv_out)
+    @pl.jit.host
+    def host_orch(
+        inputs: pl.Tensor[[2, nr, total, SIZE], pl.FP32],
+        send_counts: pl.Tensor[[nr, nr, 1], pl.INT32],
+        outputs: pl.Out[pl.Tensor[[2, nr, total, SIZE], pl.FP32]],
+        recv_outputs: pl.Out[pl.Tensor[[2, nr, nr, 1], pl.INT32]],
+    ) -> tuple[pl.Tensor[[2, nr, total, SIZE], pl.FP32], pl.Tensor[[2, nr, nr, 1], pl.INT32]]:
+        input_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
+        data_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
+        signal_buf = pld.alloc_window_buffer(nr * stride * pl.INT32.get_byte())
+        counts_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
+        recv_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
 
-        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
-        def host_orch(
-            self,
-            inputs: pl.Tensor[[2, nr, total, SIZE], pl.FP32],
-            send_counts: pl.Tensor[[nr, nr, 1], pl.INT32],
-            outputs: pl.Out[pl.Tensor[[2, nr, total, SIZE], pl.FP32]],
-            recv_outputs: pl.Out[pl.Tensor[[2, nr, nr, 1], pl.INT32]],
-        ) -> tuple[pl.Tensor[[2, nr, total, SIZE], pl.FP32], pl.Tensor[[2, nr, nr, 1], pl.INT32]]:
-            input_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
-            data_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
-            signal_buf = pld.alloc_window_buffer(nr * stride * pl.INT32.get_byte())
-            counts_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
-            recv_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
-
-            for r in pl.range(pld.world_size()):
-                counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
-                self.fill_counts_orch(send_counts[r], counts, device=r)
-
-            # Round 1.
-            for r in pl.range(pld.world_size()):
-                stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
-                self.stage_orch(inputs[0, r], stage, device=r)
-            stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
-            data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
-            signal = pld.window(signal_buf, [nr, stride], dtype=pl.INT32)
+        for r in pl.range(pld.world_size()):
             counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
-            recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
-            data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv, core_num=cores)
-            for r in pl.range(pld.world_size()):
-                self.consume_orch(data, recv, outputs[0, r], recv_outputs[0, r], device=r)
+            fill_counts_orch(send_counts[r], counts, device=r)
 
-            # Round 2 — the SAME signal, never reset. Stale credits from round 1
-            # would let this call's barrier fall through early.
-            for r in pl.range(pld.world_size()):
-                stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
-                self.stage_orch(inputs[1, r], stage, device=r)
+        # Round 1.
+        for r in pl.range(pld.world_size()):
             stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
-            data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
-            signal = pld.window(signal_buf, [nr, stride], dtype=pl.INT32)
-            counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
-            recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
-            data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv, core_num=cores)
-            for r in pl.range(pld.world_size()):
-                self.consume_orch(data, recv, outputs[1, r], recv_outputs[1, r], device=r)
+            stage_orch(inputs[0, r], stage, device=r)
+        stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
+        data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
+        signal = pld.window(signal_buf, [nr, stride], dtype=pl.INT32)
+        counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
+        recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
+        data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv, core_num=cores)
+        for r in pl.range(pld.world_size()):
+            consume_orch(data, recv, outputs[0, r], recv_outputs[0, r], device=r)
 
-            return outputs, recv_outputs
+        # Round 2 — the SAME signal, never reset. Stale credits from round 1
+        # would let this call's barrier fall through early.
+        for r in pl.range(pld.world_size()):
+            stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
+            stage_orch(inputs[1, r], stage, device=r)
+        stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
+        data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
+        signal = pld.window(signal_buf, [nr, stride], dtype=pl.INT32)
+        counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
+        recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
+        data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv, core_num=cores)
+        for r in pl.range(pld.world_size()):
+            consume_orch(data, recv, outputs[1, r], recv_outputs[1, r], device=r)
 
-    return HostTensorAllToAllVMulticoreReuse
+        return outputs, recv_outputs
+
+    return host_orch
 
 
 def _build_host_all_to_all_v_multicore_program(
@@ -274,166 +265,155 @@ def _build_host_all_to_all_v_multicore_program(
     # than corrupting the window if the entry's stride reject ever regresses.
     waited_lanes = min(admitted, signal_stride)
 
-    @pl.program
-    class HostTensorAllToAllVMulticore:
-        """N-rank HOST-orchestrated variable-size all-to-all at multiple blocks."""
+    @pl.jit.incore
+    def stage_step(
+        inp: pl.Tensor[[total, SIZE], pl.FP32],
+        stage: pl.Out[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+    ) -> pld.DistributedTensor[[total, SIZE], pl.FP32]:
+        for row in pl.range(total):
+            chunk = pl.load(inp, [row, 0], [1, SIZE])
+            stage = pl.store(chunk, [row, 0], stage)
+        return stage
 
-        @pl.function(type=pl.FunctionType.InCore)
-        def stage_step(
-            self,
-            inp: pl.Tensor[[total, SIZE], pl.FP32],
-            stage: pl.Out[pld.DistributedTensor[[total, SIZE], pl.FP32]],
-        ):
-            for row in pl.range(total):
-                chunk = pl.load(inp, [row, 0], [1, SIZE])
-                stage = pl.store(chunk, [row, 0], stage)
+    @pl.jit
+    def stage_orch(
+        inp: pl.Tensor[[total, SIZE], pl.FP32],
+        stage: pl.Out[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+    ) -> pld.DistributedTensor[[total, SIZE], pl.FP32]:
+        return stage_step(inp, stage)
 
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def stage_orch(
-            self,
-            inp: pl.Tensor[[total, SIZE], pl.FP32],
-            stage: pl.Out[pld.DistributedTensor[[total, SIZE], pl.FP32]],
-        ):
-            self.stage_step(inp, stage)
+    @pl.jit.incore
+    def fill_counts_step(
+        counts_row: pl.Tensor[[nr, 1], pl.INT32],
+        counts: pl.Out[pld.DistributedTensor[[nr, 1], pl.INT32]],
+    ) -> pld.DistributedTensor[[nr, 1], pl.INT32]:
+        # Scalar read/write — a [1,1] INT32 tile.load/store fails ptoas
+        # 32-byte row alignment (4 bytes); same pitfall the InCore
+        # all_to_all_v intrinsic ST avoids for recv_counts.
+        for d in pl.range(nr):
+            v = pl.read(counts_row, [d, 0])
+            pl.write(counts, [d, 0], v)
+        return counts
 
-        @pl.function(type=pl.FunctionType.InCore)
-        def fill_counts_step(
-            self,
-            counts_row: pl.Tensor[[nr, 1], pl.INT32],
-            counts: pl.Out[pld.DistributedTensor[[nr, 1], pl.INT32]],
-        ):
-            # Scalar read/write — a [1,1] INT32 tile.load/store fails ptoas
-            # 32-byte row alignment (4 bytes); same pitfall the InCore
-            # all_to_all_v intrinsic ST avoids for recv_counts.
-            for d in pl.range(nr):
-                v = pl.read(counts_row, [d, 0])
-                pl.write(counts, [d, 0], v)
+    @pl.jit
+    def fill_counts_orch(
+        counts_row: pl.Tensor[[nr, 1], pl.INT32],
+        counts: pl.Out[pld.DistributedTensor[[nr, 1], pl.INT32]],
+    ) -> pld.DistributedTensor[[nr, 1], pl.INT32]:
+        return fill_counts_step(counts_row, counts)
 
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def fill_counts_orch(
-            self,
-            counts_row: pl.Tensor[[nr, 1], pl.INT32],
-            counts: pl.Out[pld.DistributedTensor[[nr, 1], pl.INT32]],
-        ):
-            self.fill_counts_step(counts_row, counts)
+    @pl.jit.incore
+    def consume_step(
+        data: pld.DistributedTensor[[total, SIZE], pl.FP32],
+        recv_counts: pld.DistributedTensor[[nr, 1], pl.INT32],
+        signal: pld.DistributedTensor[[nr, stride], pl.INT32],
+        out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
+        recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
+        signal_out: pl.Out[pl.Tensor[[nr, stride], pl.INT32]],
+    ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
+        # Two loops whose row ranges partition each sender's slot, so every
+        # row of the window reaches `out` exactly once and `out` ends up
+        # FULLY written. That matters: a `pl.Out` tensor is write-only on
+        # the device (the host buffer is never uploaded), so a row the
+        # kernel skipped would come back as undefined memory rather than as
+        # window content — and the host-side tail check would be inspecting
+        # that, not the window.
+        #   [base, base + recv_counts[src])       valid -- checked vs golden
+        #   [base + recv_counts[src], base + mr)  tail  -- bounded-transfer check
+        for src in pl.range(nr):
+            n_rows_i32 = pl.read(recv_counts, [src, 0])
+            pl.write(recv_out, [src, 0], n_rows_i32)
+            n_rows = pl.cast(n_rows_i32, pl.INDEX)
+            base = src * mr
+            for r in pl.range(n_rows):
+                flat_row = base + r
+                chunk = pl.load(data, [flat_row, 0], [1, SIZE])
+                out = pl.store(chunk, [flat_row, 0], out)
+            for r in pl.range(n_rows, mr):
+                flat_row = base + r
+                chunk = pl.load(data, [flat_row, 0], [1, SIZE])
+                out = pl.store(chunk, [flat_row, 0], out)
 
-        @pl.function(type=pl.FunctionType.InCore)
-        def consume_step(
-            self,
-            data: pld.DistributedTensor[[total, SIZE], pl.FP32],
-            recv_counts: pld.DistributedTensor[[nr, 1], pl.INT32],
-            signal: pld.DistributedTensor[[nr, stride], pl.INT32],
-            out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
-            recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
-            signal_out: pl.Out[pl.Tensor[[nr, stride], pl.INT32]],
-        ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
-            # Two loops whose row ranges partition each sender's slot, so every
-            # row of the window reaches `out` exactly once and `out` ends up
-            # FULLY written. That matters: a `pl.Out` tensor is write-only on
-            # the device (the host buffer is never uploaded), so a row the
-            # kernel skipped would come back as undefined memory rather than as
-            # window content — and the host-side tail check would be inspecting
-            # that, not the window.
-            #   [base, base + recv_counts[src])       valid -- checked vs golden
-            #   [base + recv_counts[src], base + mr)  tail  -- bounded-transfer check
-            for src in pl.range(nr):
-                n_rows_i32 = pl.read(recv_counts, [src, 0])
-                pl.write(recv_out, [src, 0], n_rows_i32)
-                n_rows = pl.cast(n_rows_i32, pl.INDEX)
-                base = src * mr
-                for r in pl.range(n_rows):
-                    flat_row = base + r
-                    chunk = pl.load(data, [flat_row, 0], [1, SIZE])
-                    out = pl.store(chunk, [flat_row, 0], out)
-                for r in pl.range(n_rows, mr):
-                    flat_row = base + r
-                    chunk = pl.load(data, [flat_row, 0], [1, SIZE])
-                    out = pl.store(chunk, [flat_row, 0], out)
+        # The kernel's credit epilogue drops both credits each admitted
+        # block took on its own lane, so a used lane reads back zero once
+        # that block has completed. Lanes >= admitted were never touched by
+        # the kernel, so they read back zero as well — which is why the
+        # host-side assertion covers the used lanes only and cannot, on its
+        # own, distinguish B from L blocks.
+        # TWAIT performs the cache invalidation required for a reliable
+        # device-side observation of a lane another rank wrote.
+        ctx = pld.get_comm_ctx(signal)
+        my_rank = pld.rank(ctx)
+        for peer in pl.range(nr):
+            if peer != my_rank:
+                for lane in pl.range(waited_lanes):
+                    pld.system.wait(
+                        signal=signal,
+                        offsets=[peer, lane],
+                        expected=0,
+                        cmp=pld.WaitCmp.Eq,
+                    )
 
-            # The kernel's credit epilogue drops both credits each admitted
-            # block took on its own lane, so a used lane reads back zero once
-            # that block has completed. Lanes >= admitted were never touched by
-            # the kernel, so they read back zero as well — which is why the
-            # host-side assertion covers the used lanes only and cannot, on its
-            # own, distinguish B from L blocks.
-            # TWAIT performs the cache invalidation required for a reliable
-            # device-side observation of a lane another rank wrote.
-            ctx = pld.get_comm_ctx(signal)
-            my_rank = pld.rank(ctx)
-            for peer in pl.range(nr):
-                if peer != my_rank:
-                    for lane in pl.range(waited_lanes):
-                        pld.system.wait(
-                            signal=signal,
-                            offsets=[peer, lane],
-                            expected=0,
-                            cmp=pld.WaitCmp.Eq,
-                        )
+        signal_values = pl.load(
+            signal,
+            [0, 0],
+            [nr, signal_stage_cols],
+            valid_shape=[nr, stride],
+        )
+        pl.store(signal_values, [0, 0], signal_out)
+        return out, recv_out
 
-            signal_values = pl.load(
-                signal,
-                [0, 0],
-                [nr, signal_stage_cols],
-                valid_shape=[nr, stride],
-            )
-            pl.store(signal_values, [0, 0], signal_out)
-            return out, recv_out
+    @pl.jit
+    def consume_orch(
+        data: pld.DistributedTensor[[total, SIZE], pl.FP32],
+        recv_counts: pld.DistributedTensor[[nr, 1], pl.INT32],
+        signal: pld.DistributedTensor[[nr, stride], pl.INT32],
+        out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
+        recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
+        signal_out: pl.Out[pl.Tensor[[nr, stride], pl.INT32]],
+    ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
+        return consume_step(data, recv_counts, signal, out, recv_out, signal_out)
 
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def consume_orch(
-            self,
-            data: pld.DistributedTensor[[total, SIZE], pl.FP32],
-            recv_counts: pld.DistributedTensor[[nr, 1], pl.INT32],
-            signal: pld.DistributedTensor[[nr, stride], pl.INT32],
-            out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
-            recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
-            signal_out: pl.Out[pl.Tensor[[nr, stride], pl.INT32]],
-        ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
-            return self.consume_step(data, recv_counts, signal, out, recv_out, signal_out)
+    @pl.jit.host
+    def host_orch(
+        inputs: pl.Tensor[[nr, total, SIZE], pl.FP32],
+        send_counts: pl.Tensor[[nr, nr, 1], pl.INT32],
+        outputs: pl.Out[pl.Tensor[[nr, total, SIZE], pl.FP32]],
+        recv_outputs: pl.Out[pl.Tensor[[nr, nr, 1], pl.INT32]],
+        signal_outputs: pl.Out[pl.Tensor[[nr, nr, stride], pl.INT32]],
+    ) -> tuple[pl.Tensor[[nr, total, SIZE], pl.FP32], pl.Tensor[[nr, nr, 1], pl.INT32]]:
+        input_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
+        data_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
+        # One INT32 per (peer, admitted block); stride >= B is what the
+        # entry validates before it launches.
+        signal_buf = pld.alloc_window_buffer(nr * stride * pl.INT32.get_byte())
+        # Peers pull ONE word per rank from this window (scalar ld_dev read),
+        # so the [NR, 1] INT32 vector is the whole requirement — no fixed-
+        # width TLOAD unit set.
+        counts_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
+        recv_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
 
-        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
-        def host_orch(
-            self,
-            inputs: pl.Tensor[[nr, total, SIZE], pl.FP32],
-            send_counts: pl.Tensor[[nr, nr, 1], pl.INT32],
-            outputs: pl.Out[pl.Tensor[[nr, total, SIZE], pl.FP32]],
-            recv_outputs: pl.Out[pl.Tensor[[nr, nr, 1], pl.INT32]],
-            signal_outputs: pl.Out[pl.Tensor[[nr, nr, stride], pl.INT32]],
-        ) -> tuple[pl.Tensor[[nr, total, SIZE], pl.FP32], pl.Tensor[[nr, nr, 1], pl.INT32]]:
-            input_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
-            data_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
-            # One INT32 per (peer, admitted block); stride >= B is what the
-            # entry validates before it launches.
-            signal_buf = pld.alloc_window_buffer(nr * stride * pl.INT32.get_byte())
-            # Peers pull ONE word per rank from this window (scalar ld_dev read),
-            # so the [NR, 1] INT32 vector is the whole requirement — no fixed-
-            # width TLOAD unit set.
-            counts_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
-            recv_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
-
-            for r in pl.range(pld.world_size()):
-                stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
-                self.stage_orch(inputs[r], stage, device=r)
-
-            for r in pl.range(pld.world_size()):
-                counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
-                self.fill_counts_orch(send_counts[r], counts, device=r)
-
+        for r in pl.range(pld.world_size()):
             stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
-            data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
-            signal = pld.window(signal_buf, [nr, stride], dtype=pl.INT32)
+            stage_orch(inputs[r], stage, device=r)
+
+        for r in pl.range(pld.world_size()):
             counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
-            recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
-            data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv, core_num=cores)
+            fill_counts_orch(send_counts[r], counts, device=r)
 
-            for r in pl.range(pld.world_size()):
-                self.consume_orch(
-                    data, recv, signal, outputs[r], recv_outputs[r], signal_outputs[r], device=r
-                )
+        stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
+        data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
+        signal = pld.window(signal_buf, [nr, stride], dtype=pl.INT32)
+        counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
+        recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
+        data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv, core_num=cores)
 
-            return outputs, recv_outputs
+        for r in pl.range(pld.world_size()):
+            consume_orch(data, recv, signal, outputs[r], recv_outputs[r], signal_outputs[r], device=r)
 
-    return HostTensorAllToAllVMulticore
+        return outputs, recv_outputs
+
+    return host_orch
 
 
 def _make_inputs(n_ranks: int, max_recv: int, round_offset: float = 0.0) -> torch.Tensor:
@@ -520,22 +500,34 @@ class TestL3HostTensorAllToAllVMulticore:
         assert signal_stride >= admitted, "case is malformed: stride must admit B"
         label = f"P={nr} L={core_num} B={admitted} stride={signal_stride}"
 
-        compiled = ir.compile(
-            _build_host_all_to_all_v_multicore_program(nr, mr, core_num, signal_stride),
-            platform=test_config.platform,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:nr],
-                num_sub_workers=0,
-            ),
-        )
-
         inputs = _make_inputs(nr, mr)
         send_counts = _make_send_counts(nr)
         outputs = torch.zeros((nr, total, SIZE), dtype=torch.float32)
         recv_outputs = torch.zeros((nr, nr, 1), dtype=torch.int32)
         signal_outputs = torch.zeros((nr, nr, signal_stride), dtype=torch.int32)
 
-        compiled(inputs, send_counts, outputs, recv_outputs, signal_outputs)
+        compiled = _build_host_all_to_all_v_multicore_program(nr, mr, core_num, signal_stride).compile(
+            inputs,
+            send_counts,
+            outputs,
+            recv_outputs,
+            signal_outputs,
+            config=RunConfig(
+                platform=test_config.platform,
+                distributed_config=DistributedConfig(
+                    device_ids=device_ids[:nr],
+                    num_sub_workers=0,
+                ),
+            ),
+        )
+        compiled(
+            inputs,
+            send_counts,
+            outputs,
+            recv_outputs,
+            signal_outputs,
+            config=RunConfig(platform=test_config.platform),
+        )
 
         for rank in range(nr):
             for src in range(nr):
@@ -600,21 +592,25 @@ class TestL3HostTensorAllToAllVMulticore:
         rounds = 2
         label = f"reuse P={nr} L={core_num} B={admitted} stride={signal_stride}"
 
-        compiled = ir.compile(
-            _build_host_all_to_all_v_multicore_reuse_program(nr, mr, core_num, signal_stride),
-            platform=test_config.platform,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:nr],
-                num_sub_workers=0,
-            ),
-        )
-
         send_counts = _make_send_counts(nr)
         inputs = torch.stack([_make_inputs(nr, mr, round_offset=rd * 10000.0) for rd in range(rounds)])
         outputs = torch.zeros((rounds, nr, total, SIZE), dtype=torch.float32)
         recv_outputs = torch.zeros((rounds, nr, nr, 1), dtype=torch.int32)
 
-        compiled(inputs, send_counts, outputs, recv_outputs)
+        compiled = _build_host_all_to_all_v_multicore_reuse_program(nr, mr, core_num, signal_stride).compile(
+            inputs,
+            send_counts,
+            outputs,
+            recv_outputs,
+            config=RunConfig(
+                platform=test_config.platform,
+                distributed_config=DistributedConfig(
+                    device_ids=device_ids[:nr],
+                    num_sub_workers=0,
+                ),
+            ),
+        )
+        compiled(inputs, send_counts, outputs, recv_outputs, config=RunConfig(platform=test_config.platform))
 
         for rd in range(rounds):
             for rank in range(nr):
@@ -659,23 +655,36 @@ class TestL3HostTensorAllToAllVMulticore:
         admitted = _admitted_blocks(nr, core_num)
         assert signal_stride < admitted, "case is malformed: stride must be too narrow for B"
 
-        compiled = ir.compile(
-            _build_host_all_to_all_v_multicore_program(nr, mr, core_num, signal_stride),
-            platform=test_config.platform,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:nr],
-                num_sub_workers=0,
-            ),
-        )
-
         inputs = _make_inputs(nr, mr)
         send_counts = _make_send_counts(nr)
         outputs = torch.zeros((nr, total, SIZE), dtype=torch.float32)
         recv_outputs = torch.zeros((nr, nr, 1), dtype=torch.int32)
         signal_outputs = torch.zeros((nr, nr, signal_stride), dtype=torch.int32)
 
+        compiled = _build_host_all_to_all_v_multicore_program(nr, mr, core_num, signal_stride).compile(
+            inputs,
+            send_counts,
+            outputs,
+            recv_outputs,
+            signal_outputs,
+            config=RunConfig(
+                platform=test_config.platform,
+                distributed_config=DistributedConfig(
+                    device_ids=device_ids[:nr],
+                    num_sub_workers=0,
+                ),
+            ),
+        )
+
         with pytest.raises(RuntimeError):
-            compiled(inputs, send_counts, outputs, recv_outputs, signal_outputs)
+            compiled(
+                inputs,
+                send_counts,
+                outputs,
+                recv_outputs,
+                signal_outputs,
+                config=RunConfig(platform=test_config.platform),
+            )
 
     @pytest.mark.parametrize(
         ("n_ranks", "core_num", "signal_stride"),
@@ -707,23 +716,36 @@ class TestL3HostTensorAllToAllVMulticore:
         active = min(admitted, signal_stride)
         label = f"dfx P={nr} L={core_num} B={admitted} stride={signal_stride}"
 
-        compiled = ir.compile(
-            _build_host_all_to_all_v_multicore_program(nr, mr, core_num, signal_stride),
-            platform=test_config.platform,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:nr],
-                num_sub_workers=0,
-            ),
-        )
-
         inputs = _make_inputs(nr, mr)
         send_counts = _make_send_counts(nr)
         outputs = torch.zeros((nr, total, SIZE), dtype=torch.float32)
         recv_outputs = torch.zeros((nr, nr, 1), dtype=torch.int32)
         signal_outputs = torch.zeros((nr, nr, signal_stride), dtype=torch.int32)
 
+        compiled = _build_host_all_to_all_v_multicore_program(nr, mr, core_num, signal_stride).compile(
+            inputs,
+            send_counts,
+            outputs,
+            recv_outputs,
+            signal_outputs,
+            config=RunConfig(
+                platform=test_config.platform,
+                distributed_config=DistributedConfig(
+                    device_ids=device_ids[:nr],
+                    num_sub_workers=0,
+                ),
+            ),
+        )
+
         log_root, before = _snapshot_logs()
-        compiled(inputs, send_counts, outputs, recv_outputs, signal_outputs)
+        compiled(
+            inputs,
+            send_counts,
+            outputs,
+            recv_outputs,
+            signal_outputs,
+            config=RunConfig(platform=test_config.platform),
+        )
         lines = _new_log_lines(log_root, before)
         if log_root is None:
             pytest.skip("no ASCEND_PROCESS_LOG_PATH exported: the entry's DFX line cannot be read")
@@ -770,25 +792,38 @@ class TestL3HostTensorAllToAllVMulticore:
         assert signal_stride >= admitted, "case is malformed: our own stride check must pass"
         label = f"over-capacity P={nr} L={core_num} B={admitted}"
 
-        compiled = ir.compile(
-            _build_host_all_to_all_v_multicore_program(nr, mr, core_num, signal_stride),
-            platform=test_config.platform,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:nr],
-                num_sub_workers=0,
-            ),
-        )
-
         inputs = _make_inputs(nr, mr)
         send_counts = _make_send_counts(nr)
         outputs = torch.zeros((nr, total, SIZE), dtype=torch.float32)
         recv_outputs = torch.zeros((nr, nr, 1), dtype=torch.int32)
         signal_outputs = torch.zeros((nr, nr, signal_stride), dtype=torch.int32)
 
+        compiled = _build_host_all_to_all_v_multicore_program(nr, mr, core_num, signal_stride).compile(
+            inputs,
+            send_counts,
+            outputs,
+            recv_outputs,
+            signal_outputs,
+            config=RunConfig(
+                platform=test_config.platform,
+                distributed_config=DistributedConfig(
+                    device_ids=device_ids[:nr],
+                    num_sub_workers=0,
+                ),
+            ),
+        )
+
         log_root, before = _snapshot_logs()
 
         with pytest.raises(RuntimeError):
-            compiled(inputs, send_counts, outputs, recv_outputs, signal_outputs)
+            compiled(
+                inputs,
+                send_counts,
+                outputs,
+                recv_outputs,
+                signal_outputs,
+                config=RunConfig(platform=test_config.platform),
+            )
 
         lines = _new_log_lines(log_root, before)
         if log_root is None:

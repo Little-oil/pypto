@@ -165,12 +165,26 @@ dedicated Python 3.8 helper-test check. The review workflow uses the host
 interpreter and does not install Python or depend on the Python version inside
 the review container.
 
+Each review checks out the exact PR head into a fresh, full Git repository in a
+unique directory, without reusing the runner's cached object store. Before
+starting the container, the host fetches the complete base, head, and trusted
+workflow history, rejects shallow or partial clones, verifies reachable objects,
+and renders the full merge-base-to-head diff, including binary contents. Missing
+objects fail the job before review starts; the container does not need Git fetch
+access. The temporary checkout is removed after the review.
+
 Codex runs as UID/GID `1002:1003` in a read-only container with a read-only
 repository mount, dropped capabilities, resource limits, and an internal Docker
 network. The GitHub token with pull-request write access is available only to
 the separate publishing job. Review output is rejected if it contains an exact
 long-form value from the Codex credential and is labelled as automated,
 untrusted content when posted.
+
+Review result uploads have three attempts, each limited to two minutes. Failed
+attempts wait 10 and then 30 seconds before retrying, replacing any leftover
+artifact with the same run-specific name. Retries stop after a successful upload
+or cancellation. If all attempts fail, the review job fails and publishing does
+not run; a completed assessment alone does not make the job successful.
 
 ChatGPT-managed Codex authentication is refreshed by a trusted weekly or manual
 maintenance run that has no checkout and uses an empty temporary directory.

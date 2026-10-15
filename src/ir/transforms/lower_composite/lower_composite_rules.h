@@ -51,6 +51,25 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
 /// ``lower_composite_allgather.cpp``.
 ExprPtr LowerTensorAllGatherRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b);
 
+/// ``pld.tensor.reduce_scatter`` — staged-window form. Defined in
+/// ``lower_composite_reduce_scatter.cpp``.
+ExprPtr LowerTensorReduceScatterRule(const CallPtr& call, const std::vector<ExprPtr>& args,
+                                     LoweringBuilder& b);
+
+/// ``pld.tensor.broadcast``. Defined in ``lower_composite_broadcast.cpp``.
+ExprPtr LowerTensorBroadcastRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b);
+
+/// ``pld.tensor.barrier``. Defined in ``lower_composite_barrier.cpp``.
+ExprPtr LowerTensorBarrierRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b);
+
+/// ``pld.tensor.all_to_all`` — dual-window form. Defined in
+/// ``lower_composite_all_to_all.cpp``.
+ExprPtr LowerTensorAllToAllRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b);
+
+/// ``pld.tensor.all_to_all_v`` — 5-arg variable-size form (#2112). Defined in
+/// ``lower_composite_all_to_all_v.cpp``.
+ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b);
+
 }  // namespace lower_composite
 }  // namespace ir
 }  // namespace pypto

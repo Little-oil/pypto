@@ -1,5 +1,9 @@
 # 函数与程序结构
 
+> **旧 Python 接口示例：** 本页为兼容现有用法保留 `platform=` 调用，
+> 这些调用会发出 `DeprecationWarning`；新代码应使用 `backend_type` 和
+> `execution_mode`。参见[目标映射](../08-entry-points.md#迁移旧-platform-示例)。
+
 函数声明形式、参数方向、跨模块复用，以及如何把 IR 打印回 Python 语法。
 
 ## JIT 常量与编译复用
@@ -7,9 +11,10 @@
 `@pl.jit` 的函数体会被转写成 `@pl.program` 源码，并在只含 `pl` 与 `pld` 的命名空间中
 重新解析；因此函数体从所在模块或外层函数继承的名字，必须在其使用处被替换成能求值回
 同一个值的源码文本。可替换的范围包括：字面量（`int`、`float`、`bool`、`str`、`None`）、
-`pl` 的 dtype 与枚举常量（`pl.INT8`、`pl.Mem.Vec`、`pl.PadValue.zero`、`pl.NZ`），
-以及由它们嵌套构成的 list / tuple——例如放在常量里的 shape 或舍入模式。没有源码形式的
-值保持原样，于是该名字得以保留，由解析器报错。
+`pl` 的 dtype 与枚举常量（`pl.INT8`、`pl.Mem.Vec`、`pl.PadValue.zero`、`pl.NZ`）、
+分布式枚举常量（`pld.ReduceOp.Max`、`pld.NotifyOp.AtomicAdd`、`pld.WaitCmp.Ge`），
+以及由它们嵌套构成的 list / tuple——例如工厂函数选定的 shape、舍入模式或集合通信归约操作。
+没有源码形式的值保持原样，于是该名字得以保留，由解析器报错。
 
 所有可替换的名字同时进入编译键（compilation key），包括传递 JIT helper 和源码注解中使用
 的常量。编译键直接对每个名字*实际生成的文本*取哈希，且与 specializer 使用同一个函数，

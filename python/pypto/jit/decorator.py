@@ -70,11 +70,12 @@ import types
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 from pypto._cache_config import capture_cache_config, record_stats, time_stage
 from pypto._external_source import external_source_digest
 from pypto._identity import digest_record
+from pypto._target import _platform_string
 from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.backend.pto_backend import emit_source_loc_default
 from pypto.compile_profiling import get_active_profiler
@@ -815,7 +816,11 @@ def _build_dyndim_map_for_func(
     return out
 
 
-def _scan_dynamic_dims(func: Any, param_names: list[str]) -> set[tuple[str, int]]:
+# Cross-module private helper: the test suite (tests/ut/jit/test_decorator.py) reaches
+# it by underscore import; pyright's unused analysis discounts cross-module refs.
+def _scan_dynamic_dims(  # pyright: ignore[reportUnusedFunction]
+    func: Any, param_names: list[str]
+) -> set[tuple[str, int]]:
     """Return dynamic ``(param, dim)`` pairs declared in ``func`` (union of all sources)."""
     dyn_map = _build_dyndim_map_for_func(func, tuple(param_names))
     return {(p, i) for p, dims in dyn_map.items() for i in dims}
@@ -1457,7 +1462,7 @@ def _stmt_calls_dep(stmt: ast.stmt, dep_name: str | None, stop_at_call: ast.Call
     for field, value in ast.iter_fields(stmt):
         if field in nested_stmt_fields:
             continue
-        items = value if isinstance(value, list) else [value]
+        items = cast("list[Any]", value) if isinstance(value, list) else [value]
         for item in items:
             if not isinstance(item, ast.AST):
                 continue
@@ -1618,7 +1623,7 @@ def _walk_local_tensor_meta_stmts(
         for attr in ("body", "orelse", "finalbody"):
             nested = getattr(stmt, attr, None)
             if isinstance(nested, list) and _walk_local_tensor_meta_stmts(
-                nested,
+                cast("list[ast.stmt]", nested),
                 stop_at_dep,
                 local,
                 dim_values,
@@ -1691,7 +1696,8 @@ class _StaticScope:
         value = self.value(node) if isinstance(node, ast.Name) else None
         if not isinstance(value, (list, tuple)):
             return None
-        return tuple(value) if all(isinstance(d, int) and not isinstance(d, bool) for d in value) else None
+        seq = cast("Sequence[Any]", value)
+        return tuple(seq) if all(isinstance(d, int) and not isinstance(d, bool) for d in seq) else None
 
 
 def _drop_dims_is_noop(drop_dims_node: ast.expr | None, scope: _StaticScope) -> bool:
@@ -3099,7 +3105,7 @@ class JITFunction:
         request; :func:`_request_source_hash` layers it on top.
         """
         source_hash = self._get_static_source_hash()
-        records = []
+        records: list[tuple[Any, ...]] = []
         for index, jit_func in enumerate([self, *self._get_deps()]):
             func = jit_func._func
             namespace = func_name_lookup(func)
@@ -3189,7 +3195,7 @@ class JITFunction:
 
     def _compute_static_source_hash(self, deps: list[JITFunction]) -> str:
         """Compute source structure on graph changes or external-source lookups."""
-        sources = []
+        sources: list[str] = []
         for jit_func in [self, *deps]:
             sources.append(
                 json.dumps(
@@ -3544,6 +3550,7 @@ class JITFunction:
         )
 
         compile_kwargs, bypass_cache = _resolve_compile_request(run_config)
+        target_platform = _platform_string(compile_kwargs["backend_type"], compile_kwargs["execution_mode"])
         cache_config = capture_cache_config(getattr(run_config, "cache_config", None))
         record_stats(requests=1)
         if not cache_config.enabled:
@@ -3584,7 +3591,7 @@ class JITFunction:
             dynamic_dims={
                 (n, i) for n, m in specialization.tensor_meta.items() for i in m.dynamic_dim_indices()
             },
-            platform=compile_kwargs["platform"],
+            platform=target_platform,
             strategy=compile_kwargs["strategy"],
             distributed_config=compile_kwargs.get("distributed_config"),
             analyze_auto_scopes_for_deps=compile_kwargs["analyze_auto_scopes_for_deps"],
@@ -3605,7 +3612,7 @@ class JITFunction:
                     cache_config,
                     build,
                     self._persistent_source_digest,
-                    platform=compile_kwargs["platform"],
+                    platform=target_platform,
                     runtime_name=runtime_kind_to_name(_resolve_runtime()),
                     distributed=self._func_type == "host",
                 )
@@ -3640,7 +3647,7 @@ class JITFunction:
                     for fn in functions
                 ]
             )
-        values = []
+        values: list[tuple[Any, ...]] = []
         for index, fn in enumerate(functions):
             namespace = func_name_lookup(fn._func)
             for name in _constant_dependency_names(fn._func):
@@ -3756,7 +3763,9 @@ class JITFunction:
             ):
                 ...
 
-            worker = ChipWorker(config=RunConfig(platform="a2a3"))
+            from pypto.runtime import ChipWorker, ExecutionMode, RunConfig
+
+            worker = ChipWorker(config=RunConfig(execution_mode=ExecutionMode.ONBOARD))
 
             # From sample tensors (shape/dtype read; contents ignored):
             compiled = my_kernel.compile(sample_x, sample_w, sample_out, 128)
@@ -4266,7 +4275,11 @@ def _discover_dep_bindings(func: Any, caller_func_type: str = "orchestration") -
     return deps
 
 
-def _discover_deps(func: Any, caller_func_type: str = "orchestration") -> list[JITFunction]:
+# Cross-module private helper: the test suite (tests/ut/jit/test_decorator.py) reaches
+# it by underscore import; pyright's unused analysis discounts cross-module refs.
+def _discover_deps(  # pyright: ignore[reportUnusedFunction]
+    func: Any, caller_func_type: str = "orchestration"
+) -> list[JITFunction]:
     """Discover JIT dep functions called by ``func``, dropping their call names.
 
     Thin view over :func:`_discover_dep_bindings` for callers that only need
@@ -4378,9 +4391,11 @@ class _SubFunctionDecorator:
             )
         resolved_auto_scope = True if auto_scope is _AUTO_SCOPE_UNSET else auto_scope
         if func is None:
-            return lambda f: JITFunction(
-                f, func_type=self._func_type, level=level, auto_scope=resolved_auto_scope
-            )
+
+            def _deferred(f: Callable[..., Any]) -> JITFunction:
+                return JITFunction(f, func_type=self._func_type, level=level, auto_scope=resolved_auto_scope)
+
+            return _deferred
         return JITFunction(func, func_type=self._func_type, level=None, auto_scope=resolved_auto_scope)
 
 
@@ -4545,7 +4560,11 @@ class _JITDecorator:
         them by hand with ``with pl.scope()``.
         """
         if func is None:
-            return lambda f: JITFunction(f, func_type="orchestration", level=None, auto_scope=auto_scope)
+
+            def _deferred(f: Callable[..., Any]) -> JITFunction:
+                return JITFunction(f, func_type="orchestration", level=None, auto_scope=auto_scope)
+
+            return _deferred
         return JITFunction(func, func_type="orchestration", level=None, auto_scope=auto_scope)
 
 

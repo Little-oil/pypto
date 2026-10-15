@@ -5221,7 +5221,7 @@ class TestStructuralShapeEquality:
             [
                 ir.AssignStmt(
                     tile_a,
-                    tile.load(input_x, offsets=[0, 0], shapes=[64, 64], target_memory=ir.MemorySpace.Vec),
+                    tile.load(input_x, offsets=[0, 0], shapes=[add_1, c64], target_memory=ir.MemorySpace.Vec),
                     span,
                 ),
                 ir.AssignStmt(
@@ -5231,7 +5231,7 @@ class TestStructuralShapeEquality:
                 ),
                 ir.AssignStmt(
                     tile_b,
-                    tile.load(input_x, offsets=[0, 0], shapes=[64, 64], target_memory=ir.MemorySpace.Vec),
+                    tile.load(input_x, offsets=[0, 0], shapes=[add_2, c64], target_memory=ir.MemorySpace.Vec),
                     span,
                 ),
                 ir.AssignStmt(
@@ -6246,10 +6246,10 @@ class TestForbidOutputAlias:
         ci_calls: list[ir.Call] = []
 
         class _CiCollector(ir.IRVisitor):
-            def visit_call(self, call: ir.Call) -> None:
-                if call.op.name == ir.get_op("tile.ci").name:
-                    ci_calls.append(call)
-                super().visit_call(call)
+            def visit_call(self, op: ir.Call) -> None:
+                if op.op.name == ir.get_op("tile.ci").name:
+                    ci_calls.append(op)
+                super().visit_call(op)
 
         _CiCollector().visit_program(After)
         assert len(ci_calls) == 1 and len(ci_calls[0].args) == 3

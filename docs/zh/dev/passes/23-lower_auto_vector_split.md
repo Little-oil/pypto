@@ -254,6 +254,14 @@ with pl.at(level=pl.Level.CORE_GROUP, name_hint="sparse_kv",
   `128 x 512 x 2 = 131072`——而 `slot_num` 默认取 **2**，相当于在 512 KB 的 L1 中占用
   256 KB；每次调用只 push 一次的 kernel 无需超过该深度。`pl.cross_core_slot(slot_num=N)`
   可双向调整该值；若调得过大，`AllocateMemoryAddr` 会报告溢出并指出被预留的字节数。
+  自动 pipe 初始化会检查最终的 pop/free 调度：若两个 gather 的 Mat tile 在释放前
+  同时保留，至少需要两个 slot。深度不足时会拒绝编译；增大
+  `cross_core_slot(slot_num=N)`，或先放置/消费第一个 tile 再 gather 下一个。
+  前一个 tile 已释放的顺序 gather 不需要额外 slot。
+  硬件释放的是最早的 FIFO slot，而非任意指定的 tile。因此，finalizer 会等待同一
+  pipe 上更早的 pop 都使用完毕，再释放较晚的 tile；准入检查统计修复后的调度。
+  若嵌套 scope 会乱序释放外层仍保留的 tile，则拒绝编译；应在进入嵌套 handoff 前
+  放置/消费该 tile。
 
 `pl.aiv_shard` 在这里**不能**替代半 extent 的 `pl.full`：它是 C→V 传输，要求操作数位于
 `Acc`（cube 产出），因此无法对 vector lane 自己产生的值做切分。
@@ -472,9 +480,12 @@ out_store = pl.tile.store(popped, [0 + aiv_id * 7, 0], out_0)
        旧->新 var 重绑。cube 源（matmul / Acc 结果）保持全尺寸。
      VECTOR_TO_CUBE —— 插入
          tile.aic_gather(half_vector_tile, split=int(mode))  -> 全
-       将源解析到其折半后的 var 使 gather 把 半 -> 全 翻倍，随后保留对折叠后全尺寸
-       tile 的原 cube 放置 move（命名为 "<dest>_mat"，以便 ExpandMixedKernel 的
-       V->C 边界据此命名其合成的 tpop）。
+       将源解析到其折半后的 var，使 gather 把 半 -> 全 翻倍并落在 Mat 中。
+       若目标就是 Mat，直接绑定 gather 结果：额外的 Mat->Mat move 不受支持，
+       还会掩盖 FIFO 生命周期分析所需的真实消费者。若目标是其他 cube 内存空间
+       （如 Left/Right），保留对全尺寸 tile 的放置 move（命名为 "<dest>_mat"，
+       以便 ExpandMixedKernel 的 V->C 边界据此命名其合成的 tpop）。gather 结果
+       保持存活直到最后一次消费，包括 AutoTile K 循环内部的 extract。
 
    亲和性门控（ClassifyCallAffinity）：
      VECTOR 亲和叶子 —— 将单条语句送入
@@ -835,18 +846,19 @@ subblock 本地化。
 
 ## 示例 —— vector→cube 边界保持全尺寸（UpDown）
 
-V→C `tile.move` 变为 `tile.aic_gather`；对折叠后 tile 的 cube 放置 move 保持全尺寸
-`[128, 128]` `Mat`——cube 侧绝不会看到折半 tile：
+目标为 Mat 的 V→C `tile.move` 直接变为全尺寸 `[128, 128]` Mat 的 `tile.aic_gather`，
+不产生 Mat→Mat 复制。其他 cube 目标仍保留放置 move。若显式 Mat 布局或有效形状转换
+无法由 gather 表达，则拒绝该转换，而不是静默丢弃。直接复用 Mat 时，检查使用消费侧
+的隐式 Mat 布局及 gather 的 `valid_shape`。部分有效范围会被保留；gather 的临时
+向量布局视图并不表示用户请求了布局转换：
 
 ```python
 # `v` 是 affinity gate 产出的每 lane 折半 tile，例如 [64, 128]。
-gathered_mat: pl.Tile[[128, 128], pl.FP32, pl.Mem.Mat] = pl.tile.aic_gather(v, split=1)
-gathered:     pl.Tile[[128, 128], pl.FP32, pl.Mem.Mat] = pl.tile.move(gathered_mat,
-                                                                      target_memory=pl.Mem.Mat)
+gathered: pl.Tile[[128, 128], pl.FP32, pl.Mem.Mat] = pl.tile.aic_gather(v, split=1)
 ```
 
 **操作数必须是每 lane 的折半 tile。** `tile.aic_gather` 声明为 HALF → FULL，因此
-gather 把 `[64, 128]` 加倍为 `[128, 128]`，恰好等于 cube 放置 move 所保留的全尺寸
+gather 把 `[64, 128]` 加倍为 `[128, 128]`，恰好等于原边界 move 所要求的全尺寸
 结果类型。这种一致性是**前置条件**而非保证：向量值可能以未折半的形式到达边界——
 例如直接使用的 `Vec` 参数，或 split 维为 1 而被 affinity gate 特意保留的 tile。对
 这类操作数做加倍会得到 `[256, 128]` 的 gather，而其后的 move 仍是 `[128, 128]`，
@@ -874,9 +886,9 @@ gather 的 `split` 属性，会被拒绝。
 
 gather 结果是 `Mat` 而非 `Vec`：边界算子声明的类型指的是**消费侧** lane 的空间，
 而 AIC 会把 V→C 传输 pop 进 L1。（`Vec` 指的是*生产侧* lane，与镜像算子
-`tile.aiv_shard` 相矛盾——后者为其 cube 产出的操作数声明向量侧的 `Vec`。）随后的
-cube 放置 move 才把 tile 放到最终的操作数空间——matmul 操作数为 `Mat → Left`；
-此处的 `Mat → Mat` 是空操作，仅因本 pass 保留了作者原有的 move 而存在。
+`tile.aiv_shard` 相矛盾——后者为其 cube 产出的操作数声明向量侧的 `Vec`。）若目标为
+Mat，直接使用 gather 结果，不发射 `Mat → Mat` move。只有非 Mat 的 cube 目标才保留
+到最终操作数空间的放置 move，例如 matmul 操作数的 `Mat → Left` 或 `Mat → Right`。
 
 ## 实现
 

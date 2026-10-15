@@ -29,6 +29,19 @@ it **no longer halves any function body**:
 > lives in `split_axis_utils`, called by `LowerAutoVectorSplit` — see that
 > pass's doc for the per-op rewrite rules.
 
+Lane-1 `IfStmt` tile results retain the original join's layout and padding
+metadata with zero valid shape, and subsequent uses reference those rebuilt
+results. Branch tiles can have different padding metadata; the replay must not
+require full structural equality or adopt one branch's padding for the join.
+Tensor results use the common replayed yield type when both branches agree,
+preserving their backing view. Otherwise, non-tile results retain the original
+join type; metadata-only `tensor.view` aliases restore that contract for tensor
+destinations with different shapes without writing the destination.
+Before reusing a join type, its shape and view expressions are remapped to the
+replay lane's scalar definitions, so cloning cannot bind them to lane 0 locals.
+Inserted aliases remain inside any terminal runtime or AIV-split scope,
+preserving its attributes and the definitions used by its yield.
+
 ## API
 
 | C++ | Python | Level |
@@ -94,7 +107,7 @@ is true — the backend is Ascend910B (or any backend whose
 AIV, and `attrs["dual_aiv_dispatch"]` is true.
 
 ```text
-1. Clone params into param_replacements.
+1. Retain the unchanged signature and its parameter identities, including shape symbols.
 2. InjectSubblockIdx — prepend `subblock_idx = tile.get_subblock_idx()`.
 3. Strip the leading subblock_idx assign, then split off the shared pipe-setup
    prefix: SplitNoSplitSharedPipeSetupPrefix takes the maximal prefix of
@@ -105,16 +118,20 @@ AIV, and `attrs["dual_aiv_dispatch"]` is true.
 5. Lane 1 body = BuildNoSplitLane1ReplayStmts(branch stmts):
      - tile.store: drop EvalStmt forms; for AssignStmt forms passthrough the
        destination tensor so SSA users still see a value, but no write happens.
+       Rebuild the alias type from that destination, including its shape symbols.
+     - aliases: inherit the substituted value's type and propagate it to uses.
      - any other call producing a TileType: rewrite via
        RebuildLane1CallWithZeroValidShape — tile.load becomes tile.create with
-       valid_shape=[0, 0]; tile.slice / tile.set_validshape get their
+       valid_shape=[0, 0]; tile.slice / tile.transpose / tile.fmods / tile.rems
+       also become empty tile.create results because those operations cannot
+       safely execute with zero valid extents. tile.set_validshape gets its
        valid_shape zeroed; everything else has its result valid_shape cleared.
      - cross-core tile.tpush_* / tile.tpop_* / system.tfree_* are KEPT so the
        AIC↔AIV handshake stays balanced.
      - For/While/If recurse with a forked replacements map.
 6. Wrap lane 0 / lane 1 in `if subblock_idx == 0: <lane 0> else: <lane 1>`.
 7. New body = subblock_idx assign; hoisted shared pipe-setup; branch IfStmt.
-8. Substitute / DeepClone; attrs unchanged (dual_aiv_dispatch=True stays).
+8. DeepClone the body; attrs unchanged (dual_aiv_dispatch=True stays).
 ```
 
 ### Codegen transport: full-column box, preserved rows

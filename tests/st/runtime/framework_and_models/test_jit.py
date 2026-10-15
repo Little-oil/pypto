@@ -17,6 +17,8 @@ import ast
 import logging
 import multiprocessing
 import os
+import re
+import subprocess
 import traceback
 from pathlib import Path
 
@@ -67,7 +69,57 @@ def persistent_add(x: pl.Tensor[[16, 16], pl.FP32], out: pl.Out[pl.Tensor[[16, 1
     return out
 
 
-def _persistent_process(root, platform, device_id, consume, connection):
+def _prepare_cache_ptoas(directory, monkeypatch, startup_hook):
+    """Give cache acceptance its own explicit Python startup configuration."""
+    from pypto.backend._ptoas_locate import find_ptoas_binary  # noqa: PLC0415
+    from pypto.jit._toolchain import _console_interpreter  # noqa: PLC0415
+
+    selected = find_ptoas_binary()
+    assert selected is not None, "Cache acceptance requires PTOAS"
+    launcher = Path(selected)
+    with launcher.open("rb") as stream:
+        native = stream.read(4) == b"\x7fELF"
+    if native:
+        if startup_hook:
+            pytest.skip("A standalone ELF PTOAS has no Python startup hooks")
+        return
+    interpreter = _console_interpreter(launcher)
+    probe = subprocess.run(
+        [
+            str(interpreter),
+            "-c",
+            "import importlib.util; from pathlib import Path; "
+            "print(repr(sorted({str(Path(importlib.util.find_spec(name).origin).parent.parent) "
+            "for name in ('ptoas', 'numpy')})))",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    dependencies = ast.literal_eval(probe.stdout)
+    # No pip/setuptools installation: importing the selected dependency paths
+    # does not execute their .pth files. The installed toolchain stays untouched.
+    subprocess.run([str(interpreter), "-m", "venv", "--without-pip", str(directory)], check=True, timeout=60)
+    python = directory / "bin/python"
+    probe = subprocess.run(
+        [str(python), "-c", "import site; print(repr(site.getsitepackages()))"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    site = Path(ast.literal_eval(probe.stdout)[0])
+    (site / "cache_dependencies.pth").write_text("\n".join(dependencies) + "\n")
+    if startup_hook:
+        (site / "cache_startup.pth").write_text("import os\n")
+    target = directory / "ptoas"
+    target.write_text(f"#!{python}\n" + launcher.read_text().split("\n", 1)[1])
+    target.chmod(0o755)
+    monkeypatch.setenv("PTOAS_ROOT", str(directory))
+
+
+def _persistent_process(root, platform, device_id, consume, connection, change_search=False):
     """Fresh interpreter: ordinary execution publishes, then readonly reuse executes."""
     phase = "consumer" if consume else "producer"
     cache_logger = logging.getLogger("pypto.jit._persistent")
@@ -80,6 +132,13 @@ def _persistent_process(root, platform, device_id, consume, connection):
         from pypto.runtime.kernel_compiler import KernelCompiler  # noqa: PLC0415
 
         os.environ.pop("PYPTO_PROG_BUILD_DIR", None)
+        if consume and change_search:
+            # The tools are unchanged, but the fresh consumer must rediscover
+            # them from another cwd and an extended executable search path.
+            directory = Path(root).parent / "consumer-cwd"
+            directory.mkdir()
+            os.chdir(directory)
+            os.environ["PATH"] = os.pathsep.join((str(directory), os.environ.get("PATH", "")))
         config = RunConfig(
             platform=platform,
             device_id=device_id,
@@ -98,12 +157,20 @@ def _persistent_process(root, platform, device_id, consume, connection):
             x = torch.full((16, 16), 2.0)
             out = torch.zeros_like(x)
             persistent_add(x, out, config=config)
-            torch.testing.assert_close(out, torch.full_like(out, 5.0))
             compiled = persistent_add.compile(config=config)
+            torch.testing.assert_close(out, torch.full_like(out, 5.0))
+            # The same JIT object must reuse its compiled object on subsequent
+            # calls, including in interpreters with executable startup hooks.
+            guard.setattr(persistent_add, "_compile", forbidden)
+            out.zero_()
+            persistent_add(x, out, config=config)
+            torch.testing.assert_close(out, torch.full_like(out, 5.0))
+            stats = cache_stats()
+            assert stats.bypasses == 0, stats.last_bypass_reason
+            assert stats.object_hits >= 2
             assert compiled._artifact_runtime is not None
             assert compiled._artifact_runtime.handle.spec.state.value == "ready"
             assert (compiled.program is None) == consume
-            stats = cache_stats()
             assert stats.ready_hits == int(consume)
             assert stats.generation_builds == int(not consume)
             assert stats.binary_builds == int(not consume)
@@ -118,21 +185,41 @@ def _persistent_process(root, platform, device_id, consume, connection):
 class TestJITExecution:
     """End-to-end tests for @pl.jit compile + execute on device."""
 
-    def test_persistent_cache_across_processes(self, test_config, tmp_path):
-        """READY reuses every stage in a new process and executes numerically.
+    @pytest.mark.parametrize("change_search", [False, True])
+    @pytest.mark.parametrize("startup_hook", [False, True], ids=["ready", "startup-ready"])
+    def test_persistent_cache_across_processes(
+        self, test_config, tmp_path, monkeypatch, change_search, startup_hook
+    ):
+        """Verify numerical READY and object reuse with and without startup hooks.
 
         Run in a standalone pytest invocation, before its parent initializes
         any device. CI selects this node separately from the direct-test shard.
         """
         if test_config.codegen_only:
             pytest.skip("Persistent artifact acceptance requires compiler and runtime")
+        monkeypatch.setenv("PYPTO_CACHE_IDENTITY", "build")
+        # Keep loader inputs fixed when the consumer changes cwd. A relative
+        # loader search is a dependency change, not the unchanged-tool scenario.
+        library_path = os.environ.get("LD_LIBRARY_PATH")
+        if library_path is not None:
+            monkeypatch.setenv(
+                "LD_LIBRARY_PATH", os.pathsep.join(os.path.abspath(p) for p in re.split("[:;]", library_path))
+            )
+        _prepare_cache_ptoas(tmp_path / "ptoas-environment", monkeypatch, startup_hook)
         root = tmp_path / "persistent-cache"
         context = multiprocessing.get_context("spawn")
         for consume in (False, True):
             receiving, sending = context.Pipe(duplex=False)
             process = context.Process(
                 target=_persistent_process,
-                args=(str(root), test_config.platform, test_config.device_id, consume, sending),
+                args=(
+                    str(root),
+                    test_config.platform,
+                    test_config.device_id,
+                    consume,
+                    sending,
+                    change_search,
+                ),
             )
             process.start()
             sending.close()
@@ -148,6 +235,7 @@ class TestJITExecution:
                     process.terminate()
                     process.join(timeout=20)
         assert not list(root.rglob("__pycache__"))
+        assert list(root.rglob("artifact_manifest.json"))
 
     def test_warmup_then_execute_without_recompiling(self, test_config, monkeypatch):
         """Prepare from annotations without a worker, then execute those binaries."""

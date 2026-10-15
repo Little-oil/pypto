@@ -221,10 +221,15 @@ set(PYPTO_SOURCES
     src/ir/transforms/loop_invariant_mat_residency.cpp
     src/ir/transforms/inline_functions_pass.cpp
     src/ir/transforms/init_memref.cpp
+    src/ir/transforms/lower_composite/lower_composite_all_to_all.cpp
+    src/ir/transforms/lower_composite/lower_composite_all_to_all_v.cpp
     src/ir/transforms/lower_composite/lower_composite_allgather.cpp
     src/ir/transforms/lower_composite/lower_composite_allreduce.cpp
+    src/ir/transforms/lower_composite/lower_composite_barrier.cpp
+    src/ir/transforms/lower_composite/lower_composite_broadcast.cpp
     src/ir/transforms/lower_composite/lower_composite_builder.cpp
     src/ir/transforms/lower_composite/lower_composite_common.cpp
+    src/ir/transforms/lower_composite/lower_composite_reduce_scatter.cpp
     src/ir/transforms/lower_composite_ops_pass.cpp
     src/ir/transforms/materialize_tensor_strides_pass.cpp
     src/ir/transforms/ir_property.cpp

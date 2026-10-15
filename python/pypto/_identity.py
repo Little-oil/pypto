@@ -7,13 +7,12 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Content identity primitives for the planned persistent artifact store.
+"""Identity primitives for the persistent artifact store.
 
-These helpers are deliberately not called by JIT dispatch. A toolchain adapter
-must supply a complete dependency inventory before its component is usable;
-hashing a compiler executable alone is not evidence of a complete toolchain.
-No version string, Git revision, file timestamp, or build ID substitutes for
-file contents. Loaded installations are immutable during a process's lifetime.
+Adapters declare content inventories, verified revisions, or reported build
+identities according to their policy. Declared roots are always hashed; version
+and revision evidence never replaces explicitly listed contents. Loaded
+installations are immutable during a process's lifetime.
 """
 
 import hashlib
@@ -26,7 +25,7 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, cast
 
 IDENTITY_SCHEMA = 1
 _COMPONENTS = ("pypto", "runtime", "pto_isa", "ptoas", "device_toolchain")
@@ -56,11 +55,12 @@ def _typed_record(value: Any, ancestors: frozenset[int] = frozenset()) -> list[A
     if type(value) in (list, tuple):
         return [type(value).__name__, [_typed_record(item, nested) for item in value]]
     if type(value) is dict:
-        if any(type(key) is not str for key in value):
+        mapping = cast("dict[str, Any]", value)
+        if any(type(key) is not str for key in mapping):
             raise TypeError("Identity record dictionary keys must be strings")
         return [
             "dict",
-            [[_typed_record(key, nested), _typed_record(value[key], nested)] for key in sorted(value)],
+            [[_typed_record(key, nested), _typed_record(mapping[key], nested)] for key in sorted(mapping)],
         ]
     raise TypeError(f"Unsupported identity record type: {type(value).__module__}.{type(value).__qualname__}")
 
@@ -149,8 +149,8 @@ def _elf_debug_ranges(stream: BinaryIO) -> list[tuple[int, int]] | None:
     ):
         return None
     endian = "<" if header[5] == 1 else ">"
-    kind, _, version, _, phoff, shoff, _, ehsize, phsize, phnum, shsize, shnum, names_index = (
-        struct.unpack_from(endian + "HHIQQQIHHHHHH", header, 16)
+    kind, _, version, _, phoff, shoff, _, ehsize, phsize, phnum, shsize, shnum, names_index = cast(
+        "tuple[int, ...]", struct.unpack_from(endian + "HHIQQQIHHHHHH", header, 16)
     )
     if (
         kind not in (1, 2, 3)
@@ -175,7 +175,7 @@ def _elf_debug_ranges(stream: BinaryIO) -> list[tuple[int, int]] | None:
     table = stream.read(shsize * shnum)  # At most 0xFEFF fixed-size entries.
     if len(table) != shsize * shnum or table[:64] != bytes(64):
         return None
-    sections = list(struct.iter_unpack(endian + "IIQQQQIIQQ", table))
+    sections: list[tuple[int, ...]] = list(struct.iter_unpack(endian + "IIQQQQIIQQ", table))
     _, names_type, _, _, names_offset, names_size, _, _, _, _ = sections[names_index]
     if names_type != 3 or not names_size or not in_file(names_offset, names_size):
         return None
@@ -183,7 +183,7 @@ def _elf_debug_ranges(stream: BinaryIO) -> list[tuple[int, int]] | None:
     occupied = [(0, 64), (shoff, shoff + len(table))]
     if phnum:
         occupied.append((phoff, phoff + phsize * phnum))
-    skipped = []
+    skipped: list[tuple[int, int]] = []
     for index, (name, section_type, flags, _, offset, size, _, _, _, _) in enumerate(sections[1:], 1):
         if name >= names_size:
             return None
@@ -407,7 +407,7 @@ def fingerprint_content(roots: tuple[ContentRoot, ...]) -> ContentIdentity:
     """
     if not roots:
         return ContentIdentity(None, "No content inputs were supplied")
-    records = []
+    records: list[tuple[str, bool, list[tuple[Any, ...]]]] = []
     try:
         for root in roots:
             records.append(
@@ -446,9 +446,11 @@ def fingerprint_extra_sources(
 class ComponentInputs:
     """Inventory supplied by a dependency-aware compiler/toolchain adapter.
 
-    An adapter must leave ``unavailable_reason`` set until it has accounted
-    for all resources and dynamic dependencies, even if it knows some files.
-    A caller-supplied application fingerprint cannot complete this inventory.
+    An adapter must leave ``unavailable_reason`` set until it has established
+    the evidence required by its identity policy. Content inventories account
+    for resources and dynamic dependencies; build identities explicitly trust
+    published build/version identifiers. Application fingerprints cannot replace
+    missing installation evidence.
 
     ``verified_revision`` is the narrow exception to reading contents: an
     adapter may supply a revision when some *other* mechanism has already
@@ -465,8 +467,8 @@ class ComponentInputs:
     in place is invisible to it. Use it only where the deployment establishes
     that the component arrives as an unmodified published build, and record
     that reasoning where the adapter sets it. It is not interchangeable with
-    ``verified_revision`` and must not be treated as precedent for another
-    component.
+    ``verified_revision``. The JIT build policy uses distinct version tags for
+    its component records; it does not claim they prove installed contents.
 
     ``reported_version`` may accompany ``roots``. A component whose files come
     from more than one source -- a vendor package that states its own build
@@ -565,7 +567,7 @@ class InstallationIdentityCache:
     def capture(self, inputs: ToolchainInputs) -> ToolchainIdentity:
         """Hash complete component inventories, preserving every failure reason."""
         digests: dict[str, str | None] = {}
-        failures = []
+        failures: list[IdentityFailure] = []
         with self._lock:
             for name in _COMPONENTS:
                 component: ComponentInputs = getattr(inputs, name)

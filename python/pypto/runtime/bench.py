@@ -53,6 +53,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pypto._target import _parse_platform
+
 from .log_config import configure_log, current_level
 from .runner import RunConfig
 from .worker import ChipWorker
@@ -127,7 +129,7 @@ class TraceInvocation:
     pid: int
     inv: int
     hid: str
-    spans: list[TraceSpan] = field(default_factory=list)
+    spans: list[TraceSpan] = field(default_factory=list[TraceSpan])
 
     def root(self) -> "TraceSpan | None":
         """The depth-0 span (``chip.run``), or ``None`` if absent."""
@@ -339,7 +341,7 @@ def _span_names() -> dict[str, str]:
     than spreading it across metrics.
     """
     try:
-        from simpler_setup.tools.strace_timing import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        from simpler_setup.tools.strace_timing import (  # noqa: PLC0415
             _ROUNDS_TABLE_NAMES,
         )
     except (ImportError, AttributeError):
@@ -541,12 +543,14 @@ class BenchmarkStats:
             :meth:`per_rank` and :meth:`per_round` stay valid and populated.
     """
 
-    device_wall_us: list[float] = field(default_factory=list)
-    host_wall_us: list[float] = field(default_factory=list)
+    device_wall_us: list[float] = field(default_factory=list[float])
+    host_wall_us: list[float] = field(default_factory=list[float])
     rounds: int = 0
     warmup: int = 0
-    invocations: list[TraceInvocation] = field(default_factory=list)
-    rounds_dispatches: list[dict[int, list[TraceInvocation]]] = field(default_factory=list)
+    invocations: list[TraceInvocation] = field(default_factory=list[TraceInvocation])
+    rounds_dispatches: list[dict[int, list[TraceInvocation]]] = field(
+        default_factory=list[dict[int, list[TraceInvocation]]]
+    )
     fallback_flattened: bool = False
     unstable_dispatch_slots: bool = False
 
@@ -1205,7 +1209,7 @@ def _parse_stats_from_strace(
     # where the runtime is installed, absent on the lint / unit-test host. The
     # import is resolved lazily at call time; pyright cannot see it in the lint
     # env, and unit tests skip the parse path when it is not installed.
-    from simpler_setup.tools import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+    from simpler_setup.tools import (  # noqa: PLC0415
         strace_timing as _strace_timing,
     )
 
@@ -1451,7 +1455,11 @@ def benchmark(
                     if config is not None:
                         rc = config
                     else:
-                        rc_kwargs: dict[str, Any] = {"platform": platform or compiled.platform}
+                        backend_type, execution_mode = _parse_platform(platform or compiled.platform)
+                        rc_kwargs: dict[str, Any] = {
+                            "backend_type": backend_type,
+                            "execution_mode": execution_mode,
+                        }
                         if device_id is not None:
                             rc_kwargs["device_id"] = device_id
                         rc = RunConfig(**rc_kwargs)

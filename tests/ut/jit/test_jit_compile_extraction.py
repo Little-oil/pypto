@@ -21,13 +21,14 @@ import warnings
 
 import pypto.language as pl
 import pytest
+from pypto.backend import BackendType
 from pypto.compile_profiling import CompileProfiler
 from pypto.ir import OptimizationStrategy, PassDumpLevel
 from pypto.ir.compiled_program import CompiledProgram
 from pypto.jit.decorator import jit
 from pypto.language.parser.diagnostics.exceptions import ParserTypeError
 from pypto.pypto_core import ir, passes
-from pypto.runtime.runner import RunConfig
+from pypto.runtime.runner import ExecutionMode, RunConfig
 
 
 @pytest.fixture(autouse=True)
@@ -600,7 +601,7 @@ class TestAnnotationLayoutReachesTheProgram:
 
         span = exc_info.value.span
         assert span is not None
-        assert span["filename"].endswith("test_jit_compile_extraction.py")
+        assert str(span["filename"]).endswith("test_jit_compile_extraction.py")
 
 
 @jit.incore
@@ -750,7 +751,9 @@ def test_default_and_runtime_only_requests_share_cache(kernel, compile_calls):
         assert kernel.compile() is cached
     assert len(compile_calls) == 1
     kwargs = compile_calls[0][0]
-    assert kwargs["platform"] == "a2a3sim"
+    assert kwargs["backend_type"] == BackendType.Ascend910B
+    assert kwargs["execution_mode"] is ExecutionMode.SIM
+    assert "platform" not in kwargs
     assert kwargs["dump_passes"] is PassDumpLevel.NONE
 
 
@@ -1011,7 +1014,7 @@ def _rebind_plain(
     out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
     BLOCK: pl.constexpr,
 ):
-    BLOCK = 32
+    BLOCK = 32  # pyright: ignore[reportConstantRedefinition] — the rebind is the subject under test
     out[0:BLOCK, 0:128] = pl.add(x[0:BLOCK, 0:128], 1.0)
     return out
 
@@ -1022,7 +1025,7 @@ def _rebind_augmented(
     out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
     BLOCK: pl.constexpr,
 ):
-    BLOCK += 1
+    BLOCK += 1  # pyright: ignore[reportConstantRedefinition] — the rebind is the subject under test
     out[0:BLOCK, 0:128] = pl.add(x[0:BLOCK, 0:128], 1.0)
     return out
 
@@ -1033,7 +1036,7 @@ def _rebind_unpacked(
     out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
     BLOCK: pl.constexpr,
 ):
-    _unused, BLOCK = 1, 32
+    _unused, BLOCK = 1, 32  # pyright: ignore[reportConstantRedefinition] — the rebind is the subject under test
     out[0:BLOCK, 0:128] = pl.add(x[0:BLOCK, 0:128], 1.0)
     return out
 
@@ -1045,7 +1048,7 @@ def _rebind_loop_target(
     BLOCK: pl.constexpr,
 ):
     # PLR1704 is the point: this fixture exists to be refused by the specializer.
-    for BLOCK in pl.range(2):  # noqa: PLR1704
+    for BLOCK in pl.range(2):  # noqa: PLR1704  # pyright: ignore[reportConstantRedefinition] — the rebind is the subject under test
         out[0:64, 0:128] = pl.add(x[0:64, 0:128], 1.0)
     return out
 
@@ -1331,7 +1334,7 @@ class TestConstexprThroughDeps:
             o: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
             BLOCK: pl.constexpr,
         ):
-            BLOCK = BLOCK // 2
+            BLOCK = BLOCK // 2  # pyright: ignore[reportConstantRedefinition] — the rebind is the subject under test
             with pl.at(level=pl.Level.CORE_GROUP):
                 pl.store(pl.load(a, [0, 0], [BLOCK, BLOCK]), [0, 0], o)
             return o
@@ -1402,6 +1405,19 @@ def test_jit_fixture_detects_printer_failure(monkeypatch, pass_verification_inst
     else:
         # Explicit basic/none modes do not request a print/reparse check.
         assert isinstance(add_kernel.lower(x, x, torch.empty_like(x)), ir.Program)
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a2a3sim", "a5", "a5sim"])
+def test_deprecated_and_explicit_target_share_cache(kernel, compile_calls, platform):
+    with pytest.warns(DeprecationWarning, match=r"RunConfig\(platform="):
+        legacy = RunConfig(platform=platform)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        explicit = RunConfig(backend_type=legacy.backend_type, execution_mode=legacy.execution_mode)
+        artifact = kernel.compile(config=explicit)
+        assert kernel.compile(config=legacy) is artifact
+    assert len(compile_calls) == 1
+    assert next(iter(kernel._cache)).platform == platform
 
 
 if __name__ == "__main__":

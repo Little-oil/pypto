@@ -23,6 +23,17 @@
 > 现位于 `split_axis_utils`，由 `LowerAutoVectorSplit` 调用——逐算子改写规则见该 pass
 > 文档。
 
+Lane-1 的 `IfStmt` tile 结果保留原合流结果的布局和填充元数据，并将有效形状设为零；
+后续使用引用重建后的结果变量。分支 tile 可以具有不同的填充元数据，
+因此重放不能要求完整的结构相等，也不能将某个分支的填充属性用作合流结果。
+当两分支的重放 yield 类型一致时，张量结果采用共同类型，保留原 backing view。
+否则非 tile 结果保留原合流类型；对于形状不同的目标张量，
+通过仅修改元数据的 `tensor.view` 别名恢复该契约，不写入目标。
+复用合流类型之前，shape 和 view 表达式会映射到回放 lane 的标量定义，
+避免克隆时错误绑定到 lane 0 的局部变量。
+插入的别名保留在末尾的 runtime 或 AIV-split scope 内，
+保留 scope 属性及 yield 使用的值定义。
+
 ## API
 
 | C++ | Python | 层级 |
@@ -83,7 +94,7 @@ per-lane 形态（由上游 `LowerAutoVectorSplit` + `ExpandMixedKernel` 达成�
 真的后端），函数为 AIV，且 `attrs["dual_aiv_dispatch"]` 为真。
 
 ```text
-1. 克隆参数到 param_replacements。
+1. 保留未改变的签名及参数身份，包括 shape 符号。
 2. InjectSubblockIdx —— 前置 `subblock_idx = tile.get_subblock_idx()`。
 3. 去掉开头的 subblock_idx 赋值，再切出共享 pipe-setup 前缀：
    SplitNoSplitSharedPipeSetupPrefix 取 reserve_buffer / import_peer_buffer /
@@ -92,15 +103,17 @@ per-lane 形态（由上游 `LowerAutoVectorSplit` + `ExpandMixedKernel` 达成�
 4. Lane 0 函数体 = 原分支语句（不变）。
 5. Lane 1 函数体 = BuildNoSplitLane1ReplayStmts(分支语句)：
      - tile.store：丢弃 EvalStmt 形式；对 AssignStmt 形式透传目标 tensor，使 SSA
-       使用者仍见到值，但不发生写入。
+       使用者仍见到值，但不发生写入。别名类型使用目标 tensor 的类型及 shape 符号。
+     - 别名：继承替换值的类型，并传播到后续使用处。
      - 其他产生 TileType 的调用：经 RebuildLane1CallWithZeroValidShape 重写——
-       tile.load 变为 valid_shape=[0, 0] 的 tile.create；tile.slice /
+       tile.load 变为 valid_shape=[0, 0] 的 tile.create；tile.slice / tile.transpose /
+       tile.fmods / tile.rems 也变为空 tile.create，因为它们无法安全处理零有效范围。
        tile.set_validshape 的 valid_shape 置零；其余清空结果 valid_shape。
      - 跨核 tile.tpush_* / tile.tpop_* / system.tfree_* 保留，使 AIC↔AIV 握手对称。
      - For/While/If 以分叉的 replacements 映射递归。
 6. 将 lane 0 / lane 1 包装为 `if subblock_idx == 0: <lane 0> else: <lane 1>`。
 7. 新函数体 = subblock_idx 赋值；提升的共享 pipe-setup；分支 IfStmt。
-8. Substitute / DeepClone；属性不变（dual_aiv_dispatch=True 保留）。
+8. 对函数体执行 DeepClone；属性不变（dual_aiv_dispatch=True 保留）。
 ```
 
 ### Codegen 传输：整列 box、保留行

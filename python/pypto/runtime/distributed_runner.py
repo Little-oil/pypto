@@ -28,9 +28,9 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
-import numpy as np  # pyright: ignore[reportMissingImports]
+import numpy as np
 import torch
 
 from .device_tensor import DeviceTensor, StackedDeviceTensor
@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 # simpler Tensor → torch.Tensor conversion
 # ---------------------------------------------------------------------------
 
-_DTYPE_MAP: dict[str, tuple[type, torch.dtype]] = {
+_DTYPE_MAP: dict[str, tuple[type[ctypes._CData], torch.dtype]] = {
     "FLOAT32": (ctypes.c_float, torch.float32),
     "FLOAT16": (ctypes.c_uint8, torch.float16),
     "BFLOAT16": (ctypes.c_uint8, torch.bfloat16),
@@ -88,9 +88,9 @@ class _DispatchFrame:
 
     slot_id: int
     in_use: bool = False
-    tensors: dict[str, Any] = field(default_factory=dict)
-    keepalive: list[Any] = field(default_factory=list)
-    cleanup: list[Callable[[], None]] = field(default_factory=list)
+    tensors: dict[str, Any] = field(default_factory=dict[str, Any])
+    keepalive: list[Any] = field(default_factory=list[Any])
+    cleanup: list[Callable[[], None]] = field(default_factory=list[Callable[[], None]])
     handle: DistributedRunHandle | None = None
 
 
@@ -258,7 +258,9 @@ class _RetainedDomainLease:
         return False
 
 
-def _tensor_from_continuous(ct) -> torch.Tensor:
+# Reached only through function-scope lazy imports (pyright's unused analysis
+# discounts cross-module references to private symbols).
+def _tensor_from_continuous(ct: Any) -> torch.Tensor:  # pyright: ignore[reportUnusedFunction]
     """Convert a mapped wire arg (or legacy chip tensor) to torch, zero-copy.
 
     Current simpler Python SubWorkers receive ``MappedArg`` objects and expose
@@ -275,7 +277,7 @@ def _tensor_from_continuous(ct) -> torch.Tensor:
     dtype_str = str(ct.dtype)
     dtype_key = dtype_str.rsplit(".", 1)[-1]
     if dtype_key.isdecimal():
-        from simpler.task_interface import DataType  # pyright: ignore[reportMissingImports]  # noqa: PLC0415
+        from simpler.task_interface import DataType  # noqa: PLC0415
 
         dtype_key = DataType(int(dtype_key)).name
     try:
@@ -309,7 +311,8 @@ def _tensor_from_continuous(ct) -> torch.Tensor:
         )
 
     arr = np.ctypeslib.as_array(ctypes.cast(ct.data, ctypes.POINTER(c_type)), shape=(n_c_elements,))
-    t = torch.from_numpy(arr)
+    # torch's stubs leave from_numpy's ndarray item-type parameter unresolved.
+    t = torch.from_numpy(arr)  # pyright: ignore[reportUnknownMemberType]
     if t.dtype != torch_dtype:
         # view(dtype) reinterprets the bytes without copying — preserves shared memory.
         t = t.view(torch_dtype)
@@ -340,7 +343,7 @@ def _load_generated_module(path: Path) -> Any:
     # either, so there is nothing to protect — skip the registration. The
     # import is local so plain ``import pypto`` never requires cloudpickle.
     try:
-        import cloudpickle  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        import cloudpickle  # noqa: PLC0415
 
         cloudpickle.register_pickle_by_value(module)
     except ImportError:
@@ -355,11 +358,12 @@ def _run_directory(compiled: Any) -> Path:
 
 
 def _collect_program_swimlane(compiled: Any) -> None:
-    if vars(compiled).get("_artifact_runtime") is None:
+    artifact_fields = cast("dict[str, Any]", vars(compiled))
+    if artifact_fields.get("_artifact_runtime") is None:
         _collect_l3_swimlane(compiled.output_dir, compiled.platform)
     else:
         _collect_l3_swimlane(
-            vars(compiled)["_artifact_runtime"].directory,
+            artifact_fields["_artifact_runtime"].directory,
             compiled.platform,
             run_directory=_run_directory(compiled),
         )
@@ -371,6 +375,41 @@ def _collect_program_swimlane(compiled: Any) -> None:
 # both paths run identical, expensive setup (_compile_and_assemble, module load,
 # Worker construction + registration) without duplicating it.
 # ---------------------------------------------------------------------------
+
+
+class _ChipCallables(dict[str, Any]):
+    """Chip callables (or registered handles) with their tensor transfer contracts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.host_tensor_indices: dict[str, frozenset[int]] = {}
+
+    def add(self, name: str, value: Any, config: dict[str, Any]) -> None:
+        self[name] = value
+        self.host_tensor_indices[name] = frozenset(config.get("host_tensor_indices", ()))
+
+
+def add_chip_tensor_arg(
+    args: Any,
+    worker: Any,
+    tensor: Any,
+    tag: Any,
+    callables: dict[str, Any],
+    name: str,
+    index: int,
+) -> None:
+    """Pack a chip argument using the callee's emitted host-control contract."""
+    from .tensor_arg import make_tensor_arg  # noqa: PLC0415
+
+    host_slots = callables.host_tensor_indices.get(name, ()) if isinstance(callables, _ChipCallables) else ()
+    if index in host_slots:
+        from simpler.buffer import TensorTransfer  # noqa: PLC0415
+
+        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu":
+            raise ValueError(f"Chip {name!r} host control tensor slot {index} requires a CPU tensor")
+        args.add_tensor(make_tensor_arg(worker, tensor), tag, transfer=TensorTransfer.NONE)
+    else:
+        args.add_tensor(make_tensor_arg(worker, tensor), tag)
 
 
 def _assemble_chip_callables(
@@ -387,12 +426,15 @@ def _assemble_chip_callables(
     artifact_runtime = vars(compiled).get("_artifact_runtime")
     if artifact_runtime is not None:
         chips = artifact_runtime.load()
+        callables = _ChipCallables()
+        for name, (chip_callable, _, config) in chips.items():
+            callables.add(name, chip_callable, config)
         return (
-            {name: value[0] for name, value in chips.items()},
+            callables,
             next(iter(chips.values()))[1],
             any(bool(value[2].get("enable_sdma", False)) for value in chips.values()),
         )
-    chip_callables: dict[str, Any] = {}
+    chip_callables = _ChipCallables()
     runtime_name: str | None = None
     enable_sdma = False
     next_levels_dir = compiled.output_dir / "next_levels"
@@ -408,7 +450,7 @@ def _assemble_chip_callables(
             chip_callable, chip_runtime, chip_runtime_config = _compile_and_assemble(
                 chip_dir, compiled.platform
             )
-            chip_callables[chip_dir.name] = chip_callable
+            chip_callables.add(chip_dir.name, chip_callable, chip_runtime_config)
             enable_sdma = enable_sdma or bool(chip_runtime_config.get("enable_sdma", False))
             if runtime_name is None:
                 runtime_name = chip_runtime
@@ -487,7 +529,7 @@ def _call_alloc_intermediates(alloc_fn: Any, tensors: dict[str, Any], world_size
     signature mismatch and silently retried.
     """
     try:
-        params = inspect.signature(alloc_fn).parameters
+        params = dict(inspect.signature(alloc_fn).parameters)
     except (TypeError, ValueError):  # builtin / C callable with no introspectable signature
         params = {}
     takes_world_size = "world_size" in params or any(
@@ -540,7 +582,7 @@ def _construct_worker(
             f"got {startup_timeout_s!r}"
         )
 
-    from simpler.worker import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+    from simpler.worker import (  # noqa: PLC0415
         Worker,
     )
 
@@ -601,7 +643,11 @@ def _register_callables(
     # ``Any`` here and threaded straight back into ``submit_sub`` /
     # ``submit_next_level``, which accept the handle.
     sub_ids: dict[str, Any] = {name: w.register(fn) for name, fn in sub_worker_fns.items()}
-    chip_cids: dict[str, Any] = {name: w.register(cc) for name, cc in chip_callables.items()}
+    chip_cids = _ChipCallables()
+    for name, cc in chip_callables.items():
+        chip_cids[name] = w.register(cc)
+    if isinstance(chip_callables, _ChipCallables):
+        chip_cids.host_tensor_indices = chip_callables.host_tensor_indices.copy()
     return sub_ids, chip_cids
 
 
@@ -726,8 +772,8 @@ def _make_call_config(
     Raises:
         ValueError: a DFX flag is enabled but *dfx_base* is ``None``.
     """
-    from simpler.task_interface import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-        CallConfig,  # pyright: ignore[reportAttributeAccessIssue]
+    from simpler.task_interface import (  # noqa: PLC0415
+        CallConfig,
     )
 
     call_config = CallConfig()
@@ -938,7 +984,10 @@ def _record_dispatch_program(orch: Any, callable_id: Any, disp_dir: Path) -> Non
         )
 
 
-def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worker: int | None) -> Any:
+# Called from generated host_orch.py code (pyright cannot see those references).
+def _submit_chip(  # pyright: ignore[reportUnusedFunction]
+    orch: Any, callable_id: Any, task_args: Any, config: Any, worker: int | None
+) -> Any:
     """``orch.submit_next_level`` that stamps each dispatch's DFX directory.
 
     The runtime path helpers root every diagnostic artifact at a fixed filename
@@ -977,7 +1026,7 @@ def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worke
     if idx_map is None:
         # Defensive: a caller that bypassed ``orch_fn`` (no reset) still gets
         # per-card isolation, just without a guaranteed two-pass match.
-        idx_map = orch._dfx_dispatch_idx = {}
+        idx_map = orch._dfx_dispatch_idx = cast("dict[str, int]", {})
     rank_label = _dfx_rank_label(worker)
     k = idx_map.get(rank_label, 0)
     idx_map[rank_label] = k + 1
@@ -1037,7 +1086,7 @@ def _read_dispatch_identity(disp_dir: Path) -> dict[str, Any] | None:
         identity = json.loads((disp_dir / _DISPATCH_IDENTITY_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return identity if isinstance(identity, dict) else None
+    return cast("dict[str, Any]", identity) if isinstance(identity, dict) else None
 
 
 def _pair_rank_captures(rank_dir: Path) -> dict[Path, Path]:
@@ -1252,7 +1301,7 @@ def _write_dispatch_name_map(
 
                     table = kernel_name_map(chip_dir)
                 else:
-                    from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+                    from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415
                         load_kernel_config,
                     )
 
@@ -1411,7 +1460,7 @@ def _is_simpler_tensor(arg: Any) -> bool:
     """
     try:
         from .task_interface import (  # noqa: PLC0415
-            Tensor,  # pyright: ignore[reportAttributeAccessIssue]
+            Tensor,
         )
     except ImportError:
         return False
@@ -1432,7 +1481,7 @@ def _make_dispatch_orchestration(
     # binds ``pld.system.world_size()`` to this kwarg uniformly across comm
     # and comm-less paths.
 
-    def orch_fn(orch, _unused_args, _unused_cfg):
+    def orch_fn(orch: Any, _unused_args: Any, _unused_cfg: Any) -> None:
         # Reset the per-card DFX dispatch counter at the start of every run so
         # a card's dispatches are numbered ``d0, d1, ...`` fresh each pass.
         # Two-pass swimlane reissues the same dispatch order, so pass 1
@@ -1509,7 +1558,9 @@ def _dispatch(
     native_handle.result()
 
 
-def _execute_distributed(
+# Reached only through function-scope lazy imports (pyright's unused analysis
+# discounts cross-module references to private symbols).
+def _execute_distributed(  # pyright: ignore[reportUnusedFunction]
     compiled: DistributedCompiledProgram,
     coerced_args: Sequence[torch.Tensor | DeviceTensor | StackedDeviceTensor],
     config: RunConfig | None = None,
@@ -1650,14 +1701,14 @@ def _execute_distributed(
 _EXECUTE_DISTRIBUTED_COMPILED_DEPRECATION = (
     "pypto.runtime.execute_distributed_compiled is deprecated; reconstruct the "
     "artifact and call it: ir.DistributedCompiledProgram.from_dir(output_dir, "
-    "platform=...)(*args, config=...). The directory-driven function will be "
+    "backend_type=..., execution_mode=...)(*args, config=...). The directory-driven function will be "
     "removed in a future release."
 )
 
 
 def execute_distributed_compiled(
     output_dir: str | Path,
-    args: Sequence[torch.Tensor | DeviceTensor | StackedDeviceTensor | ctypes._SimpleCData],
+    args: Sequence[torch.Tensor | DeviceTensor | StackedDeviceTensor | ctypes._SimpleCData[Any]],
     config: RunConfig | None = None,
     *,
     platform: str | None = None,
@@ -1681,7 +1732,12 @@ def execute_distributed_compiled(
         execute_distributed_compiled(work_dir, args, config=cfg, platform="a2a3")
 
         # after
-        ir.DistributedCompiledProgram.from_dir(work_dir, platform="a2a3")(*args, config=cfg)
+        from pypto.backend import BackendType
+        from pypto.runtime import ExecutionMode
+
+        ir.DistributedCompiledProgram.from_dir(
+            work_dir, backend_type=BackendType.Ascend910B, execution_mode=ExecutionMode.ONBOARD,
+        )(*args, config=cfg)
 
     Emits a :class:`DeprecationWarning`; behaviour is unchanged.
 
@@ -2106,12 +2162,12 @@ class DistributedWorker(Worker):
 
     def _accepted_native_handles(self) -> set[Any] | None:
         """Snapshot Simpler's accepted set for interruption recovery."""
-        handles = getattr(self._w, "_accepted_run_handles", None)
+        handles: Any = getattr(self._w, "_accepted_run_handles", None)
         lifecycle_cv = getattr(self._w, "_hierarchical_start_cv", None)
         if not isinstance(handles, set) or lifecycle_cv is None:
             return None
         with lifecycle_cv:
-            return set(handles)
+            return set(cast("set[Any]", handles))
 
     def _recover_accepted_native_handle(self, before: set[Any] | None) -> Any | None:
         """Recover the sole handle accepted while one serialized submit ran."""
@@ -2175,7 +2231,7 @@ class DistributedWorker(Worker):
         if not self._persistent:
             return
         live_domains = getattr(self._w, "_live_domains", None)
-        missing = []
+        missing: list[str] = []
         if not isinstance(live_domains, dict):
             missing.append("_live_domains")
         if not hasattr(self._w, "_building_run_resources"):
@@ -2275,6 +2331,8 @@ class DistributedWorker(Worker):
             raise RuntimeError(
                 "persistent distributed execution requires Simpler's active per-run CommDomain journal"
             )
+        live_domains = cast("dict[str, Any]", live_domains)
+        run_live_domains = cast("dict[str, Any]", run_live_domains)
         with domain_lock:
             if bool(getattr(resources, "retired", False)):
                 raise RuntimeError("persistent CommDomain cannot be retained from an already-retired run")
@@ -2478,9 +2536,9 @@ class DistributedWorker(Worker):
     def malloc(self, nbytes: int, *, worker_id: int = 0) -> int:
         """Allocate ``nbytes`` on chip *worker_id*; returns a device pointer."""
         self._require_open("malloc")
-        if not isinstance(nbytes, int) or nbytes <= 0:
+        if type(nbytes) is not int or nbytes <= 0:
             raise ValueError(f"nbytes must be a positive int, got {nbytes!r}")
-        from simpler.task_interface import DataType  # pyright: ignore[reportMissingImports]  # noqa: PLC0415
+        from simpler.task_interface import DataType  # noqa: PLC0415
 
         handle = self._w.alloc_child_tensor(worker_id, (nbytes,), DataType.UINT8)
         try:
@@ -2601,7 +2659,7 @@ class DistributedWorker(Worker):
         for entry in listed:
             is_marked = isinstance(entry, ReadOnlyHostTensor)
             tensor = entry.tensor if is_marked else entry
-            if not isinstance(tensor, torch.Tensor):
+            if not isinstance(tensor, torch.Tensor):  # pyright: ignore[reportUnnecessaryIsInstance] -- mistyped-input guard
                 raise TypeError(
                     "DistributedWorker inherited_host_tensors entries must be torch.Tensor or "
                     f"ReadOnlyHostTensor objects, got {type(entry).__name__}."
@@ -2636,7 +2694,7 @@ class DistributedWorker(Worker):
         :class:`ReadOnlyHostTensor` keeps READ — which is what lets the ABI refuse a D2H into a
         mapping that would fault on the store.
         """
-        from simpler.buffer import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        from simpler.buffer import (  # noqa: PLC0415
             AccessMode,
             BackendKind,
             mint_owner_instance_id,
@@ -2709,11 +2767,11 @@ class DistributedWorker(Worker):
         """H2D copy: ``nbytes`` from ``src_host_ptr + src_offset`` to ``dst_dev_ptr + dst_offset``."""
         self._require_open("copy_to")
         dst = self._device_buffer(dst_dev_ptr, worker_id, "copy_to")
-        if not isinstance(dst_offset, int) or dst_offset < 0:
+        if type(dst_offset) is not int or dst_offset < 0:
             raise ValueError(f"dst_offset must be a non-negative int, got {dst_offset!r}")
-        if not isinstance(src_offset, int) or src_offset < 0:
+        if type(src_offset) is not int or src_offset < 0:
             raise ValueError(f"src_offset must be a non-negative int, got {src_offset!r}")
-        if not isinstance(nbytes, int) or nbytes <= 0:
+        if type(nbytes) is not int or nbytes <= 0:
             raise ValueError(f"nbytes must be a positive int, got {nbytes!r}")
 
         allocation_nbytes = int(dst.nbytes)
@@ -2755,11 +2813,11 @@ class DistributedWorker(Worker):
         """D2H copy: ``nbytes`` from ``src_dev_ptr + src_offset`` to ``dst_host_ptr + dst_offset``."""
         self._require_open("copy_from")
         src = self._device_buffer(src_dev_ptr, worker_id, "copy_from")
-        if not isinstance(dst_offset, int) or dst_offset < 0:
+        if type(dst_offset) is not int or dst_offset < 0:
             raise ValueError(f"dst_offset must be a non-negative int, got {dst_offset!r}")
-        if not isinstance(src_offset, int) or src_offset < 0:
+        if type(src_offset) is not int or src_offset < 0:
             raise ValueError(f"src_offset must be a non-negative int, got {src_offset!r}")
-        if not isinstance(nbytes, int) or nbytes <= 0:
+        if type(nbytes) is not int or nbytes <= 0:
             raise ValueError(f"nbytes must be a positive int, got {nbytes!r}")
 
         allocation_nbytes = int(src.nbytes)
@@ -2859,7 +2917,7 @@ class DistributedWorker(Worker):
             via :meth:`free_stacked_tensor`.
         """
         self._require_open("alloc_stacked_tensor")
-        if not isinstance(host, torch.Tensor):
+        if not isinstance(host, torch.Tensor):  # pyright: ignore[reportUnnecessaryIsInstance] -- mistyped-input guard
             raise TypeError(
                 f"alloc_stacked_tensor(host=...) expects a torch.Tensor, got {type(host).__name__}"
             )
@@ -2975,11 +3033,11 @@ class DistributedWorker(Worker):
                 through a runtime-owned shared Buffer before copying into it.
         """
         self._require_open("copy_stacked_from")
-        if not isinstance(stacked, StackedDeviceTensor):
+        if type(stacked) is not StackedDeviceTensor:
             raise TypeError(
                 f"copy_stacked_from(stacked=...) expects a StackedDeviceTensor, got {type(stacked).__name__}"
             )
-        if not isinstance(host, torch.Tensor):
+        if not isinstance(host, torch.Tensor):  # pyright: ignore[reportUnnecessaryIsInstance] -- mistyped-input guard
             raise TypeError(f"copy_stacked_from(host=...) expects a torch.Tensor, got {type(host).__name__}")
         if tuple(host.shape) != stacked.full_shape:
             raise ValueError(

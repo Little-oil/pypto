@@ -45,8 +45,8 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 import torch
-from pypto import ir
 from pypto.ir import DistributedConfig
+from pypto.runtime import RunConfig
 
 SIZE = 64
 MAX_RECV = 4
@@ -83,188 +83,173 @@ def _counts_for_call(call: int, nr: int, mr: int) -> list[list[int]]:
 
 
 def _build_reuse_program(n_ranks: int, max_recv: int):
-    """Build the N-rank reuse program: three straight-line exchanges."""
+    """Build the N-rank reuse program: three straight-line exchanges on one set of windows, with skew."""
     nr = n_ranks
     mr = max_recv
     total = nr * mr
 
-    @pl.program
-    class HostAllToAllVReuse:
-        """Three back-to-back exchanges on one set of windows, with skew."""
+    @pl.jit.incore
+    def stage_step(
+        inp: pl.Tensor[[total, SIZE], pl.FP32],
+        stage: pl.Out[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+    ) -> pld.DistributedTensor[[total, SIZE], pl.FP32]:
+        for row in pl.range(total):
+            chunk = pl.load(inp, [row, 0], [1, SIZE])
+            stage = pl.store(chunk, [row, 0], stage)
+        return stage
 
-        @pl.function(type=pl.FunctionType.InCore)
-        def stage_step(
-            self,
-            inp: pl.Tensor[[total, SIZE], pl.FP32],
-            stage: pl.Out[pld.DistributedTensor[[total, SIZE], pl.FP32]],
-        ):
-            for row in pl.range(total):
-                chunk = pl.load(inp, [row, 0], [1, SIZE])
-                stage = pl.store(chunk, [row, 0], stage)
+    @pl.jit
+    def stage_orch(
+        inp: pl.Tensor[[total, SIZE], pl.FP32],
+        stage: pl.Out[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+    ) -> pld.DistributedTensor[[total, SIZE], pl.FP32]:
+        return stage_step(inp, stage)
 
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def stage_orch(
-            self,
-            inp: pl.Tensor[[total, SIZE], pl.FP32],
-            stage: pl.Out[pld.DistributedTensor[[total, SIZE], pl.FP32]],
-        ):
-            self.stage_step(inp, stage)
+    @pl.jit.incore
+    def fill_counts_step(
+        counts_row: pl.Tensor[[nr, 1], pl.INT32],
+        counts: pl.Out[pld.DistributedTensor[[nr, 1], pl.INT32]],
+    ) -> pld.DistributedTensor[[nr, 1], pl.INT32]:
+        for d in pl.range(nr):
+            v = pl.read(counts_row, [d, 0])
+            pl.write(counts, [d, 0], v)
+        return counts
 
-        @pl.function(type=pl.FunctionType.InCore)
-        def fill_counts_step(
-            self,
-            counts_row: pl.Tensor[[nr, 1], pl.INT32],
-            counts: pl.Out[pld.DistributedTensor[[nr, 1], pl.INT32]],
-        ):
-            for d in pl.range(nr):
-                v = pl.read(counts_row, [d, 0])
-                pl.write(counts, [d, 0], v)
+    @pl.jit
+    def fill_counts_orch(
+        counts_row: pl.Tensor[[nr, 1], pl.INT32],
+        counts: pl.Out[pld.DistributedTensor[[nr, 1], pl.INT32]],
+    ) -> pld.DistributedTensor[[nr, 1], pl.INT32]:
+        return fill_counts_step(counts_row, counts)
 
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def fill_counts_orch(
-            self,
-            counts_row: pl.Tensor[[nr, 1], pl.INT32],
-            counts: pl.Out[pld.DistributedTensor[[nr, 1], pl.INT32]],
-        ):
-            self.fill_counts_step(counts_row, counts)
+    @pl.jit.incore
+    def consume_step(
+        data: pld.DistributedTensor[[total, SIZE], pl.FP32],
+        recv_counts: pld.DistributedTensor[[nr, 1], pl.INT32],
+        n_spin: pl.Scalar[pl.INT32],
+        scratch: pl.Out[pl.Tensor[[SCRATCH_ROWS + 1, 1], pl.INT32]],
+        out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
+        recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
+    ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
+        # Rank-skewed slow consumer: burn the GM-store loop BEFORE reading
+        # the window, so a fast rank genuinely overlaps this consumption.
+        # The trailing marker row keeps `n_spin` itself observable even if
+        # the compiler collapses the loop (the loop writes rows
+        # [0, SCRATCH_ROWS) only).
+        pl.write(scratch, [SCRATCH_ROWS, 0], pl.cast(n_spin, pl.INT32))
+        spin_n = pl.cast(n_spin, pl.INDEX)
+        for i in pl.range(spin_n):
+            for j in pl.range(SCRATCH_ROWS):
+                pl.write(scratch, [j, 0], pl.cast(i, pl.INT32))
 
-        @pl.function(type=pl.FunctionType.InCore)
-        def consume_step(
-            self,
-            data: pld.DistributedTensor[[total, SIZE], pl.FP32],
-            recv_counts: pld.DistributedTensor[[nr, 1], pl.INT32],
-            n_spin: pl.Scalar[pl.INT32],
-            scratch: pl.Out[pl.Tensor[[SCRATCH_ROWS + 1, 1], pl.INT32]],
-            out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
-            recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
-        ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
-            # Rank-skewed slow consumer: burn the GM-store loop BEFORE reading
-            # the window, so a fast rank genuinely overlaps this consumption.
-            # The trailing marker row keeps `n_spin` itself observable even if
-            # the compiler collapses the loop (the loop writes rows
-            # [0, SCRATCH_ROWS) only).
-            pl.write(scratch, [SCRATCH_ROWS, 0], pl.cast(n_spin, pl.INT32))
-            spin_n = pl.cast(n_spin, pl.INDEX)
-            for i in pl.range(spin_n):
-                for j in pl.range(SCRATCH_ROWS):
-                    pl.write(scratch, [j, 0], pl.cast(i, pl.INT32))
+        # Mirror the whole window (valid rows checked against golden, tail
+        # rows only to keep `out` fully written — a pl.Out tensor is
+        # write-only on the device).
+        for src in pl.range(nr):
+            n_rows_i32 = pl.read(recv_counts, [src, 0])
+            pl.write(recv_out, [src, 0], n_rows_i32)
+            n_rows = pl.cast(n_rows_i32, pl.INDEX)
+            base = src * mr
+            for r in pl.range(n_rows):
+                flat_row = base + r
+                chunk = pl.load(data, [flat_row, 0], [1, SIZE])
+                out = pl.store(chunk, [flat_row, 0], out)
+            for r in pl.range(n_rows, mr):
+                flat_row = base + r
+                chunk = pl.load(data, [flat_row, 0], [1, SIZE])
+                out = pl.store(chunk, [flat_row, 0], out)
+        return out, recv_out
 
-            # Mirror the whole window (valid rows checked against golden, tail
-            # rows only to keep `out` fully written — a pl.Out tensor is
-            # write-only on the device).
-            for src in pl.range(nr):
-                n_rows_i32 = pl.read(recv_counts, [src, 0])
-                pl.write(recv_out, [src, 0], n_rows_i32)
-                n_rows = pl.cast(n_rows_i32, pl.INDEX)
-                base = src * mr
-                for r in pl.range(n_rows):
-                    flat_row = base + r
-                    chunk = pl.load(data, [flat_row, 0], [1, SIZE])
-                    out = pl.store(chunk, [flat_row, 0], out)
-                for r in pl.range(n_rows, mr):
-                    flat_row = base + r
-                    chunk = pl.load(data, [flat_row, 0], [1, SIZE])
-                    out = pl.store(chunk, [flat_row, 0], out)
-            return out, recv_out
+    @pl.jit
+    def consume_orch(
+        data: pld.DistributedTensor[[total, SIZE], pl.FP32],
+        recv_counts: pld.DistributedTensor[[nr, 1], pl.INT32],
+        n_spin: pl.Scalar[pl.INT32],
+        scratch: pl.Out[pl.Tensor[[SCRATCH_ROWS + 1, 1], pl.INT32]],
+        out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
+        recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
+    ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
+        return consume_step(data, recv_counts, n_spin, scratch, out, recv_out)
 
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def consume_orch(
-            self,
-            data: pld.DistributedTensor[[total, SIZE], pl.FP32],
-            recv_counts: pld.DistributedTensor[[nr, 1], pl.INT32],
-            n_spin: pl.Scalar[pl.INT32],
-            scratch: pl.Out[pl.Tensor[[SCRATCH_ROWS + 1, 1], pl.INT32]],
-            out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
-            recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
-        ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
-            return self.consume_step(data, recv_counts, n_spin, scratch, out, recv_out)
+    @pl.jit.host
+    def host_orch(
+        inputs: pl.Tensor[[N_CALLS, nr, total, SIZE], pl.FP32],
+        send_counts_in: pl.Tensor[[N_CALLS, nr, nr, 1], pl.INT32],
+        scratch: pl.Out[pl.Tensor[[N_CALLS, nr, SCRATCH_ROWS + 1, 1], pl.INT32]],
+        outputs: pl.Out[pl.Tensor[[N_CALLS, nr, total, SIZE], pl.FP32]],
+        recv_outputs: pl.Out[pl.Tensor[[N_CALLS, nr, nr, 1], pl.INT32]],
+    ) -> tuple[pl.Tensor[[N_CALLS, nr, total, SIZE], pl.FP32], pl.Tensor[[N_CALLS, nr, nr, 1], pl.INT32]]:
+        input_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
+        data_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
+        signal_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
+        counts_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
+        recv_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
+        # Windows are RE-BOUND per use (`stage = pld.window(...)` again over
+        # the SAME buffer): the InOut-use discipline kills a variable once a
+        # user-function call consumes it as Out, and every dispatch passes
+        # its window by variable. Fresh views over the same allocation keep
+        # the memory shared while each call gets a clean binding — the same
+        # idiom the single-shot HOST ST uses inside its dispatch loops.
+        #
+        # All three invocations share one set of buffers: the signal credits
+        # accumulate across them, counts are restaged in place, and the data
+        # window is overwritten — the exact window lifecycle the two
+        # barriers protect.
 
-        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
-        def host_orch(
-            self,
-            inputs: pl.Tensor[[N_CALLS, nr, total, SIZE], pl.FP32],
-            send_counts_in: pl.Tensor[[N_CALLS, nr, nr, 1], pl.INT32],
-            scratch: pl.Out[pl.Tensor[[N_CALLS, nr, SCRATCH_ROWS + 1, 1], pl.INT32]],
-            outputs: pl.Out[pl.Tensor[[N_CALLS, nr, total, SIZE], pl.FP32]],
-            recv_outputs: pl.Out[pl.Tensor[[N_CALLS, nr, nr, 1], pl.INT32]],
-        ) -> tuple[pl.Tensor[[N_CALLS, nr, total, SIZE], pl.FP32], pl.Tensor[[N_CALLS, nr, nr, 1], pl.INT32]]:
-            input_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
-            data_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
-            signal_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
-            counts_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
-            recv_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
-            # Windows are RE-BOUND per use (`stage = pld.window(...)` again over
-            # the SAME buffer): the InOut-use discipline kills a variable once a
-            # user-function call consumes it as Out, and every dispatch passes
-            # its window by variable. Fresh views over the same allocation keep
-            # the memory shared while each call gets a clean binding — the same
-            # idiom the single-shot HOST ST uses inside its dispatch loops.
-            #
-            # All three invocations share one set of buffers: the signal credits
-            # accumulate across them, counts are restaged in place, and the data
-            # window is overwritten — the exact window lifecycle the two
-            # barriers protect.
-
-            # --- invocation 0: one row per destination -------------------
-            for r in pl.range(pld.world_size()):
-                stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
-                self.stage_orch(inputs[0, r], stage, device=r)
-            for r in pl.range(pld.world_size()):
-                counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
-                self.fill_counts_orch(send_counts_in[0, r], counts, device=r)
+        # --- invocation 0: one row per destination -------------------
+        for r in pl.range(pld.world_size()):
             stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
-            data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
-            signal = pld.window(signal_buf, [nr, 1], dtype=pl.INT32)
+            stage_orch(inputs[0, r], stage, device=r)
+        for r in pl.range(pld.world_size()):
             counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
-            recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
-            data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv)
-            for r in pl.range(pld.world_size()):
-                spin = (pld.world_size() - 1 - r) * _SKEW_PER_CALL[0]
-                self.consume_orch(
-                    data, recv, spin, scratch[0, r], outputs[0, r], recv_outputs[0, r], device=r
-                )
+            fill_counts_orch(send_counts_in[0, r], counts, device=r)
+        stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
+        data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
+        signal = pld.window(signal_buf, [nr, 1], dtype=pl.INT32)
+        counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
+        recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
+        data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv)
+        for r in pl.range(pld.world_size()):
+            spin = (pld.world_size() - 1 - r) * _SKEW_PER_CALL[0]
+            consume_orch(data, recv, spin, scratch[0, r], outputs[0, r], recv_outputs[0, r], device=r)
 
-            # --- invocation 1: full MAX_RECV push ------------------------
-            for r in pl.range(pld.world_size()):
-                stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
-                self.stage_orch(inputs[1, r], stage, device=r)
-            for r in pl.range(pld.world_size()):
-                counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
-                self.fill_counts_orch(send_counts_in[1, r], counts, device=r)
+        # --- invocation 1: full MAX_RECV push ------------------------
+        for r in pl.range(pld.world_size()):
             stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
-            data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
-            signal = pld.window(signal_buf, [nr, 1], dtype=pl.INT32)
+            stage_orch(inputs[1, r], stage, device=r)
+        for r in pl.range(pld.world_size()):
             counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
-            recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
-            data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv)
-            for r in pl.range(pld.world_size()):
-                spin = (pld.world_size() - 1 - r) * _SKEW_PER_CALL[1]
-                self.consume_orch(
-                    data, recv, spin, scratch[1, r], outputs[1, r], recv_outputs[1, r], device=r
-                )
+            fill_counts_orch(send_counts_in[1, r], counts, device=r)
+        stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
+        data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
+        signal = pld.window(signal_buf, [nr, 1], dtype=pl.INT32)
+        counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
+        recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
+        data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv)
+        for r in pl.range(pld.world_size()):
+            spin = (pld.world_size() - 1 - r) * _SKEW_PER_CALL[1]
+            consume_orch(data, recv, spin, scratch[1, r], outputs[1, r], recv_outputs[1, r], device=r)
 
-            # --- invocation 2: mixed / over-capacity counts --------------
-            for r in pl.range(pld.world_size()):
-                stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
-                self.stage_orch(inputs[2, r], stage, device=r)
-            for r in pl.range(pld.world_size()):
-                counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
-                self.fill_counts_orch(send_counts_in[2, r], counts, device=r)
+        # --- invocation 2: mixed / over-capacity counts --------------
+        for r in pl.range(pld.world_size()):
             stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
-            data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
-            signal = pld.window(signal_buf, [nr, 1], dtype=pl.INT32)
+            stage_orch(inputs[2, r], stage, device=r)
+        for r in pl.range(pld.world_size()):
             counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
-            recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
-            data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv)
-            for r in pl.range(pld.world_size()):
-                spin = (pld.world_size() - 1 - r) * _SKEW_PER_CALL[2]
-                self.consume_orch(
-                    data, recv, spin, scratch[2, r], outputs[2, r], recv_outputs[2, r], device=r
-                )
+            fill_counts_orch(send_counts_in[2, r], counts, device=r)
+        stage = pld.window(input_buf, [total, SIZE], dtype=pl.FP32)
+        data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
+        signal = pld.window(signal_buf, [nr, 1], dtype=pl.INT32)
+        counts = pld.window(counts_buf, [nr, 1], dtype=pl.INT32)
+        recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
+        data = pld.tensor.all_to_all_v(stage, data, signal, counts, recv)
+        for r in pl.range(pld.world_size()):
+            spin = (pld.world_size() - 1 - r) * _SKEW_PER_CALL[2]
+            consume_orch(data, recv, spin, scratch[2, r], outputs[2, r], recv_outputs[2, r], device=r)
 
-            return outputs, recv_outputs
+        return outputs, recv_outputs
 
-    return HostAllToAllVReuse
+    return host_orch
 
 
 class TestL3HostTensorAllToAllVReuse:
@@ -278,12 +263,6 @@ class TestL3HostTensorAllToAllVReuse:
         nr = n_ranks
         mr = MAX_RECV
         total = nr * mr
-
-        compiled = ir.compile(
-            _build_reuse_program(nr, mr),
-            platform=test_config.platform,
-            distributed_config=DistributedConfig(device_ids=device_ids[:nr], num_sub_workers=0),
-        )
 
         # Per-call payloads: distinct constant offsets keep every (call, sender,
         # destination, row) value unique, so a value written by the WRONG
@@ -305,7 +284,26 @@ class TestL3HostTensorAllToAllVReuse:
         scratch = torch.zeros((N_CALLS, nr, SCRATCH_ROWS + 1, 1), dtype=torch.int32)
         outputs = torch.zeros((N_CALLS, nr, total, SIZE), dtype=torch.float32)
         recv_outputs = torch.zeros((N_CALLS, nr, nr, 1), dtype=torch.int32)
-        compiled(inputs, send_counts_in, scratch, outputs, recv_outputs)
+
+        compiled = _build_reuse_program(nr, mr).compile(
+            inputs,
+            send_counts_in,
+            scratch,
+            outputs,
+            recv_outputs,
+            config=RunConfig(
+                platform=test_config.platform,
+                distributed_config=DistributedConfig(device_ids=device_ids[:nr], num_sub_workers=0),
+            ),
+        )
+        compiled(
+            inputs,
+            send_counts_in,
+            scratch,
+            outputs,
+            recv_outputs,
+            config=RunConfig(platform=test_config.platform),
+        )
 
         for k in range(N_CALLS):
             for rank in range(nr):

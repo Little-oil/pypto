@@ -1,5 +1,9 @@
 # Functions and Program Structure
 
+> **Legacy Python API examples:** `platform=` calls on this page are retained for
+> compatibility. They emit `DeprecationWarning`; new code should use
+> `backend_type` and `execution_mode`. See the [target mapping](../08-entry-points.md#legacy-platform-examples).
+
 Function declaration forms, parameter directions, cross-module reuse, and how to
 print IR back to Python syntax.
 
@@ -10,9 +14,11 @@ holding only `pl` and `pld`, so any name it inherits from its own module or an
 enclosing function must be replaced, at its use site, by source text that
 evaluates back to the same value. That covers literals (`int`, `float`, `bool`,
 `str`, `None`), the `pl` dtype and enum constants (`pl.INT8`, `pl.Mem.Vec`,
-`pl.PadValue.zero`, `pl.NZ`), and lists/tuples nested from those — a shape or a
-rounding mode held in a constant, for instance. A value with no source form is
-left alone, so the name survives and the parser reports it.
+`pl.PadValue.zero`, `pl.NZ`), distributed enum constants (`pld.ReduceOp.Max`,
+`pld.NotifyOp.AtomicAdd`, `pld.WaitCmp.Ge`), and lists/tuples nested from those —
+a shape, rounding mode, or collective reduction selected by a factory, for instance.
+A value with no source form is left alone, so the name survives and the parser
+reports it.
 
 Every name that folds is also in the compilation key, including constants used by
 transitive JIT helpers and source annotations. The key hashes the *emitted text*

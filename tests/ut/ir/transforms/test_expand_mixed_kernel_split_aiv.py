@@ -161,7 +161,7 @@ def test_aiv_shard_folds_into_cube_to_vector_boundary():
 
 
 def _build_aic_gather_program():
-    """half2[64,128]Vec --aic_gather(split=1)--> full[128,128], move->Left, matmul."""
+    """half2[64,128]Vec --aic_gather(split=1)--> full[128,128]Mat, move->Left, matmul."""
     span = ir.Span.unknown()
     a = ir.Var("a", _tile([64, 128], mem=MS.Vec), span)
     b = ir.Var("b", _tile([128, 128], mem=MS.Right), span)
@@ -172,7 +172,7 @@ def _build_aic_gather_program():
     half2 = ir.Var("half2", _tile(add.type.shape, add.type.tile_view, MS.Vec), span)
     gather = T.aic_gather(half2, split=1, span=span)
     assert isinstance(gather.type, ir.TileType)
-    full = ir.Var("full", _tile(gather.type.shape, gather.type.tile_view, MS.Vec), span)
+    full = ir.Var("full", _tile(gather.type.shape, gather.type.tile_view, MS.Mat), span)
     move_left = T.move(full, MS.Left, span=span)
     assert isinstance(move_left.type, ir.TileType)
     full_left = ir.Var("full_left", _tile(move_left.type.shape, move_left.type.tile_view, MS.Left), span)
@@ -807,19 +807,20 @@ class _UnplacedNotifyBefore:
 class _WrapNotifyBody(ir.IRMutator):
     """Model pass 23 output using a region, preserving the existing golden body."""
 
-    def visit_function(self, op):
-        stmts = list(op.body.stmts)
+    def visit_function(self, func):
+        assert isinstance(func.body, ir.SeqStmts)  # the pass models a multi-stmt body
+        stmts = list(func.body.stmts)
         region = ir.SplitAivScopeStmt(
-            split=ir.SplitMode.UP_DOWN, body=ir.SeqStmts(stmts[:-1], op.span), span=op.span
+            split=ir.SplitMode.UP_DOWN, body=ir.SeqStmts(stmts[:-1], func.span), span=func.span
         )
         return ir.Function(
-            op.name,
-            list(zip(op.params, op.param_directions)),
-            op.return_types,
-            ir.SeqStmts([region, stmts[-1]], op.span),
-            op.span,
-            op.func_type,
-            attrs=dict(op.attrs),
+            func.name,
+            list(zip(func.params, func.param_directions)),
+            func.return_types,
+            ir.SeqStmts([region, stmts[-1]], func.span),
+            func.span,
+            func.func_type,
+            attrs=dict(func.attrs),
         )
 
 
