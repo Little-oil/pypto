@@ -562,6 +562,51 @@ class ScopedRebind:
     assert "__pypto_l2_hint_begin store" not in mlir
 
 
+@pytest.mark.parametrize(
+    "policy",
+    [pl.CachePolicy.NORMAL_FIRST_VICTIM, pl.CachePolicy.NORMAL_LAST_VICTIM, pl.CachePolicy.NORMAL_PERSISTENT],
+)
+@pytest.mark.parametrize("loop_kind", ["for", "while"])
+@pytest.mark.parametrize("read_kind", ["explicit", "explicit_default", "synthesized"])
+def test_scope_cache_policy_survives_loop_results(policy, loop_kind, read_kind):
+    loop = (
+        "for i, (carried,) in pl.range(steps, init_values=(out,)):"
+        if loop_kind == "for"
+        else "for i, carried in pl.while_(init_values=(0, out)):\n                pl.cond(i < steps)"
+    )
+    yielded = "out = pl.yield_(updated)" if loop_kind == "for" else "_i, out = pl.yield_(i + 1, updated)"
+    read = {
+        "explicit": "pl.load(out, [0, 0], [32, 32])",
+        "explicit_default": "pl.load(out, [0, 0], [32, 32], cache=pl.CachePolicy.DEFAULT)",
+        "synthesized": "pl.add(out, x)",
+    }[read_kind]
+    write = (
+        "pl.assemble(out, second, [0, 0])" if read_kind == "synthesized" else "pl.store(second, [0, 0], out)"
+    )
+    program = pl.parse_program(f"""
+@pl.program
+class ScopedLoopRebind:
+    @pl.function
+    def main(self, x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+             steps: pl.Scalar[pl.INT32]) -> pl.Tensor[[32, 32], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP):
+            pl.set_cache_policy(out, pl.CachePolicy.{policy.name})
+            out = pl.assemble(out, pl.add(x, x), [0, 0])
+            {loop}
+                updated = pl.assemble(carried, pl.add(carried, x), [0, 0])
+                {yielded}
+            second = {read}
+            out = {write}
+        return out
+""")
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend950)
+    mlir = _incore_mlir(program)
+    expected = 1 if read_kind == "explicit_default" else 2
+    assert mlir.count(f"__pypto_l2_hint_begin load {_LOAD_HINTS[policy]}") == expected
+    assert "__pypto_l2_hint_begin store" not in mlir
+
+
 @pytest.mark.parametrize("hint", _LOAD_POLICIES[2:])
 def test_a2a3_rejects_all_explicit_load_hints(hint):
     @pl.program

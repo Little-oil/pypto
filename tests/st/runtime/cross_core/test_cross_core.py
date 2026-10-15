@@ -1026,7 +1026,11 @@ def _scope_rebind_run(_st_case, test_runner, tmp_path, monkeypatch):
 )
 def test_scope_cache_policy_survives_gm_rebinding(_scope_rebind_run, policy, explicit_default):
     """Check inherited ISA modes as well as values after assemble/store rebindings."""
-    case_run, work_dir = _scope_rebind_run
+    _assert_scope_rebind_hints(_scope_rebind_run, policy, explicit_default)
+
+
+def _assert_scope_rebind_hints(scope_rebind_run, policy, explicit_default):
+    case_run, work_dir = scope_rebind_run
     case_run.assert_passed()
     sources = list((work_dir / "kernels").rglob("*.cpp"))
     assert sources, "the compiled case must retain its kernel sources"
@@ -1038,6 +1042,87 @@ def test_scope_cache_policy_survives_gm_rebinding(_scope_rebind_run, policy, exp
     }[policy]
     assert cpp.count(f"TLOAD<pto::TLoadL2Hint::{hint}>") == (1 if explicit_default else 2)
     assert "TSTORE<pto::TStoreL2Hint" not in cpp, "scope policies govern reads only"
+
+
+def _scope_loop_rebind_case(policy, planner, explicit_default, use_while, steps):
+    override = pl.CachePolicy.DEFAULT if explicit_default else None
+
+    @pl.jit.inline
+    def for_rebind(
+        x: pl.Tensor[[32, 32], pl.FP32],
+        out: pl.Tensor[[32, 32], pl.FP32],
+        limit: pl.Scalar[pl.INT32],
+    ):
+        for i, (carried,) in pl.range(limit, init_values=(out,)):
+            updated = pl.assemble(carried, pl.add(carried, x), [0, 0])
+            out = pl.yield_(updated)
+        return out
+
+    @pl.jit.inline
+    def while_rebind(
+        x: pl.Tensor[[32, 32], pl.FP32],
+        out: pl.Tensor[[32, 32], pl.FP32],
+        limit: pl.Scalar[pl.INT32],
+    ):
+        for i, carried in pl.while_(init_values=(0, out)):
+            pl.cond(i < limit)
+            updated = pl.assemble(carried, pl.add(carried, x), [0, 0])
+            _i, out = pl.yield_(i + 1, updated)
+        return out
+
+    rebind = while_rebind if use_while else for_rebind
+
+    @pl.jit
+    def scoped_loop_rebind(
+        x: pl.Tensor[[32, 32], pl.FP32],
+        counts: pl.Tensor[[1], pl.INT32],
+        out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    ):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            pl.set_cache_policy(out, policy)
+            out = pl.assemble(out, pl.add(x, x), [0, 0])
+            limit = pl.read(counts, [0])
+            out = rebind(x, out, limit)
+            second = pl.load(out, [0, 0], [32, 32], cache=override)
+            out = pl.store(pl.add(second, second), [0, 0], out)
+        return out
+
+    kind = "while" if use_while else "for"
+    name = f"l2_scope_loop_{kind}_{steps}_{policy.name}_{explicit_default}_{planner.name}"
+    x = (torch.arange(32 * 32).reshape(32, 32) % 127 - 63).float()
+    case = st.case(
+        scoped_loop_rebind,
+        x,
+        torch.tensor([steps], dtype=torch.int32),
+        torch.full_like(x, float("nan")),
+        name=name,
+        golden=lambda tensors: tensors["x"] * (4 + 2 * steps),
+        memory_planner=planner,
+        rtol=0.0,
+        atol=0.0,
+    )
+    return pytest.param(policy, explicit_default, case, id=name)
+
+
+@pytest.mark.platforms("a5", "a5sim")
+@pytest.mark.parametrize(
+    "policy, explicit_default, _st_case",
+    [
+        _scope_loop_rebind_case(policy, planner, explicit_default, use_while, steps)
+        for policy in (
+            pl.CachePolicy.NORMAL_FIRST_VICTIM,
+            pl.CachePolicy.NORMAL_LAST_VICTIM,
+            pl.CachePolicy.NORMAL_PERSISTENT,
+        )
+        for planner in (MemoryPlanner.PYPTO, MemoryPlanner.PTOAS)
+        for explicit_default in (False, True)
+        for use_while in (False, True)
+        for steps in (0, 2)
+    ],
+)
+def test_scope_cache_policy_survives_loop_results(_scope_rebind_run, policy, explicit_default):
+    """Check zero/multiple iterations and ISA hints after for/while GM results."""
+    _assert_scope_rebind_hints(_scope_rebind_run, policy, explicit_default)
 
 
 def _acc_store_cache_case(policy, planner, quantized, with_relu):

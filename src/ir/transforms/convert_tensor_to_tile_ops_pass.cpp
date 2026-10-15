@@ -1266,21 +1266,26 @@ class TensorToTileMutator : public TypePropagatingMutator {
   }
 
  private:
-  /// Stores return a new SSA handle to their destination's GM storage. Keep
-  /// scope read policies on that handle, without applying them to the store.
-  void InheritCachePolicy(const VarPtr& var, const ExprPtr& value) {
-    if (cache_policies_.empty() || !AsTensorTypeLike(var->GetType())) return;
+  std::optional<int> GetCachePolicy(const ExprPtr& value) const {
+    if (cache_policies_.empty()) return std::nullopt;
     auto source = value;
     if (auto call = As<Call>(value)) {
       auto index = ResultAliasedArgIndex(call);
-      if (!index) return;
+      if (!index) return std::nullopt;
       source = call->args_[*index];
     }
     auto root = ResolveToRootParam(source);
-    if (!root) return;
+    if (!root) return std::nullopt;
     auto policy = cache_policies_.find(root.get());
-    if (policy != cache_policies_.end()) {
-      cache_policies_.insert_or_assign(var.get(), policy->second);
+    return policy == cache_policies_.end() ? std::nullopt : std::optional<int>(policy->second);
+  }
+
+  /// Stores return a new SSA handle to their destination's GM storage. Keep
+  /// scope read policies on that handle, without applying them to the store.
+  void InheritCachePolicy(const VarPtr& var, const ExprPtr& value) {
+    if (!AsTensorTypeLike(var->GetType())) return;
+    if (auto policy = GetCachePolicy(value)) {
+      cache_policies_.insert_or_assign(var.get(), *policy);
     }
   }
 
@@ -1340,7 +1345,23 @@ class TensorToTileMutator : public TypePropagatingMutator {
         loop->iter_args_[i] = std::move(new_iter);
       }
     }
-    stmts.push_back(TypePropagatingMutator::VisitStmt_(LoopPtr(loop)));
+    auto converted = std::dynamic_pointer_cast<typename LoopPtr::element_type>(
+        TypePropagatingMutator::VisitStmt_(LoopPtr(loop)));
+    INTERNAL_CHECK_SPAN(converted, op->span_) << "Internal error: loop conversion changed statement kind";
+    if (!cache_policies_.empty()) {
+      auto yield = transform_utils::GetLastYieldStmt(converted->body_);
+      if (yield) {
+        for (size_t i = 0; i < converted->return_vars_.size() && i < yield->value_.size(); ++i) {
+          // A zero-trip loop returns its initializer. Only propagate a policy
+          // shared by both that value and the yielded GM handle.
+          auto initial_policy = GetCachePolicy(converted->iter_args_[i]->initValue_);
+          if (initial_policy && initial_policy == GetCachePolicy(yield->value_[i])) {
+            InheritCachePolicy(converted->return_vars_[i], yield->value_[i]);
+          }
+        }
+      }
+    }
+    stmts.push_back(converted);
     for (const auto& iter : op->iter_args_) var_remap_.erase(iter.get());
     yield_tile_targets_ = std::move(saved_targets);
     return SeqStmts::Flatten(std::move(stmts), op->span_);
