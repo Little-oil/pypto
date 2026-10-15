@@ -531,6 +531,37 @@ class ReadWritePolicy:
         assert "pto.tload" in _incore_mlir(program)
 
 
+@pytest.mark.parametrize(
+    "policy",
+    [pl.CachePolicy.NORMAL_FIRST_VICTIM, pl.CachePolicy.NORMAL_LAST_VICTIM, pl.CachePolicy.NORMAL_PERSISTENT],
+)
+@pytest.mark.parametrize("explicit_default", [False, True])
+def test_scope_cache_policy_survives_assemble_and_store_rebindings(policy, explicit_default):
+    override = ", cache=pl.CachePolicy.DEFAULT" if explicit_default else ""
+    program = pl.parse_program(f"""
+@pl.program
+class ScopedRebind:
+    @pl.function
+    def main(self, x: pl.Tensor[[32, 32], pl.FP32], out: pl.Out[pl.Tensor[[32, 32], pl.FP32]]
+             ) -> pl.Tensor[[32, 32], pl.FP32]:
+        with pl.at(level=pl.Level.CORE_GROUP):
+            pl.set_cache_policy(out, pl.CachePolicy.{policy.name})
+            value = pl.add(x, x)
+            out = pl.assemble(out, value, [0, 0])
+            first = pl.load(out, [0, 0], [32, 32])
+            out = pl.store(pl.add(first, first), [0, 0], out)
+            alias = out
+            second = pl.load(alias, [0, 0], [32, 32]{override})
+            out = pl.store(second, [0, 0], alias)
+        return out
+""")
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend950)
+    mlir = _incore_mlir(program)
+    assert mlir.count(f"__pypto_l2_hint_begin load {_LOAD_HINTS[policy]}") == (1 if explicit_default else 2)
+    assert "__pypto_l2_hint_begin store" not in mlir
+
+
 @pytest.mark.parametrize("hint", _LOAD_POLICIES[2:])
 def test_a2a3_rejects_all_explicit_load_hints(hint):
     @pl.program
@@ -638,7 +669,8 @@ def test_l2_hints_stay_with_transfers_in_control_flow(tmp_path, planner, load_hi
 
 @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])
 @pytest.mark.parametrize("with_relu", [False, True])
-def test_store_l2_hint_preserves_epilogue_with_stock_ptoas(tmp_path, planner, with_relu):
+@pytest.mark.parametrize("policy", _STORE_POLICIES)
+def test_store_l2_hint_preserves_epilogue_with_stock_ptoas(tmp_path, planner, with_relu, policy):
     if find_ptoas_binary() is None:
         pytest.skip("PTOAS is not available")
 
@@ -664,17 +696,24 @@ def test_store_l2_hint_preserves_epilogue_with_stock_ptoas(tmp_path, planner, wi
                 atomic=pl.AtomicType.Add,
                 pre_quant=1.0 / 1024,
                 pre_relu=with_relu,
-                cache=pl.CachePolicy.NORMAL_PERSISTENT,
+                cache=policy,
             )
 
     backend.reset_for_testing()
     backend.set_backend_type(BackendType.Ascend950)
     with passes.PassContext([], memory_planner=planner):
         optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(HintedWriteback)
+    if policy not in (pl.CachePolicy.DEFAULT, pl.CachePolicy.NORMAL_FIRST_VICTIM):
+        with pytest.raises(ValueError, match="ACC stores ignore l2Control"):
+            codegen.PTOCodegen().generate(optimized, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS)
+        return
     mlir = codegen.PTOCodegen().generate(optimized, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS)
     cpp = pto_backend._compile_pto_module(mlir, "hinted_writeback", str(tmp_path), planner)
     store = next(line for line in cpp.splitlines() if "TSTORE<" in line)
-    assert "TSTORE<pto::TStoreL2Hint::NormalPersistent," in store
+    if policy == pl.CachePolicy.NORMAL_FIRST_VICTIM:
+        assert "TSTORE<pto::TStoreL2Hint::NormalFirstVictim," in store
+    else:
+        assert "TStoreL2Hint" not in store
     assert "AtomicType::AtomicAdd" in store
     assert ("ReluPreMode::NormalRelu" in store) == with_relu
     assert store.rsplit(">(", 1)[1].count(",") == 2  # Destination, accumulator, packed scale.
@@ -703,7 +742,7 @@ def test_store_l2_hint_preserves_phase_in_pto_ir(planner):
             rhs = pl.load(y, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
             acc = pl.tile.gemv(lhs, rhs, acc_phase=pl.AccPhase.Final)
             return pl.store(
-                acc, [0, 0], out, st_phase=pl.STPhase.Final, cache=pl.CachePolicy.NORMAL_PERSISTENT
+                acc, [0, 0], out, st_phase=pl.STPhase.Final, cache=pl.CachePolicy.NORMAL_FIRST_VICTIM
             )
 
     backend.reset_for_testing()
@@ -713,7 +752,7 @@ def test_store_l2_hint_preserves_phase_in_pto_ir(planner):
     mlir = codegen.PTOCodegen().generate(optimized, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS)
     store = next(line for line in mlir.splitlines() if "pto.tstore" in line)
     assert "stPhase = #pto<st_phase final>" in store
-    assert "__pypto_l2_hint_begin store NormalPersistent" in mlir
+    assert "__pypto_l2_hint_begin store NormalFirstVictim" in mlir
 
 
 @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])

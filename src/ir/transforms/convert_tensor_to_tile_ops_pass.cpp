@@ -248,8 +248,8 @@ bool IsPassthroughTensorOp(const CallPtr& call) {
   return IsOp(call, "tensor.dim") || IsOp(call, "tensor.view");
 }
 
-/// Declared GM cache policy per source tensor, keyed by the param Var the
-/// declaration resolved to. ``CachePolicy`` stored as ``int``, the type the
+/// Declared GM cache policy per source tensor, including SSA aliases of the
+/// parameter the declaration resolved to. ``CachePolicy`` stored as ``int``, the type the
 /// ``tile.load`` ``cache`` kwarg is registered with.
 using CachePolicyByParam = std::unordered_map<const Var*, int>;
 
@@ -1227,6 +1227,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
     auto tile_name = MakeTileValueName(op->var_->name_hint_);
     auto tile_var = std::make_shared<Var>(tile_name, new_result->GetType(), op->var_->span_);
     RecordPackedTile(tile_var, new_result);
+    InheritCachePolicy(tile_var, new_result);
     stmts.push_back(std::make_shared<AssignStmt>(tile_var, new_result, op->span_));
     var_remap_[op->var_.get()] = tile_var;
 
@@ -1265,6 +1266,24 @@ class TensorToTileMutator : public TypePropagatingMutator {
   }
 
  private:
+  /// Stores return a new SSA handle to their destination's GM storage. Keep
+  /// scope read policies on that handle, without applying them to the store.
+  void InheritCachePolicy(const VarPtr& var, const ExprPtr& value) {
+    if (cache_policies_.empty() || !AsTensorTypeLike(var->GetType())) return;
+    auto source = value;
+    if (auto call = As<Call>(value)) {
+      auto index = ResultAliasedArgIndex(call);
+      if (!index) return;
+      source = call->args_[*index];
+    }
+    auto root = ResolveToRootParam(source);
+    if (!root) return;
+    auto policy = cache_policies_.find(root.get());
+    if (policy != cache_policies_.end()) {
+      cache_policies_.insert_or_assign(var.get(), policy->second);
+    }
+  }
+
   /// Track packed storage in O(N); views can inherit pitch absent from TileView.
   void RecordPackedTile(const VarPtr& var, const ExprPtr& value) {
     auto type = As<TileType>(var->GetType());
@@ -1293,6 +1312,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
     INTERNAL_CHECK_SPAN(assign, op->span_)
         << "Internal error: pass-through assignment must stay an assignment";
     RecordPackedTile(assign->var_, assign->value_);
+    InheritCachePolicy(assign->var_, assign->value_);
     return result;
   }
 
@@ -1651,9 +1671,8 @@ class TensorToTileMutator : public TypePropagatingMutator {
   std::unordered_map<const Expr*, ExprPtr> preloaded_tiles_;
   ConversionContext conversion_context_;
   std::vector<bool> yield_tile_targets_;
-  /// Declared GM cache policies of this function's params (empty when the
-  /// function carries no ``pl.set_cache_policy`` declaration).
-  const CachePolicyByParam cache_policies_;
+  /// Scope read policies, extended to destination aliases as they are converted.
+  CachePolicyByParam cache_policies_;
 };
 
 bool ExprUsesVar(const ExprPtr& expr, const Var* target) {

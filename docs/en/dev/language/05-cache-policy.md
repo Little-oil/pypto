@@ -40,6 +40,12 @@ cache-line state, Clean retains an existing line but marks it clean so eviction
 requires no writeback, and Drop discards an existing line at the same address.
 The store interface exposes only the Clean non-allocate mode.
 
+With the pinned PTO-ISA, A5 ACC-to-GM stores support only DEFAULT and
+NORMAL_FIRST_VICTIM. Other store policies are rejected before dispatch because
+the ISA's ACC path ignores `l2Control`, including ReLU and quantized writeback
+([PTO-ISA #349](https://github.com/hw-native-sys/pto-isa/issues/349)). The store
+modes in the table apply to Vec-to-GM transfers.
+
 On A2/A3, load DEFAULT/BYPASS keeps the existing implementation: BYPASS carries
 the runtime nocache offset to PTOAS, which adjusts that load's source address.
 Only DEFAULT is supported for stores. The six additional policies are rejected
@@ -58,6 +64,8 @@ out = pl.store(retained, [0, 0], out, cache=pl.CachePolicy.NOT_ALLOC_CLEAN)
 `pl.set_cache_policy`; the scope interface accepts the same enum and governs
 reads only. Non-allocating scope declarations require read-only tensors.
 Stores are controlled explicitly on `pl.store`, not by scope declarations.
+Scope read policies follow GM destination handles returned by `pl.assemble`
+and `pl.store`; an explicit policy on a later load still takes precedence.
 
 **Integration:** the IR carries semantic integer `cache` kwargs. A2/A3 uses
 PTOAS's existing bypass attribute and explicit offset operand. On A5, PyPTO

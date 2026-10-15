@@ -91,6 +91,13 @@ static std::optional<std::string> GetIsaCacheHint(const CallPtr& op, codegen::PT
         << " is only supported on A5; A2/A3 supports load DEFAULT/BYPASS and store DEFAULT";
     return std::nullopt;
   }
+  if (store && policy != ir::CachePolicy::kNormalFirstVictim) {
+    auto tile_type = As<ir::TileType>(op->args_[0]->GetType());
+    CHECK_SPAN(!tile_type || tile_type->memory_space_ != ir::MemorySpace::Acc, op->span_)
+        << "A5 ACC-to-GM store cache policy " << ir::CachePolicyToString(policy)
+        << " is not supported by the pinned PTO-ISA: ACC stores ignore l2Control; "
+           "use CachePolicy.DEFAULT or CachePolicy.NORMAL_FIRST_VICTIM";
+  }
   switch (policy) {
     case ir::CachePolicy::kNormalFirstVictim:
       return store ? ir::StoreL2HintToString(ir::StoreL2Hint::NormalFirstVictim)

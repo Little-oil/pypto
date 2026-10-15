@@ -9,7 +9,7 @@
 | [手工依赖原语](02-manual_dependencies.md) | `pl.manual_scope`、显式 `deps=` 边、调度谓词、array-carry fence |
 | [函数与程序结构](03-functions.md) | 函数类型、参数方向、跨模块复用、打印 IR |
 | [集成手写 C++ Kernel](04-external-kernels.md) | 从 PyPTO 程序中调用已有的手写 C++ InCore kernel |
-| [GM 缓存访问策略与 L2 Hint](05-cache-policy.md) | 原有 `CachePolicy` 声明与 A5 上单次搬运的 `l2_hint` 控制 |
+| [GM 缓存访问策略与 L2 Hint](05-cache-policy.md) | 作用域声明与单次搬运的 `cache=CachePolicy...` 控制，包含 A5 模式 |
 
 ## 另请参阅
 

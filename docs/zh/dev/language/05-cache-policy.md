@@ -34,6 +34,11 @@ FirstVictim 倾向更早替换，LastVictim 倾向更晚替换；Persistent 使�
 Clean 保留已有缓存行但标记为干净，后续淘汰无需回写，Drop 丢弃同地址已有缓存行。
 store 仅提供 Clean 这一种非分配模式。
 
+固定版本的 PTO-ISA 在 A5 ACC → GM store 上仅支持 DEFAULT 和 NORMAL_FIRST_VICTIM。
+ISA 的 ACC 路径会忽略 `l2Control`（包括 ReLU 和量化写回），因此其他 store 策略在
+发射内核前报错，见 [PTO-ISA #349](https://github.com/hw-native-sys/pto-isa/issues/349)。
+上表中的完整 store 模式适用于 Vec → GM 搬运。
+
 A2/A3 的 load DEFAULT/BYPASS 保留原实现：BYPASS 将运行时 nocache offset
 传给 PTOAS，再调整对应 load 的源地址。A2/A3 的 store 只支持 DEFAULT；
 新增六种策略在 A2/A3 上报错，不会静默近似成其他模式。
@@ -50,6 +55,8 @@ out = pl.store(retained, [0, 0], out, cache=pl.CachePolicy.NOT_ALLOC_CLEAN)
 `cache=None` 不记录策略；显式 load 策略优先于 `pl.set_cache_policy`。
 作用域接口接受同一枚举，仅控制读取，非分配策略要求张量在该作用域内只读。
 store 由 `pl.store` 的参数控制，不继承作用域声明。
+作用域读取策略会跟随 `pl.assemble` 和 `pl.store` 返回的 GM 目标句柄；
+后续 load 显式指定的策略仍然优先。
 
 **接入方式：** IR 在 `cache` kwarg 中保存语义整数。A2/A3 使用 PTOAS 原有的
 bypass 属性和显式 offset 操作数。A5 保留真实的 `pto.tload` / `pto.tstore`
