@@ -491,15 +491,15 @@ void BindIR(nb::module_& m) {
       .value("NormalPersistent", StoreL2Hint::NormalPersistent)
       .value("NotAllocClean", StoreL2Hint::NotAllocClean);
 
-  // CachePolicy enum - declared GM cache-access policy for a tensor read.
-  // nb::is_arithmetic like AtomicType: the policy rides the `tile.load` "cache"
+  // CachePolicy enum - semantic GM cache-access policy for reads and writes.
+  // nb::is_arithmetic like AtomicType: the policy rides the transfer's "cache"
   // kwarg as a plain `int`, so the DSL needs `int(policy)` to work.
   nb::enum_<CachePolicy>(ir, "CachePolicy", nb::is_arithmetic(),
-                         "GM cache-access policy declared for a tensor read")
+                         "GM cache-access policy lowered by backend and transfer direction")
       .value("DEFAULT", CachePolicy::kDefault, "Ordinary cached GM access")
       .value("BYPASS", CachePolicy::kBypass,
              "Streaming access declared to bypass the cache: asserts this tensor has no reuse "
-             "worth caching and that nothing writes those bytes while the kernel runs")
+             "worth caching and, for reads, that nothing writes those bytes while the kernel runs")
       .value("NORMAL_FIRST_VICTIM", CachePolicy::kNormalFirstVictim)
       .value("NORMAL_LAST_VICTIM", CachePolicy::kNormalLastVictim)
       .value("NORMAL_PERSISTENT", CachePolicy::kNormalPersistent)

@@ -1102,8 +1102,22 @@ class TensorToTileMutator : public TypePropagatingMutator {
   StmtPtr VisitStmt_(const IfStmtPtr& op) override {
     auto saved_targets = std::move(yield_tile_targets_);
     SetYieldTileTargets(op->return_vars_);
-    auto result = TypePropagatingMutator::VisitStmt_(op);
+    auto result = As<IfStmt>(TypePropagatingMutator::VisitStmt_(op));
+    INTERNAL_CHECK_SPAN(result, op->span_) << "Internal error: if conversion changed statement kind";
     yield_tile_targets_ = std::move(saved_targets);
+    if (cache_policies_.empty() || !result->else_body_) return result;
+    auto then_yield = transform_utils::GetLastYieldStmt(result->then_body_);
+    auto else_yield = transform_utils::GetLastYieldStmt(*result->else_body_);
+    if (!then_yield || !else_yield) return result;
+    for (size_t i = 0;
+         i < result->return_vars_.size() && i < then_yield->value_.size() && i < else_yield->value_.size();
+         ++i) {
+      // The merged GM handle can carry only a policy shared by both paths.
+      auto policy = GetCachePolicy(then_yield->value_[i]);
+      if (policy && policy == GetCachePolicy(else_yield->value_[i])) {
+        InheritCachePolicy(result->return_vars_[i], then_yield->value_[i]);
+      }
+    }
     return result;
   }
 

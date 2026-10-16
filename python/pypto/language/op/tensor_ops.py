@@ -382,11 +382,15 @@ def set_cache_policy(tensor: Tensor, policy: CachePolicy) -> None:
       and that **nothing writes those bytes while the kernel runs**. Mixing a
       cached write and a bypassing read of the same bytes is a coherency bug
       the compiler cannot detect, so coherency is the author's contract. This
-      is why the policy is never a default and never inferred. Declaring
-      BYPASS on a tensor the scope itself writes is rejected at outlining.
+      is why the policy is never a default and never inferred. All non-allocating
+      scope policies (BYPASS and every NOT_ALLOC_* mode) require a read-only
+      tensor; declaring one on a tensor the scope writes is rejected at outlining.
     * **Tracked by Var identity, never by name.** The declaration names the
-      binding live at the scope, so rebinding the name afterwards
-      (``b = self.foo(b)``) yields a new value the declaration does not cover.
+      binding live at the scope and follows compiler-recognized aliases.
+      Rebinding the name to different GM storage loses the declaration; handles
+      returned by ``pl.store`` or ``pl.assemble`` retain the scope read policy
+      when they preserve the declared destination's storage. The declaration
+      does not configure stores.
     * **Consumed at parse time.** It emits no IR statement of its own: the
       parser records it on the enclosing scope, the scope outliner resolves it
       to the outlined kernel's parameters, and ``ConvertTensorToTileOps`` turns

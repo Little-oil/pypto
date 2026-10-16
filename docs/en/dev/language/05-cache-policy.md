@@ -114,12 +114,15 @@ tile = pl.load(x, [0, 0], [32, 32], cache=pl.CachePolicy.BYPASS)
 
 ## The contract
 
-`CachePolicy.BYPASS` asserts **two** things about the tensor:
+On a read, `CachePolicy.BYPASS` asserts **two** things about the tensor:
 
 | Claim | Who guarantees it | Does the compiler check it? |
 | ----- | ----------------- | --------------------------- |
 | The kernel streams these bytes — no reuse worth caching | Author | No (a performance claim) |
 | Nothing writes these bytes while the kernel runs | Author | Partially — see below |
+
+A per-store BYPASS policy controls that write; the no-writer promise applies
+only to bypassing reads.
 
 Mixing a cached write and a bypassing read of the same bytes is a **coherency
 bug**: the two paths can see different data. The compiler cannot prove absence
@@ -127,10 +130,11 @@ of a concurrent writer across tasks, ranks, or the host, so coherency is the
 author's contract. This is exactly why the policy is never a default and never
 inferred by an optimisation pass.
 
-The one part the compiler *can* check, it does: declaring `BYPASS` on a tensor
-**the same scope writes** is rejected at outlining (see
-[Errors](#errors)). The scope's own parameter direction already says whether it
-writes, so a self-inflicted coherency bug is caught rather than trusted.
+Every non-allocating scope declaration (`BYPASS`, `NOT_ALLOC_KEEP`,
+`NOT_ALLOC_CLEAN` or `NOT_ALLOC_DROP`) requires a read-only tensor
+(`ParamDirection::In`). Declaring one on a tensor **the same scope writes** is
+rejected at outlining (see [Errors](#errors)). The scope's parameter direction
+already records whether it writes the tensor.
 
 ## Precedence
 
@@ -176,8 +180,10 @@ parsing the body.
 Two more rules the parser enforces:
 
 - **Tracked by Var identity, never by name.** The declaration names the binding
-  live *at the scope*. Rebinding the name afterwards (`b = self.foo(b)`) yields
-  a new value the declaration does not cover.
+  live *at the scope* and follows compiler-recognized aliases. Rebinding to
+  different GM storage loses the declaration. Storage-preserving destination
+  handles returned by `pl.store` or `pl.assemble` retain the scope read policy;
+  the declaration does not configure the stores themselves.
 - **Bare name, tensor-typed, already bound.** Attribute / subscript / call
   expressions name no binding; a non-tensor binding has no GM read to govern; a
   tensor created *inside* the body is not captured by the scope.
@@ -365,8 +371,8 @@ an error that names both versions.
   `ConvertTensorToTileOps` is what turns GM reads into `tile.load`, and it
   transforms InCore functions. Declare the policy on the scope that becomes the
   device kernel (a `CORE_GROUP` `pl.at`, or a `pl.spmd` inline body).
-- Scope declarations govern **reads**; per-store policies are supported on A5. `BYPASS` on
-  a written tensor is rejected rather than reinterpreted.
+- Scope declarations govern **reads**; per-store policies are supported on A5.
+  Every non-allocating scope policy requires a read-only tensor.
 
 ## Implementation map
 

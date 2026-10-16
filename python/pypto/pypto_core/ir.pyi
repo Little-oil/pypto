@@ -422,9 +422,10 @@ class CachePolicy(enum.IntEnum):
     BYPASS = 1
     """Streaming access declared to bypass the cache.
 
-    Asserts this tensor has no reuse worth caching and that nothing writes
-    those bytes while the kernel runs — mixing a cached write and a bypassing
-    read of the same bytes is a coherency bug.
+    Asserts this tensor has no reuse worth caching. For reads, also asserts
+    that nothing writes those bytes while the kernel runs — mixing a cached
+    write and a bypassing read of the same bytes is a coherency bug. A per-store
+    BYPASS policy controls that write and does not assert the absence of writes.
     """
 
     NORMAL_FIRST_VICTIM = 2

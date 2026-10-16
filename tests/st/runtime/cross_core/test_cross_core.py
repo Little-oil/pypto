@@ -1044,6 +1044,62 @@ def _assert_scope_rebind_hints(scope_rebind_run, policy, explicit_default):
     assert "TSTORE<pto::TStoreL2Hint" not in cpp, "scope policies govern reads only"
 
 
+def _scope_conditional_rebind_case(policy, planner, take_then):
+    @pl.jit
+    def scoped_conditional_rebind(
+        x: pl.Tensor[[32, 32], pl.FP32],
+        flags: pl.Tensor[[1], pl.INT32],
+        out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+    ):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            pl.set_cache_policy(out, policy)
+            if pl.read(flags, [0]) > 0:
+                out = pl.assemble(out, pl.add(x, x), [0, 0])
+            else:
+                value = pl.load(x, [0, 0], [32, 32])
+                out = pl.store(pl.add(value, pl.add(value, value)), [0, 0], out)
+            first = pl.load(out, [0, 0], [32, 32])
+            out = pl.store(pl.add(first, first), [0, 0], out)
+            second = pl.load(out, [0, 0], [32, 32])
+            out = pl.store(second, [0, 0], out)
+        return out
+
+    name = f"l2_scope_if_{take_then}_{policy.name}_{planner.name}"
+    x = (torch.arange(32 * 32).reshape(32, 32) % 127 - 63).float()
+    factor = 4 if take_then else 6
+    case = st.case(
+        scoped_conditional_rebind,
+        x,
+        torch.tensor([int(take_then)], dtype=torch.int32),
+        torch.full_like(x, float("nan")),
+        name=name,
+        golden=lambda tensors: tensors["x"] * factor,
+        memory_planner=planner,
+        rtol=0.0,
+        atol=0.0,
+    )
+    return pytest.param(policy, case, id=name)
+
+
+@pytest.mark.platforms("a5", "a5sim")
+@pytest.mark.parametrize(
+    "policy, _st_case",
+    [
+        _scope_conditional_rebind_case(policy, planner, take_then)
+        for policy in (
+            pl.CachePolicy.NORMAL_FIRST_VICTIM,
+            pl.CachePolicy.NORMAL_LAST_VICTIM,
+            pl.CachePolicy.NORMAL_PERSISTENT,
+        )
+        for planner in (MemoryPlanner.PYPTO, MemoryPlanner.PTOAS)
+        for take_then in (False, True)
+    ],
+)
+def test_scope_cache_policy_survives_conditional_gm_rebinding(_scope_rebind_run, policy):
+    """Both runtime branches retain the selected read mode after their GM merge."""
+    _assert_scope_rebind_hints(_scope_rebind_run, policy, False)
+
+
 def _scope_loop_rebind_case(policy, planner, explicit_default, use_while, steps):
     override = pl.CachePolicy.DEFAULT if explicit_default else None
 
