@@ -63,6 +63,7 @@ from .type_resolver import (
     TypeResolver,
     _const_int_value,  # noqa: PLC2701
     _implicit_tile_view_defaults,  # noqa: PLC2701
+    _is_dump_call,  # noqa: PLC2701
 )
 
 if TYPE_CHECKING:
@@ -196,18 +197,6 @@ def _is_pl_call(node: object, attr_name: str) -> TypeGuard[ast.Call]:
         and func.attr == attr_name
         and isinstance(func.value, ast.Name)
         and func.value.id == "pl"
-    )
-
-
-def _is_dump_call(node: object, name: str | None = None) -> TypeGuard[ast.Call]:
-    """Match private dump calls under the printer's configurable module prefix."""
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and (name is None or node.func.attr == name)
-        and isinstance(node.func.value, ast.Attribute)
-        and node.func.value.attr == "_dump"
-        and isinstance(node.func.value.value, ast.Name)
     )
 
 

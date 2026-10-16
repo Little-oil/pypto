@@ -1575,6 +1575,83 @@ def test_composite_shape_dim_roundtrips(dim_factory):
     assert python_print(reparsed, format=False) == printed
 
 
+@pytest.mark.parametrize("prefix", ["pl", "custom"])
+@pytest.mark.parametrize("dtype", [DataType.INDEX, DataType.INT64])
+@pytest.mark.parametrize("composite", [False, True])
+@pytest.mark.parametrize("shape_position", ["parameter", "local"])
+def test_recorded_call_shape_dim_roundtrips(prefix, dtype, composite, shape_position):
+    """Storage operands select recorded calls even inside shape annotations."""
+    span = ir.Span.unknown()
+    storage = ir.MemRef("storage", 0, 1024, span)
+    x = ir.Var("x", ir.TensorType([8, 32], DataType.FP32, storage), span)
+    # INT64 deliberately differs from tensor.dim's inferred INDEX type: a
+    # recorded call must keep its saved type and metadata, without inference.
+    dim_call = ir.Call(
+        ir.get_op("tensor.dim"),
+        [x, ir.ConstInt(0, DataType.INDEX, span)],
+        {},
+        {"saved": True},
+        ir.ScalarType(dtype),
+        span,
+    )
+    dim = ir.Mul(dim_call, ir.ConstInt(2, dtype, span), dtype, span) if composite else dim_call
+    trailing = ir.ConstInt(16 if composite else 32, DataType.INDEX, span)
+    result_type = ir.TensorType([dim, trailing], DataType.FP32, storage)
+    y = ir.Var("y", result_type, span)
+    params = [x, y] if shape_position == "parameter" else [x]
+    stmts: list[ir.Stmt] = []
+    if shape_position == "local":
+        reshape = ir.Call(
+            ir.get_op("tensor.reshape"),
+            [x, ir.MakeTuple([dim, trailing], span)],
+            {},
+            {},
+            result_type,
+            span,
+        )
+        stmts.append(ir.AssignStmt(y, reshape, span))
+    stmts.append(ir.ReturnStmt([y], span))
+    body = ir.SeqStmts(stmts, span) if len(stmts) > 1 else stmts[0]
+    func = ir.Function("main", params, [result_type], body, span, ir.FunctionType.InCore)
+    program = ir.Program([func], "RecordedShapeDim", span)
+
+    canonical = python_print(program, format=False)
+    # Exercise the marker's configurable prefix independently of decorator
+    # syntax, whose function-type enum uses the canonical pl qualifier.
+    printed = canonical.replace("pl._dump.call(", f"{prefix}._dump.call(")
+    if prefix != "pl":
+        printed = f"import pypto.language as {prefix}\n{printed}"
+    assert f'{prefix}._dump.call("tensor.dim"' in printed
+    reparsed = pl.parse(printed)
+    assert isinstance(reparsed, ir.Program)
+    ir.verify_structural_bindings(reparsed)
+    ir.assert_structural_equal(program, reparsed)
+    assert ir.structural_hash(program) == ir.structural_hash(reparsed)
+    assert python_print(reparsed, format=False) == canonical
+
+    restored_func = next(iter(reparsed.functions.values()))
+    restored_type = restored_func.return_types[0]
+    assert isinstance(restored_type, ir.TensorType)
+    restored_dim = restored_type.shape[0]
+    if composite:
+        assert isinstance(restored_dim, ir.Mul)
+        assert isinstance(restored_dim.right, ir.ConstInt)
+        assert restored_dim.right.value == 2
+        assert restored_dim.right.dtype == dtype
+        restored_dim = restored_dim.left
+    assert isinstance(restored_dim, ir.Call)
+    assert restored_dim.op.name == ir.get_op("tensor.dim").name
+    assert isinstance(restored_dim.type, ir.ScalarType)
+    assert restored_dim.type.dtype == dtype
+    assert restored_dim.args[0] is restored_func.params[0]
+    assert restored_dim.attrs == {"saved": True}
+    source_type = restored_func.params[0].type
+    assert isinstance(source_type, ir.TensorType)
+    assert source_type.memref is not None
+    assert restored_type.memref is not None
+    assert restored_type.memref.base_ is source_type.memref.base_
+
+
 def test_pure_const_composite_prints_typed_leaves():
     """A pure-ConstInt composite prints ``pl.const`` leaves (never bare ``32 + 32``),
     so reparse rebuilds the tree instead of Python-eval folding it to one int."""

@@ -3592,8 +3592,22 @@ def test_tensor_dim_view_loop_compiles_without_folding(tmp_path):
     lowered = _run_default_passes(Repro)
     printed = ir.python_print(lowered)
     assert "__FREE_VAR" not in printed
-    assert "pl.Tensor[[pl.tensor.dim(" in printed
     kernels = [func for func in lowered.functions.values() if ir.is_incore_type(func.func_type)]
+    # Storage annotations select the recorded-call printer spelling. Inspect
+    # the retained shape IR so this test accepts either lossless spelling.
+    retained_dims = [
+        dim.left
+        for func in kernels
+        for param in func.params
+        if isinstance(param.type, ir.TensorType)
+        for dim in param.type.shape
+        if isinstance(dim, ir.Mul) and isinstance(dim.left, ir.Call)
+    ]
+    assert retained_dims
+    for dim in retained_dims:
+        assert dim.op.name == ir.get_op("tensor.dim").name
+        assert isinstance(dim.type, ir.ScalarType)
+        assert dim.type.dtype == DataType.INDEX
     mlir = _generate_mlir(ir.Program(kernels, "DimViewKernels", ir.Span.unknown()))
     assert "arith.muli ," not in mlir
     # Compile the generated kernel with PTOAS when the toolchain is installed.

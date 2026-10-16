@@ -105,6 +105,11 @@ constant leaves in printed shapes reconstruct arithmetic, power, bitwise and
 shift nodes without constant folding. Ordinary user constant expressions may
 still fold; simplification of reconstructed IR belongs to a separate pass.
 
+Shape dimensions also restore private `pl._dump.call(...)` snapshots through
+the expression parser, preserving recorded result types, operand bindings, and
+metadata. These calls must return integer/index scalars. A `tensor.dim` read
+whose operand carries storage can use this form without folding the read.
+
 Nested `pl.Tuple[...]` denotes a recursive tuple value type. The built-in
 `tuple[...]` return annotation continues to denote a list of function results;
 a nested result list is not a tuple value type and remains rejected.

@@ -13,7 +13,7 @@ import ast
 import warnings
 from collections.abc import Callable, Sequence
 from functools import partial
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
 from pypto.language.typing.dynamic import DynVar
 from pypto.language.typing.scalar import Scalar
@@ -21,6 +21,18 @@ from pypto.pypto_core import DataType, ir
 
 from .diagnostics import ParserError, ParserTypeError
 from .expr_evaluator import ExprEvaluator
+
+
+def _is_dump_call(node: object, name: str | None = None) -> TypeGuard[ast.Call]:
+    """Match private dump calls under the printer's configurable module prefix."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and (name is None or node.func.attr == name)
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "_dump"
+        and isinstance(node.func.value.value, ast.Name)
+    )
 
 
 def _warn_incomplete_fp4() -> None:
@@ -248,7 +260,8 @@ class TypeResolver:
                 ensuring the same DynVar produces the same ir.Var across functions
                 in a program.
             parse_expression: Optional callback to the enclosing parser's full
-                expression parser. When set, TileView/TensorView fields accept any
+                expression parser. Restores recorded calls in shape dimensions
+                without repeating type inference. TileView/TensorView fields accept any
                 index expression the DSL itself can parse (matching what the C++
                 ``ir.TileView`` constructor accepts), not just integer constants
                 and bare names.
@@ -1425,7 +1438,8 @@ class TypeResolver:
         """Rebuild a composite shape dimension as an IR expression, no folding.
 
         Handles int literals, names (closure/scope), ``pl.const(value, dtype)``,
-        ``pl.tensor.dim`` reads and arithmetic/bitwise integer binary operators over those.
+        ``pl.tensor.dim`` reads, recorded calls, and arithmetic/bitwise integer
+        binary operators over those.
         Returns None for any other form.
         """
         span = self._get_span(node)
@@ -1447,6 +1461,17 @@ class TypeResolver:
                 value = self._rebuild_composite_dim(call.args[0])
                 if isinstance(value, ir.ConstInt):
                     return ir.ConstInt(value.value, self.resolve_dtype(call.args[1]), span)
+        if _is_dump_call(node, "call") and self._parse_expression is not None:
+            # Storage operands make even tensor.dim print as a recorded call.
+            # Restore its exact result type and metadata through the existing
+            # parser; ordinary calls retain the non-folding shape path below.
+            result = self._parse_expression(node)
+            if not _is_index_expr_type(result.type):
+                raise ParserTypeError(
+                    f"Shape dimension must be an integer scalar, got {result.type}: {ast.unparse(node)}",
+                    span=span,
+                )
+            return result
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)

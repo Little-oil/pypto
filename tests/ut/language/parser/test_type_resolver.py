@@ -386,6 +386,30 @@ class TestTypeResolver:
             resolver.resolve_type(ast.parse(annotation, mode="eval").body)
 
 
+@pytest.mark.parametrize("composite", [False, True])
+@pytest.mark.parametrize(
+    "result_type",
+    [
+        "pl.Scalar[pl.FP32]",
+        "pl.Scalar[pl.BOOL]",
+        "pl.Tensor[[1], pl.FP32]",
+        "pl.Tile[[1], pl.FP32, pl.Mem.Vec]",
+        "pl.Tuple[pl.Scalar[pl.INDEX]]",
+    ],
+)
+def test_shape_recorded_call_rejects_non_integer_result(result_type, composite):
+    """A restored Call is admissible as a shape only with an integer scalar type."""
+    call = f'pl._dump.call("tensor.dim", [x, pl.const(0, pl.INDEX)], {result_type})'
+    dim = f"{call} * pl.const(2, pl.INDEX)" if composite else call
+    source = f"""
+@pl.function
+def kernel(x: pl.Tensor[[8, 32], pl.FP32], y: pl.Tensor[[{dim}, 16], pl.FP32]):
+    return y
+"""
+    with pytest.raises(ParserTypeError, match="Shape dimension must be an integer scalar"):
+        pl.parse(source)
+
+
 class TestTupleTypeResolver:
     """Tests for tuple[T1, T2, ...] return type resolution."""
 
