@@ -1652,6 +1652,74 @@ def test_recorded_call_shape_dim_roundtrips(prefix, dtype, composite, shape_posi
     assert restored_type.memref.base_ is source_type.memref.base_
 
 
+@pytest.mark.parametrize("operand_scope", ["parameter", "local"])
+@pytest.mark.parametrize("composite", [False, True])
+def test_recorded_shape_call_preserves_renamed_operand(operand_scope, composite):
+    """A shape call must keep the second x binding after name disambiguation."""
+    span = ir.Span.unknown()
+    storage = ir.MemRef("storage", 0, 1024, span)
+    first = ir.Var("x", ir.TensorType([8, 32], DataType.FP32, storage), span)
+    operand = ir.Var("x", ir.TensorType([16, 16], DataType.FP32, storage), span)
+    params = [first]
+    stmts: list[ir.Stmt] = []
+    if operand_scope == "parameter":
+        params.append(operand)
+    else:
+        shape = ir.MakeTuple([ir.ConstInt(16, DataType.INDEX, span)] * 2, span)
+        value = ir.Call(ir.get_op("tensor.reshape"), [first, shape], {}, {}, operand.type, span)
+        stmts.append(ir.AssignStmt(operand, value, span))
+    dim = ir.Call(
+        ir.get_op("tensor.dim"),
+        [operand, ir.ConstInt(0, DataType.INDEX, span)],
+        {},
+        {},
+        ir.ScalarType(DataType.INDEX),
+        span,
+    )
+    shape_dim = ir.Mul(dim, ir.ConstInt(2, DataType.INDEX, span), DataType.INDEX, span) if composite else dim
+    trailing = ir.ConstInt(8 if composite else 16, DataType.INDEX, span)
+    result_type = ir.TensorType([shape_dim, trailing], DataType.FP32, storage)
+    result = ir.Var("result", result_type, span)
+    if operand_scope == "parameter":
+        params.append(result)
+    else:
+        shape = ir.MakeTuple([shape_dim, trailing], span)
+        value = ir.Call(ir.get_op("tensor.reshape"), [operand, shape], {}, {}, result_type, span)
+        stmts.append(ir.AssignStmt(result, value, span))
+    stmts.append(ir.ReturnStmt([result], span))
+    body = ir.SeqStmts(stmts, span) if len(stmts) > 1 else stmts[0]
+    func = ir.Function("main", params, [], body, span, ir.FunctionType.InCore)
+    program = ir.Program([func], "RenamedShapeOperand", span)
+    ir.verify_structural_bindings(program)
+
+    printed = python_print(program, format=False)
+    reparsed = pl.parse(printed)
+    assert isinstance(reparsed, ir.Program)
+    restored = next(iter(reparsed.functions.values()))
+    if operand_scope == "parameter":
+        restored_operand = restored.params[1]
+        restored_result = restored.params[2]
+    else:
+        assert isinstance(restored.body, ir.SeqStmts)
+        assignments = [stmt for stmt in restored.body.stmts if isinstance(stmt, ir.AssignStmt)]
+        restored_operand, restored_result = (stmt.var for stmt in assignments)
+    restored_type = restored_result.type
+    assert isinstance(restored_type, ir.TensorType)
+    restored_dim = restored_type.shape[0]
+    if composite:
+        assert isinstance(restored_dim, ir.Mul)
+        restored_dim = restored_dim.left
+    assert isinstance(restored_dim, ir.Call)
+    # Both bindings are in scope: checking only parse success or scope validity
+    # misses a call silently rebound to the first x (extent 8 instead of 16).
+    assert restored_dim.args[0] is restored_operand
+    assert restored_dim.args[0] is not restored.params[0]
+    ir.verify_structural_bindings(reparsed)
+    ir.assert_structural_equal(program, reparsed)
+    assert ir.structural_hash(program) == ir.structural_hash(reparsed)
+    assert python_print(reparsed, format=False) == printed
+
+
 def test_pure_const_composite_prints_typed_leaves():
     """A pure-ConstInt composite prints ``pl.const`` leaves (never bare ``32 + 32``),
     so reparse rebuilds the tree instead of Python-eval folding it to one int."""

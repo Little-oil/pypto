@@ -3463,13 +3463,10 @@ std::string IRPythonPrinter::PrintExprForType(const ExprPtr& expr) {
   if (auto var = As<Var>(expr)) {
     return GetVarName(var.get());
   }
-  IRPythonPrinter temp_printer(prefix_);
-  temp_printer.dyn_var_rename_map_ = dyn_var_rename_map_;
-  // Composite dims must reparse to the same tree, not Python-eval to a folded
-  // int. Typed const leaves (pl.const(v, pl.INDEX)) make them self-describing;
-  // simplification stays the Simplify pass's job.
-  temp_printer.typed_index_consts_ = true;
-  return temp_printer.Print(expr);
+  // Composite dims retain their enclosing rename context and typed constant
+  // leaves so print/parse preserves bindings and does not fold the IR tree.
+  // Simplification stays the Simplify pass's job.
+  return PrintSubExpr(expr, /*typed_index=*/true);
 }
 
 void IRPythonPrinter::PrintShapeDims(std::ostringstream& oss, const std::vector<ExprPtr>& shape) {
