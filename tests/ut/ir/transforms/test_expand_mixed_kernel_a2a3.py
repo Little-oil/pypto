@@ -1489,6 +1489,7 @@ def test_while_condition_only_scalar_carry_survives_nested_split():
             lane: pl.Scalar[pl.INDEX],
             worker: pl.Scalar[pl.INDEX],
         ):
+            pl.func_attr({"dual_aiv_dispatch": True})
             if lane == 0:
                 if worker == 1:
                     initial_ready = pl.tensor.read(flags, [0])
@@ -1555,6 +1556,7 @@ def test_while_condition_only_tile_read_carry_survives_nested_split():
             lane: pl.Scalar[pl.INDEX],
             worker: pl.Scalar[pl.INDEX],
         ):
+            pl.func_attr({"dual_aiv_dispatch": True})
             if lane == 0:
                 if worker == 1:
                     initial_tile = pl.load(flags, [0], [16], target_memory=pl.Mem.Vec)
@@ -1617,6 +1619,7 @@ def test_while_condition_seed_keeps_fifo_dependency_and_prunes_dead_slot():
             cube_out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
             vector_out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
         ):
+            pl.func_attr({"dual_aiv_dispatch": True})
             first = pl.tensor.read(flags, [0])
             second = pl.tensor.read(flags, [1])
             for ready, queued in pl.while_(init_values=(first, second)):

@@ -1764,7 +1764,7 @@ class TestExpandMixedKernelCodegen:
             TILE_POLLING=tile_polling,
             KEEP_RESULT=keep_result,
             config=RunConfig(
-                platform="a2a3",
+                backend_type=BackendType.Ascend910B,
                 codegen_only=True,
                 save_kernels=True,
                 save_kernels_dir=str(tmp_path),
@@ -1782,18 +1782,19 @@ class TestExpandMixedKernelCodegen:
         pto = "\n".join(path.read_text() for path in pto_files)
         loop = re.search(
             r"scf\.while \([^\n]+\) : \(i32\) -> \(i32\) \{.*?scf\.condition\(.*?"
-            r"\} do \{(?P<body>.*?)scf\.yield %\w+ : i32",
+            r"\} do \{(?P<body>.*?)scf\.yield (?P<yielded>%\w+) : i32",
             pto,
             re.DOTALL,
         )
         assert loop is not None, pto
-        # The flag must be reloaded on the backedge, not merely read before
-        # entering the loop, so a retained empty polling loop cannot pass.
+        # The backedge must yield the freshly read flag, so retaining a reload
+        # while yielding stale state cannot satisfy this polling regression.
         body = loop.group("body")
+        yielded = loop.group("yielded")
+        reload_op = "pto.tgetval" if tile_polling else "pto.load"
+        assert re.search(rf"^\s*{re.escape(yielded)} = {re.escape(reload_op)} ", body, re.MULTILINE), body
         if tile_polling:
-            assert "pto.tload " in body and "pto.tgetval " in body, body
-        else:
-            assert "pto.load " in body, body
+            assert "pto.tload " in body, body
 
     @staticmethod
     def _expand_and_generate(program) -> dict[str, str]:
