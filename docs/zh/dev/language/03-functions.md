@@ -52,6 +52,25 @@ second = slice_kernel.compile()  # A distinct specialization with 64 rows.
 内部状态，或修改编译器/源码文件。持久复用还需要完整的
 [产物身份与缓存策略](../10-jit-cache.md)。
 
+### JIT 内联 helper 的 Tile 参数
+
+内联 helper 可以接收显式声明类型的片上 Tile：
+
+```python
+@pl.jit.inline(auto_scope=False)
+def keep_tile(tile: pl.Tile[[8, 64], pl.FP32, pl.MemorySpace.Vec]) -> pl.Tile:
+    return tile
+```
+
+专门化（specialization）保留声明的形状、数据类型和内存空间，并折叠注解中引用的
+模块与闭包常量。如果延迟求值的注解引用 helper 自身的 `pl.constexpr` 参数，
+会先代入该调用的 constexpr 绑定，再求值注解；该绑定优先于模块或闭包中的同名常量。
+不同绑定会生成各自的 helper 专门化。
+
+内联（inlining）直接代入调用方的 Tile，无需复制，并保留调用方的有效形状
+（valid shape）。这不会放宽对不兼容 Tile 实参的类型检查，也不会为设备派发接口
+增加 Tile 参数支持。
+
 ### 编译选项与诊断请求
 
 JIT 调用和 `kernel.compile()` 在查找进程内产物之前解析编译选项。
