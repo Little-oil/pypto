@@ -632,6 +632,63 @@ def _derive_return_types_from_body(body: ir.Stmt | None) -> list[ir.Type]:
     return types
 
 
+class _InlineReturnProvenanceCollector(ir.IRVisitor):
+    """Check that a trailing inline return has no competing return or rebound formal."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.return_count = 0
+        self.assigned_ids: set[int] = set()
+
+    def visit_return_stmt(self, op: ir.ReturnStmt) -> None:
+        self.return_count += 1
+        super().visit_return_stmt(op)
+
+    def visit_assign_stmt(self, op: ir.AssignStmt) -> None:
+        self.assigned_ids.add(op.var.unique_id)
+        super().visit_assign_stmt(op)
+
+
+def _returned_tile_types(actual: ir.Type, fallback: ir.Type) -> ir.Type | None:
+    """Recover only returned Tile metadata; other result kinds retain native deduction."""
+    if isinstance(actual, ir.TileType) and isinstance(fallback, ir.TileType):
+        return actual
+    if isinstance(actual, ir.TupleType) and isinstance(fallback, ir.TupleType):
+        if len(actual.types) != len(fallback.types):
+            return None
+        projected = [_returned_tile_types(a, f) for a, f in zip(actual.types, fallback.types)]
+        if any(t is not None for t in projected):
+            return ir.TupleType([p if p is not None else f for p, f in zip(projected, fallback.types)])
+    return None
+
+
+def _inline_argument_return_type(
+    value: ir.Expr,
+    fallback: ir.Type,
+    argument_types: dict[int, ir.Type],
+    assigned_ids: frozenset[int],
+) -> ir.Type | None:
+    """Trace direct formal/tuple returns by Var identity, without guessing computed results."""
+    if isinstance(value, ir.Var):
+        actual = argument_types.get(value.unique_id)
+        if actual is not None and value.unique_id not in assigned_ids:
+            return _returned_tile_types(actual, fallback)
+    elif isinstance(value, ir.MakeTuple) and isinstance(fallback, ir.TupleType):
+        if len(value.elements) != len(fallback.types):
+            return None
+        projected = [
+            _inline_argument_return_type(v, f, argument_types, assigned_ids)
+            for v, f in zip(value.elements, fallback.types)
+        ]
+        if any(t is not None for t in projected):
+            return ir.TupleType([p if p is not None else f for p, f in zip(projected, fallback.types)])
+    elif isinstance(value, ir.TupleGetItemExpr):
+        container = _inline_argument_return_type(value.tuple, value.tuple.type, argument_types, assigned_ids)
+        if isinstance(container, ir.TupleType) and 0 <= value.index < len(container.types):
+            return _returned_tile_types(container.types[value.index], fallback)
+    return None
+
+
 @dataclass
 class _AtKwargState:
     """Mutable accumulator used while parsing pl.at() keyword arguments."""
@@ -789,6 +846,9 @@ class ASTParser:
         # object (not id()) keeps a strong reference, so there is no id-reuse
         # hazard from a collected-and-reallocated Function.
         self._derived_return_types_cache: dict[ir.Function, list[ir.Type]] = {}
+        self._inline_return_provenance_cache: dict[
+            ir.Function, tuple[tuple[ir.Expr, ...], frozenset[int]]
+        ] = {}
 
         # Track context for handling yields and returns
         self.in_for_loop = False
@@ -7719,7 +7779,9 @@ class ASTParser:
                 callee_params_for_return,
                 args_for_return,
                 return_types,
+                is_inline=func_obj.func_type == ir.FunctionType.Inline,
             )
+            return_types = self._inline_argument_return_types(func_obj, args, return_types)
         return self._make_call_with_return_type(
             gvar,
             args,
@@ -8419,6 +8481,42 @@ class ASTParser:
             self._derived_return_types_cache[func] = cached
         return list(cached)
 
+    def _inline_argument_return_types(
+        self, func: ir.Function, args: list[ir.Expr], return_types: list[ir.Type]
+    ) -> list[ir.Type]:
+        """Keep direct Tile returns in caller scope after native contract checking.
+
+        Different inline operands may specialize one generic symbol differently.
+        An unresolved callee symbol cannot survive in a caller's temporary type,
+        so recover proven parameter returns from the corresponding actual type.
+        A single trailing return and an unmodified formal are required; computed
+        values and competing return paths retain native inference.
+        """
+        if func.func_type != ir.FunctionType.Inline or len(args) != len(func.params):
+            return return_types
+        cached = self._inline_return_provenance_cache.get(func)
+        if cached is None:
+            collector = _InlineReturnProvenanceCollector()
+            collector.visit_stmt(func.body)
+            trailing = func.body
+            if isinstance(trailing, ir.SeqStmts) and trailing.stmts:
+                trailing = trailing.stmts[-1]
+            values = (
+                tuple(trailing.value)
+                if collector.return_count == 1 and isinstance(trailing, ir.ReturnStmt)
+                else ()
+            )
+            cached = (values, frozenset(collector.assigned_ids))
+            self._inline_return_provenance_cache[func] = cached
+        values, assigned_ids = cached
+        if len(values) != len(return_types):
+            return return_types
+        argument_types = {p.unique_id: a.type for p, a in zip(func.params, args)}
+        return [
+            _inline_argument_return_type(v, t, argument_types, assigned_ids) or t
+            for v, t in zip(values, return_types)
+        ]
+
     def _make_call_with_return_type(  # noqa: PLR0913, PLR0912 — cohesive call-builder; bundling args/branches hurts clarity
         self,
         gvar: ir.GlobalVar,
@@ -9058,7 +9156,9 @@ class ASTParser:
             list(ext_func.params),
             args,
             self._effective_return_types(ext_func),
+            is_inline=ext_func.func_type == ir.FunctionType.Inline,
         )
+        return_types = self._inline_argument_return_types(ext_func, args, return_types)
         return self._make_call_with_return_type(gvar, args, return_types, span)
 
     @staticmethod
