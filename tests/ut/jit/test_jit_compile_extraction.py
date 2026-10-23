@@ -120,6 +120,95 @@ class TestCompileReturnsCompiledProgram:
         assert (tmp_path / "perf_hints.log").is_file()
 
 
+@pytest.mark.parametrize("nested", [True, False], ids=["nested", "named_scalar"])
+def test_compile_device_read_in_valid_shape(tmp_path, nested):
+    """Nested and named device extents must compile with closed SSA bindings (#3087)."""
+
+    @jit.incore
+    def nested_calculate(
+        src: pl.Tensor[[1, 2048], pl.FP32],
+        valid: pl.Tensor[[1], pl.INT32],
+        out: pl.Out[pl.Tensor[[1, 2048], pl.FP32]],
+    ):
+        tile = pl.load(src, [0, 0], [1, 2048])
+        narrowed = pl.set_validshape(tile, 1, pl.cast(pl.read(valid, [0]), pl.INDEX))
+        result = pl.add(narrowed, 1.0)
+        pl.store(result, [0, 0], out)
+        return out
+
+    @jit.incore
+    def named_calculate(
+        src: pl.Tensor[[1, 2048], pl.FP32],
+        valid: pl.Tensor[[1], pl.INT32],
+        out: pl.Out[pl.Tensor[[1, 2048], pl.FP32]],
+    ):
+        tile = pl.load(src, [0, 0], [1, 2048])
+        n = pl.read(valid, [0])
+        n_index = pl.cast(n, pl.INDEX)
+        narrowed = pl.set_validshape(tile, 1, n_index)
+        result = pl.add(narrowed, 1.0)
+        pl.store(result, [0, 0], out)
+        return out
+
+    calculate = nested_calculate if nested else named_calculate
+
+    @jit
+    def entry(
+        src: pl.Tensor[[1, 2048], pl.FP32],
+        valid: pl.Tensor[[1], pl.INT32],
+        out: pl.Out[pl.Tensor[[1, 2048], pl.FP32]],
+    ):
+        with pl.spmd(1):
+            out = calculate(src, valid, out)
+        return out
+
+    # CompiledProgram.program is the frontend IR. Observe the real pipeline to
+    # also catch a detached consumer Var at conversion and an accidentally lifted
+    # valid-shape scalar at the final signature materialization pass.
+    observed: dict[str, ir.Program] = {}
+
+    def observe(pass_obj: passes.Pass, program: ir.Program) -> None:
+        if pass_obj.get_name() in {"ConvertTensorToTileOps", "MaterializeValidShapeSymbols"}:
+            observed[pass_obj.get_name()] = program
+
+    with passes.PassContext([passes.CallbackInstrument(after_pass=observe, name="ValidShapeBindings")]):
+        compiled = entry.compile(
+            config=RunConfig(save_kernels=True, save_kernels_dir=str(tmp_path), dump_passes=True)
+        )
+
+    assert isinstance(compiled, CompiledProgram)
+    assert set(observed) == {"ConvertTensorToTileOps", "MaterializeValidShapeSymbols"}
+    for program in observed.values():
+        ir.verify_structural_bindings(program)
+        assert "__FREE_VAR" not in ir.python_print(program)
+        kernels = [f for f in program.functions.values() if ir.is_incore_type(f.func_type)]
+        assert len(kernels) == 1
+        assert len(kernels[0].params) == 3
+        assert all(isinstance(param.type, ir.TensorType) for param in kernels[0].params)
+
+    pto_files = list(compiled.output_dir.rglob("*.pto"))
+    assert len(pto_files) == 1
+    mlir = pto_files[0].read_text()
+    assert mlir.count("pto.load ") == 1
+    load = re.search(r"(%\S+) = pto\.load %\S+\[[^\n]*\] : !pto\.ptr<i32> -> i32", mlir)
+    assert load is not None, mlir
+    # The valid extent must still come from the device read. Accept multiple
+    # casts of that same value without depending on temporary names or numbers.
+    extents = set(re.findall(rf"(%\S+) = arith\.index_cast {re.escape(load[1])} : i32 to index", mlir))
+    assert extents, mlir
+    narrowed = re.search(r"pto\.set_validshape %\S+, %\S+, (%\S+) :", mlir)
+    assert narrowed is not None and narrowed[1] in extents, mlir
+    result_extents = re.findall(r"pto\.alloc_tile[^\n]* valid_col = (%\S+) :", mlir)
+    assert any(extent in extents for extent in result_extents), mlir
+    store = re.search(r"pto\.tstore[^\n]* outs\((%\S+) :", mlir)
+    assert store is not None, mlir
+    store_view = re.search(
+        rf"{re.escape(store[1])} = pto\.partition_view[^\n]* sizes = \[%\S+, (%\S+)\] :", mlir
+    )
+    assert store_view is not None and store_view[1] in extents, mlir
+    assert "pto.tadds " in mlir
+
+
 class TestLowerReturnsProgram:
     """Verify ``lower()`` specializes and runs passes without compiling."""
 

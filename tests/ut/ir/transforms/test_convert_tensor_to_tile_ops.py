@@ -8625,5 +8625,162 @@ def test_added_output_rebinds_omitted_original_out_storage():
     ir.assert_structural_equal(statement.expr.type.types[0], output_type)
 
 
+def _convert_dynamic_validshape(program: ir.Program) -> ir.Function:
+    program = passes.flatten_call_expr()(passes.convert_to_ssa()(program))
+    after = passes.convert_tensor_to_tile_ops()(program)
+    assert "__FREE_VAR" not in ir.python_print(after)
+    kernel = _require_function(after, "kernel")
+    ir.verify_structural_bindings(kernel)
+    properties = passes.IRPropertySet()
+    # Check references embedded in types as well as evaluated operands, across
+    # all lexical scopes. Declarative type expressions need not be materialized.
+    properties.insert(passes.IRProperty.UseAfterDef)
+    properties.insert(passes.IRProperty.AssignTypeSymmetry)
+    passes.PropertyVerifierRegistry.verify_or_throw(properties, after)
+    return kernel
+
+
+class TestDynamicValidShapeBindings:
+    """Dynamic metadata must preserve definition identity through conversion (#3087)."""
+
+    @pytest.mark.parametrize("named_scalar", [False, True], ids=["nested", "named"])
+    def test_read_cast_validshape_preserves_def_use(self, named_scalar):
+        bindings = (
+            "length = pl.read(valid, [0])\n        length_index = pl.cast(length, pl.INDEX)"
+            if named_scalar
+            else ""
+        )
+        extent = "length_index" if named_scalar else "pl.cast(pl.read(valid, [0]), pl.INDEX)"
+        before = pl.parse_program(f"""
+@pl.program
+class Before:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, src: pl.Tensor[[1, 2048], pl.FP32], valid: pl.Tensor[[1], pl.INT32],
+               out: pl.Out[pl.Tensor[[1, 2048], pl.FP32]]):
+        tile = pl.load(src, [0, 0], [1, 2048])
+        {bindings}
+        narrowed = pl.set_validshape(tile, 1, {extent})
+        result = pl.add(narrowed, 1.0)
+        pl.store(result, [0, 0], out)
+        return out
+""")
+        kernel = _convert_dynamic_validshape(before)
+        assert len(_find_calls_to(kernel, "tensor.read")) == 1
+        assert isinstance(kernel.body, ir.SeqStmts)
+        narrowed = next(
+            stmt
+            for stmt in kernel.body.stmts
+            if isinstance(stmt, ir.AssignStmt)
+            and isinstance(stmt.value, ir.Call)
+            and stmt.value.op.name == ir.get_op("tile.set_validshape").name
+        )
+        ir.assert_structural_equal(narrowed.var.type, narrowed.value.type)
+        add = _find_first_call_to(kernel, "tile.adds")
+        assert add is not None and isinstance(add.args[0], ir.Var)
+        assert add.args[0].unique_id == narrowed.var.unique_id
+
+    def test_consecutive_validshape_view_chain_preserves_bindings(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[1, 2048], pl.FP32],
+                valid: pl.Tensor[[2], pl.INT32],
+                out: pl.Out[pl.Tensor[[1, 2048], pl.FP32]],
+            ):
+                tile = pl.load(src, [0, 0], [1, 2048])
+                first = pl.set_validshape(tile, 1, pl.cast(pl.read(valid, [0]), pl.INDEX))
+                viewed = pl.reshape(first, [1, 2048])
+                second = pl.set_validshape(viewed, 1, pl.cast(pl.read(valid, [1]), pl.INDEX))
+                result = pl.add(second, 1.0)
+                pl.store(result, [0, 0], out)
+                return out
+
+        kernel = _convert_dynamic_validshape(Before)
+        assert len(_find_calls_to(kernel, "tile.set_validshape")) == 2
+        assert _find_first_call_to(kernel, "tile.reshape") is not None
+        assert len(_find_calls_to(kernel, "tensor.read")) == 2
+
+    def test_nested_validshape_read_remains_inside_loop(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[1, 2048], pl.FP32],
+                valid: pl.Tensor[[2], pl.INT32],
+                out: pl.Out[pl.Tensor[[1, 2048], pl.FP32]],
+            ):
+                tile = pl.load(src, [0, 0], [1, 2048])
+                for i in pl.range(2):
+                    narrowed = pl.set_validshape(tile, 1, pl.cast(pl.read(valid, [i]), pl.INDEX))
+                    result = pl.add(narrowed, 1.0)
+                    pl.store(result, [0, 0], out)
+                return out
+
+        kernel = _convert_dynamic_validshape(Before)
+        assert isinstance(kernel.body, ir.SeqStmts)
+        loop = next(stmt for stmt in kernel.body.stmts if isinstance(stmt, ir.ForStmt))
+        assert isinstance(loop.body, ir.SeqStmts)
+        reads = [
+            stmt
+            for stmt in loop.body.stmts
+            if isinstance(stmt, ir.AssignStmt)
+            and isinstance(stmt.value, ir.Call)
+            and stmt.value.op.name == ir.get_op("tensor.read").name
+        ]
+        assert len(reads) == 1
+        assert isinstance(reads[0].value, ir.Call)
+        indices = reads[0].value.args[1]
+        assert isinstance(indices, ir.MakeTuple) and isinstance(indices.elements[0], ir.Var)
+        assert indices.elements[0].unique_id == loop.loop_var.unique_id
+
+    def test_independent_reads_are_not_shared_across_write(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[1, 2048], pl.FP32],
+                valid: pl.InOut[pl.Tensor[[1], pl.INT32]],
+                out: pl.Out[pl.Tensor[[1, 2048], pl.FP32]],
+            ):
+                tile = pl.load(src, [0, 0], [1, 2048])
+                first = pl.set_validshape(tile, 1, pl.cast(pl.read(valid, [0]), pl.INDEX))
+                pl.tensor.write(valid, [0], pl.const(16, pl.INT32))
+                second = pl.set_validshape(first, 1, pl.cast(pl.read(valid, [0]), pl.INDEX))
+                result = pl.add(second, 1.0)
+                pl.store(result, [0, 0], out)
+                return out
+
+        kernel = _convert_dynamic_validshape(Before)
+        assert isinstance(kernel.body, ir.SeqStmts)
+        events = [
+            stmt.value if isinstance(stmt, ir.AssignStmt) else stmt.expr
+            for stmt in kernel.body.stmts
+            if isinstance(stmt, (ir.AssignStmt, ir.EvalStmt))
+        ]
+        memory_ops = [
+            event.op.name
+            for event in events
+            if isinstance(event, ir.Call)
+            and event.op.name in {ir.get_op("tensor.read").name, ir.get_op("tensor.write").name}
+        ]
+        assert memory_ops == [
+            ir.get_op("tensor.read").name,
+            ir.get_op("tensor.write").name,
+            ir.get_op("tensor.read").name,
+        ]
+        reads = [
+            stmt.var
+            for stmt in kernel.body.stmts
+            if isinstance(stmt, ir.AssignStmt)
+            and isinstance(stmt.value, ir.Call)
+            and stmt.value.op.name == ir.get_op("tensor.read").name
+        ]
+        assert len(reads) == 2 and reads[0].unique_id != reads[1].unique_id
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
