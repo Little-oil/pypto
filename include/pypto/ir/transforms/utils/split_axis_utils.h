@@ -246,11 +246,12 @@ bool IsReduceOnSplitAxis(const CallPtr& call, int split_dim);
  *
  * Once a tile var has been partitioned along the split axis, downstream ops
  * (e.g. ``tile.store``, loop ``iter_args``/``return_vars``) need its halved
- * extent to re-localize their split-dim offsets. ``half_dim_size`` is that
- * extent (a ``ConstInt`` for static dims, a ``floordiv`` expression otherwise)
- * — the tile's PHYSICAL half. How far apart the two lanes' data sits is the
- * partition stride instead (see ResolveLaneStride), which equals this half
- * unless the body was rebalanced onto a ragged boundary's valid region.
+ * capacity and logical partition stride separately. ``half_dim_size`` is the
+ * per-lane PHYSICAL capacity (normally the old extent's ceil half, but aligned
+ * operator outputs may round it up). ``partition_stride`` overrides the
+ * default distance between lane intervals when alignment makes that distance
+ * differ from capacity. A body rebalanced onto valid data supplies its shared
+ * stride separately (see ResolveLaneStride).
  */
 struct TileInfo {
   ExprPtr half_dim_size;
@@ -258,6 +259,15 @@ struct TileInfo {
   // dim, but a reshape can migrate the split axis to another dimension (e.g. the
   // rms_norm [N,1]<->[1,N] column reshape), so each tracked tile carries its own.
   int split_dim = 0;
+  // Aligned result capacity can stay unchanged (or round up) while its logical
+  // lane interval shrinks. Keep that interval's stride separate from capacity.
+  ExprPtr partition_stride = nullptr;
+  // The operator's re-deduced per-lane type is authoritative for padded outputs;
+  // carrying it through aliases avoids re-halving an already aligned capacity.
+  TypePtr lane_type = nullptr;
+  // A tuple binding has no single axis. Its entry stores these per-element
+  // facts, and only projection lookups expose them as individual tile facts.
+  std::shared_ptr<const std::vector<TileInfo>> tuple_elements = nullptr;
 };
 
 /// Admission facts for a lowered data-parallel body. Broadcast roots remain
