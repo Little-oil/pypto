@@ -181,8 +181,9 @@ std::optional<TileInfo> TupleElementSplitInfo(const ExprPtr& tuple, size_t index
                                               const std::unordered_map<const Var*, TileInfo>& tile_vars) {
   auto var = AsVarLike(tuple);
   auto it = var ? tile_vars.find(var.get()) : tile_vars.end();
-  if (it == tile_vars.end() || (!it->second.tuple_elements || index >= it->second.tuple_elements->size()))
+  if (it == tile_vars.end() || (!it->second.tuple_elements || index >= it->second.tuple_elements->size())) {
     return std::nullopt;
+  }
   return (*it->second.tuple_elements)[index];
 }
 
@@ -312,12 +313,12 @@ bool DeducerPinsOperandExtent(const CallPtr& call, const HalvedCallProbe& probe,
 // skips the operand that genuinely does span the split axis. Map the axis onto
 // the operand instead, and treat a missing leading axis as broadcast.
 //
-// ``probe`` decides what this function IS. With a probe it is a GATE, and an
-// operand whose extent the deducer pins is skipped -- the type-consistency check
-// already answered for it, so this heuristic never gets to overrule the
-// operator itself. Without a probe it is only a DIAGNOSTIC refinement, naming
-// the likely operand behind a type-consistency failure; a misjudged axis is
-// then a wrong number in a message rather than a rejected program.
+// A probe lets ordinary physical-halving callers defer to the deducer's pinned
+// extents. Without one, every untracked non-broadcast positional tile is
+// reported: ordinary callers use that result to refine a failed type probe's
+// diagnostic. Aligned-capacity consumers also use it as a conservative gate,
+// because unchanged physical capacity can hide a missing logical partition;
+// a pinned physical extent alone cannot prove the lane intervals agree.
 FullWidthOperand FindFullWidthOperand(const CallPtr& call, int result_split_dim, int result_rank,
                                       const std::unordered_map<const Var*, TileInfo>& tile_vars,
                                       const std::unordered_map<const Var*, VarPtr>& var_replacements,
@@ -1203,18 +1204,23 @@ StmtPtr ProcessStmt(const StmtPtr& stmt, SplitMode mode, int split_dim,
       std::shared_ptr<const TileType> in_tt;
       std::shared_ptr<const TileType> lane_input;
       TileInfo input_info;
-      std::vector<TileInfo> positional_inputs;
+      std::vector<std::pair<TileInfo, int>> positional_inputs;
       bool has_aligned_input = false;
       for (size_t i = 0; i < call->args_.size(); ++i) {
         const auto& a = call->args_[i];
         if (auto info = OperandSplitInfo(a, tile_vars, var_replacements)) {
+          const auto arg_type = As<TileType>(a->GetType());
+          INTERNAL_CHECK_SPAN(
+              arg_type && info->split_dim >= 0 && info->split_dim < static_cast<int>(arg_type->shape_.size()),
+              call->span_)
+              << "Internal error: a tracked tile operand has no valid split axis";
           if (!DeclaredLaneInvariantKind(call, i)) {
-            positional_inputs.push_back(*info);
+            positional_inputs.emplace_back(*info, static_cast<int>(arg_type->shape_.size()));
             has_aligned_input |= info->partition_stride != nullptr;
           }
           if (in_split_dim >= 0) continue;
           in_split_dim = info->split_dim;
-          in_tt = std::dynamic_pointer_cast<const TileType>(a->GetType());
+          in_tt = arg_type;
           input_info = *info;
           auto replaced = ReplacedOperand(a, var_replacements);
           lane_input = replaced ? As<TileType>(replaced->GetType()) : nullptr;
@@ -1222,7 +1228,17 @@ StmtPtr ProcessStmt(const StmtPtr& stmt, SplitMode mode, int split_dim,
       }
       if (has_aligned_input) {
         const auto step = LogicalLaneStep(input_info, lane_stride);
-        for (const auto& info : positional_inputs) {
+        // Broadcasting aligns operands from the right: rank-1 dim 0 and
+        // rank-2 dim 1 describe the same axis. Equal strides on DIFFERENT
+        // mapped axes do not align lane intervals -- a row shard cannot use a
+        // lane-local column shard as a shared broadcast vector.
+        const int axis_from_right = input_info.split_dim - static_cast<int>(in_tt->shape_.size());
+        for (const auto& [info, rank] : positional_inputs) {
+          CHECK_SPAN(info.split_dim - rank == axis_from_right, call->span_)
+              << "LowerAutoVectorSplit: '" << op_name
+              << "' combines tiles with different logical partition axes after right-aligned "
+                 "broadcasting. Equal strides do not make their lane intervals match; derive operands "
+                 "from the same partition or move the operation outside the automatically split region.";
           const auto other_step = LogicalLaneStep(info, lane_stride);
           CHECK_SPAN(structural_equal(step, other_step), call->span_)
               << "LowerAutoVectorSplit: '" << op_name
@@ -1351,7 +1367,29 @@ StmtPtr ProcessStmt(const StmtPtr& stmt, SplitMode mode, int split_dim,
         // logical axis is admitted; shape-changing forms still need an explicit
         // split outside this automatic region.
         const auto args = BuildHalvedCallArgs(call->args_, var_replacements);
-        auto deduced = OpRegistry::GetInstance().Create(op_name, args, call->kwargs_, call->span_)->GetType();
+        TypePtr deduced;
+        try {
+          deduced = OpRegistry::GetInstance().Create(op_name, args, call->kwargs_, call->span_)->GetType();
+        } catch (const pypto::Error& err) {
+          // A full-width operand can make deduction throw before the ordinary
+          // operand gate runs. Keep the split-specific remedy and the original
+          // operator refusal, even when no particular operand explains it.
+          const int result_rank = static_cast<int>(tt->shape_.size());
+          const int result_axis = input_info.split_dim + result_rank - static_cast<int>(in_tt->shape_.size());
+          const auto full =
+              result_axis >= 0 && result_axis < result_rank
+                  ? FindFullWidthOperand(call, result_axis, result_rank, tile_vars, var_replacements)
+                  : FullWidthOperand{};
+          if (full.arg) {
+            CHECK_SPAN(false, call->span_)
+                << FullWidthOperandDiagnostic(op_name, full) << "\nOperator validation: " << err.what();
+          }
+          CHECK_SPAN(false, call->span_)
+              << "LowerAutoVectorSplit: '" << op_name
+              << "' refuses the per-lane arguments of an aligned tile: " << err.what()
+              << "\nDerive every operand from the same logical partition, or move the operation "
+                 "outside the automatically split region.";
+        }
         auto info =
             DiscoverElementSplit(tt, As<TileType>(deduced), in_tt, lane_input, input_info, lane_stride,
                                  /*require_logical_axis=*/true);
@@ -1362,11 +1400,15 @@ StmtPtr ProcessStmt(const StmtPtr& stmt, SplitMode mode, int split_dim,
         // Even when capacity happens to halve, offsets still follow the source
         // partition, which can be narrower than that physical half.
         info->partition_stride = input_info.partition_stride;
-        const HalvedCallProbe probe{&args, As<TileType>(deduced)};
-        if (auto blind = FindFullWidthOperand(call, info->split_dim, static_cast<int>(tt->shape_.size()),
-                                              tile_vars, var_replacements, &probe);
-            blind.arg) {
-          CHECK_SPAN(false, call->span_) << FullWidthOperandDiagnostic(op_name, blind);
+        // Aligned capacity can hide an unpartitioned operand: [1,8] counts
+        // with four valid entries still type-check against a full [1,8] bias,
+        // but lane 1 needs bias[4:8], not bias[0:4]. Deduction cannot establish
+        // that logical correspondence, so require positional data operands to
+        // be tracked, broadcast, or explicitly lane-invariant in the registry.
+        if (auto full = FindFullWidthOperand(call, info->split_dim, static_cast<int>(tt->shape_.size()),
+                                             tile_vars, var_replacements);
+            full.arg) {
+          CHECK_SPAN(false, call->span_) << FullWidthOperandDiagnostic(op_name, full);
         }
         auto new_call = std::make_shared<Call>(call->op_, call->args_, call->kwargs_, deduced, call->span_);
         auto new_var = std::make_shared<Var>(assign->var_->name_hint_, deduced, assign->var_->span_);

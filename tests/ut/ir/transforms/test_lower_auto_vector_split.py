@@ -2443,6 +2443,141 @@ def test_aligned_tuple_consumers_reject_different_partitions(reverse):
         _lower(Before)
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_aligned_tuple_consumers_reject_equal_strides_on_different_axes(reverse):
+    """A row shard cannot broadcast a column shard merely because both step by four.
+
+    The index output becomes [4,8] along dim 0; the count output retains [1,8]
+    capacity but has four valid columns along dim 1. Lane-local counts cannot
+    serve as the shared eight-column vector that this broadcast would require.
+    """
+    first, second = (1, 0) if reverse else (0, 1)
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            t: pl.Tensor[[8, 64], pl.FP32],
+            tmp: pl.Tile[[1, 512], pl.UINT8, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out: pl.Out[pl.Tensor[[8, 8], pl.INT32]],
+        ) -> pl.Tensor[[8, 8], pl.INT32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            src = pl.tile.load(t, [0, 0], [8, 64], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8)
+            combined = pl.tile.add(pair[first], pair[second])
+            return pl.tile.store(combined, [0, 0], out)
+
+    with pytest.raises(ValueError, match="different logical partition axes"):
+        _lower(Before)
+
+
+def test_aligned_tuple_consumer_right_aligns_different_rank_split_axes():
+    """Rank-1 dim 0 broadcasts onto rank-2 dim 1 while preserving its lane interval."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            t: pl.Tensor[[8, 64], pl.FP32],
+            tmp: pl.Tile[[1, 512], pl.UINT8, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out: pl.Out[pl.Tensor[[1, 8], pl.INT32]],
+        ) -> pl.Tensor[[1, 8], pl.INT32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            src = pl.tile.load(t, [0, 0], [8, 64], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8)
+            flat = pl.tile.reshape(pair[1], [8])
+            combined = pl.tile.add(pair[1], flat)
+            return pl.tile.store(combined, [0, 0], out)
+
+    after = _lower(Before)
+    consumer_types = []
+
+    class ConsumerTypes(ir.IRVisitor):
+        def visit_call(self, op):
+            if op.op.name == ir.get_op("tile.add").name:
+                consumer_types.append(op.type)
+            super().visit_call(op)
+
+    ConsumerTypes().visit_program(after)
+    assert len(consumer_types) == 1
+    combined_type = consumer_types[0]
+    assert len(combined_type.shape) == 2
+    row_dim, col_dim = combined_type.shape
+    assert isinstance(row_dim, ir.ConstInt) and isinstance(col_dim, ir.ConstInt)
+    assert [row_dim.value, col_dim.value] == [1, 8]
+    assert combined_type.tile_view is not None
+    valid_col = combined_type.tile_view.valid_shape[1]
+    assert isinstance(valid_col, ir.ConstInt) and valid_col.value == 4
+    assert "pl.tile.store(combined, [0, 0 + subblock_idx * 4], out)" in after.as_python()
+
+
+@pytest.mark.parametrize("rows", [8, 9])
+def test_aligned_tuple_consumer_refusal_identifies_full_width_operand(rows):
+    """Full biases need a split even if aligned count capacity stays unchanged.
+
+    R8 retains capacity eight, hiding the missing bias partition from physical
+    type checks. R9 changes capacity sixteen to eight, so deduction throws
+    first; that diagnostic must keep both the split remedy and operator cause.
+    """
+    count_cols = ((rows + 7) // 8) * 8
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            t: pl.Tensor[[rows, 64], pl.FP32],
+            bias: pl.Tile[[1, count_cols], pl.INT32, pl.Mem.Vec],
+            tmp: pl.Tile[[1, 512], pl.UINT8, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out: pl.Out[pl.Tensor[[1, count_cols], pl.INT32]],
+        ) -> pl.Tensor[[1, count_cols], pl.INT32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            src = pl.tile.load(t, [0, 0], [rows, 64], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8)
+            combined = pl.tile.add(pair[1], bias)
+            return pl.tile.store(combined, [0, 0], out)
+
+    with pytest.raises(ValueError, match="full-width operand 'bias'") as exc_info:
+        _lower(Before)
+    message = str(exc_info.value)
+    assert "LowerAutoVectorSplit" in message
+    if rows == 9:
+        assert "Operator validation:" in message
+        assert "requires compatible shapes" in message
+
+
+def test_aligned_tuple_consumer_refusal_preserves_operator_error_without_full_width_operand():
+    """An authored identity reshape can become invalid after aligned capacity changes."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            t: pl.Tensor[[9, 64], pl.FP32],
+            tmp: pl.Tile[[1, 512], pl.UINT8, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out: pl.Out[pl.Tensor[[1, 16], pl.INT32]],
+        ) -> pl.Tensor[[1, 16], pl.INT32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            src = pl.tile.load(t, [0, 0], [9, 64], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8)
+            reshaped = pl.tile.reshape(pair[1], [1, 16])
+            return pl.tile.store(reshaped, [0, 0], out)
+
+    with pytest.raises(ValueError, match="refuses the per-lane arguments of an aligned tile") as exc_info:
+        _lower(Before)
+    message = str(exc_info.value)
+    assert "LowerAutoVectorSplit: 'tile.reshape'" in message
+    assert "cannot reshape tile of size 8 into shape with size 16" in message
+    assert "outside the automatically split region" in message
+
+
 def test_aligned_tuple_consumer_rejects_promoting_padding_to_data():
     """Filling both eight-cell capacities cannot be stored at a five-cell stride."""
 

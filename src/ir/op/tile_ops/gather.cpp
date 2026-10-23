@@ -442,7 +442,14 @@ static TypePtr DeduceTileGatherCompareType(const std::vector<ExprPtr>& args,
   const auto src_view = tile_view_semantics::GetEffectiveTileView(*src_type);
   const ExprPtr& valid_rows = src_view.valid_shape[0];
   constexpr int64_t kVecRowBytes = 32;
-  const int64_t counts_per_block = kVecRowBytes / static_cast<int64_t>(count_dtype.GetByte());
+  const int64_t count_bytes = static_cast<int64_t>(count_dtype.GetByte());
+  // Validate the storage-width contract before either division or remainder.
+  // Dtype identity alone does not establish a nonzero GetByte() for analysis.
+  INTERNAL_CHECK_SPAN(count_bytes > 0 && count_bytes <= kVecRowBytes && kVecRowBytes % count_bytes == 0,
+                      args[0]->span_)
+      << "Internal error: gather count element width must be a positive divisor of " << kVecRowBytes
+      << " bytes, got " << count_bytes;
+  const int64_t counts_per_block = kVecRowBytes / count_bytes;
   ExprPtr count_cols;
   if (auto rows = As<ConstInt>(rows_expr)) {
     CHECK_SPAN(rows->value_ > 0, args[0]->span_)
