@@ -2478,13 +2478,13 @@ class TopDownRetargeter {
     if (!target || !def.definition_stmt) return false;
     auto component = memref_component_.find(target.get());
     if (component == memref_component_.end()) return false;
-    // Preserve the legacy destructive contract inside a carry's own ForStmt.
-    // Only an enclosing loop can add the independent next-entry observation
-    // that this guard protects before For-carry producer retargeting.
-    const size_t recurrence_begin = def.nearest_for ? stmt_order_.at(def.nearest_for.get()) : def.order;
+    // Include every recurrence interval spanning this producer, including its
+    // own For: a handle defined before that For can observe the old seed on
+    // the next iteration. Reads of the advancing carry itself already exclude
+    // its own loop when the recurrence index compares logical definitions.
     auto recurring = recurring_physical_read_index_.find(component->second);
-    if (recurrence_begin != 0 && recurring != recurring_physical_read_index_.end() &&
-        recurring->second.HasAfter(0, recurrence_begin - 1, def.order)) {
+    if (recurring != recurring_physical_read_index_.end() &&
+        recurring->second.HasAfter(0, def.order, def.order)) {
       return false;
     }
     auto accesses = physical_access_index_.find(component->second);
@@ -5152,6 +5152,13 @@ class YieldFixupMutator : public StorageBoundaryMutator {
 
   template <typename LoopPtr>
   StmtPtr FixupCanonicalLoop(const LoopPtr& loop) {
+    // Tensor descriptors are reanchored by their dedicated boundary logic.
+    // This fixup only reconciles Tile storage; preserve Tensor-only bodies,
+    // including their writeback statements and sequence structure at zero trips.
+    if (std::none_of(loop->iter_args_.begin(), loop->iter_args_.end(),
+                     [](const IterArgPtr& argument) { return As<TileType>(argument->GetType()); })) {
+      return loop;
+    }
     if (!LoopMayExecute(loop, false)) {
       // The body cannot run, so no transfer into a carry is needed. Give the
       // unreachable boundary canonical identity yields rather than requesting
