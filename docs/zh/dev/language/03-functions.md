@@ -52,6 +52,23 @@ second = slice_kernel.compile()  # A distinct specialization with 64 rows.
 内部状态，或修改编译器/源码文件。持久复用还需要完整的
 [产物身份与缓存策略](../10-jit-cache.md)。
 
+### 动态维度元数据
+
+解析特化程序前，JIT 会推导局部 `TensorMeta`，为仅有裸张量注解的 helper 补齐实参类型。
+标量维度绑定使用 `int`、`DynDim` 或表示未知的 `None`。动态算术创建新的
+`pending_binding=True` 的 `DynDim`；赋值别名保留同一个对象，后续算术则创建不同的快照。
+
+- `pending_binding=True`：已识别的维度算术，等待建立结果轴符号，不能进入 `TensorMeta.shape`。
+- `pending_binding=False`：可用于张量类型的动态符号。
+
+reshape 推导把待绑定值替换为结果专属符号。同一结果 shape 内重复使用同一快照时共享
+符号；不同结果建立独立绑定。被调函数从实际张量参数的描述符（descriptor）读取维度。
+原始算术及 reshape 校验仍保留在程序中，占位上界不会替代真实运行时尺寸。
+
+`synthesized` 与 `pending_binding` 相互独立：前者标记自动生成的占位符号，继续沿用
+既有注解覆盖及 helper 返回行为。`TensorMeta` 在构造时拒绝待绑定维度，避免临时标量状态
+泄漏到生成的张量注解中。
+
 ### 编译选项与诊断请求
 
 JIT 调用和 `kernel.compile()` 在查找进程内产物之前解析编译选项。

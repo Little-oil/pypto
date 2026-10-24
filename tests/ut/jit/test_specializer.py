@@ -2135,6 +2135,18 @@ class TestTensorLayoutAnnotation:
     dropped without a word and the parameter silently became ND.
     """
 
+    def test_tensor_meta_rejects_pending_dimension(self):
+        """A scalar arithmetic snapshot cannot be emitted as a tensor axis before binding."""
+        pending = DynDim(
+            name="",
+            literal="",
+            static_bound=1,
+            synthesized=True,
+            pending_binding=True,
+        )
+        with pytest.raises(ValueError, match="pending"):
+            TensorMeta((16, pending), DataType.FP32)
+
     def test_layout_str_renders_dsl_constant(self):
         assert _layout_str(ir.TensorLayout.NZ) == "pl.NZ"
         assert _layout_str(ir.TensorLayout.MX_A_ZZ) == "pl.MX_A_ZZ"

@@ -61,7 +61,7 @@ from ._source import _UNBOUND, function_namespace
 
 @dataclass(frozen=True)
 class DynDim:
-    """A shape dim bound to a DynVar at JIT specialization time.
+    """A dynamic dimension, optionally awaiting a result-axis binding.
 
     Attributes:
         name:        Python variable name used in user source (e.g. ``"M"``).
@@ -79,12 +79,18 @@ class DynDim:
                      ``pl.dynamic`` replaces it with the user's symbol, so a
                      kernel body referencing that name stays bound. A DynDim the
                      caller actually derived is never replaced.
+        pending_binding: True for a dimension-arithmetic snapshot that has not
+                     acquired a result-axis symbol yet. Such values live only
+                     in the metadata walker's scalar bindings. Their names and
+                     bound are placeholders; shape inference creates a fresh,
+                     non-pending symbol before placing them in TensorMeta.
     """
 
     name: str
     literal: str
     static_bound: int
     synthesized: bool = False
+    pending_binding: bool = False
 
 
 ShapeDim = int | DynDim
@@ -108,6 +114,14 @@ class TensorMeta:
     shape: tuple[ShapeDim, ...]
     dtype: DataType
     layout: TensorLayout | None = None
+
+    def __post_init__(self) -> None:
+        for axis, dim in enumerate(self.shape):
+            if isinstance(dim, DynDim) and dim.pending_binding:
+                raise ValueError(
+                    f"TensorMeta shape axis {axis} contains pending dimension {dim.name!r}; "
+                    "bind it to a result-axis symbol before building tensor metadata"
+                )
 
     def static_shape(self) -> tuple[int, ...]:
         """Concrete shape tuple — DynDim dims collapse to their static_bound."""

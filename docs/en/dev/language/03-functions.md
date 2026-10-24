@@ -64,6 +64,29 @@ or editing compiler/source files during compilation is not supported by this
 constant-tracking mechanism. Persistent reuse additionally requires the full
 [artifact identity and cache policy](../10-jit-cache.md).
 
+### Dynamic dimension metadata
+
+Before parsing the specialized program, the JIT infers local `TensorMeta` values
+to type arguments passed to bare-annotated helpers. Scalar dimension bindings
+use `int`, `DynDim`, or `None` (unknown). Dynamic arithmetic creates a fresh
+`DynDim` with `pending_binding=True`; assignment aliases retain that object,
+while subsequent arithmetic creates a different snapshot.
+
+- `pending_binding=True`: recognized dimension arithmetic awaiting a result-axis
+  symbol. It cannot enter `TensorMeta.shape`.
+- `pending_binding=False`: a dynamic symbol usable in a tensor type.
+
+Reshape inference replaces pending values with result-specific symbols. Repeated
+uses of the same snapshot within one result shape share a symbol; separate
+results get independent bindings. The callee reads the dimension from its actual
+tensor argument's descriptor. The original arithmetic and reshape validation
+remain in the program; placeholder bounds do not replace runtime extents.
+
+`synthesized` is independent of `pending_binding`: it records an automatically
+generated placeholder symbol and retains its existing annotation-overlay and
+helper-return behavior. `TensorMeta` rejects pending dimensions at construction,
+so temporary scalar state cannot leak into generated tensor annotations.
+
 ### Compile options and diagnostic requests
 
 JIT calls and `kernel.compile()` resolve compile options before looking up an
