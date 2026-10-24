@@ -205,6 +205,9 @@ to individual assignments before parsing. Static integer aliases fold normally;
 unknown runtime values and invalid arithmetic remain unresolved. Aliases rebound
 under conditionals or loops are handled conservatively across control-flow
 boundaries, rather than assuming the value from one syntactic execution.
+After a tensor variable is rebound, shape reads use its current value, including
+whole-shape unpacking and results of tensor operations. Shape and dtype arguments
+such as `shape=src.shape` and `dtype=src.dtype` also use the current tensor type.
 Unrelated branches and loops keep existing aliases; a loop-carried alias becomes
 unknown until a definite assignment establishes its value in the current iteration.
 Mutually exclusive `if`/`elif`/`else` arms start from the same incoming scalar

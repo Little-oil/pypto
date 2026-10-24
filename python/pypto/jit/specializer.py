@@ -964,6 +964,8 @@ class _BodyTransformer(ast.NodeTransformer):
             elif name in self._meta:
                 # Keep the original parameter metadata for its original version.
                 self._var_renames[name] = name
+        elif self._var_renames.get(name) == name:
+            self._var_renames.pop(name)
 
     def _visit_simple_assign(self, node: ast.Assign) -> ast.stmt:
         """Handle a single-target name assignment with alpha-renaming support."""
@@ -1273,15 +1275,6 @@ class _BodyTransformer(ast.NodeTransformer):
                 for part in parts[1:]:
                     result = ast.Attribute(value=result, attr=part, ctx=ast.Load())
                 return result
-        if (
-            isinstance(node.value, ast.Name)
-            and node.value.id in self._var_renames
-            and node.attr in ("shape", "dtype")
-        ):
-            raise ValueError(
-                f"Cannot resolve {node.value.id}.{node.attr} after a tensor rebinding with unknown metadata; "
-                "use pl.tensor.dim(tensor, axis) for individual dimensions"
-            )
         return cast("ast.expr", self.generic_visit(node))
 
     def visit_Subscript(self, node: ast.Subscript) -> ast.expr:

@@ -242,6 +242,25 @@ class TestTupleRoundTrip:
         assert by_name["_first"].value is by_name["first"].var
         assert by_name["_second"].value is by_name["second"].var
 
+    def test_tensor_shape_unpack_preserves_dynamic_symbol(self):
+        """Shape unpacking after an op keeps the signature's extent identity."""
+        extent = pl.dynamic("ROWS")
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, src: pl.Tensor[[extent, 64], pl.FP32], other: pl.Tensor[[extent, 64], pl.FP32]):
+                src = pl.add(src, other)
+                rows, cols = src.shape
+                observed = (rows, cols)
+                return observed
+
+        func = next(iter(Program.functions.values()))
+        tensor_type = func.params[0].type
+        assert isinstance(tensor_type, ir.TensorType)
+        observed = next(stmt for stmt in _assign_stmts(func) if stmt.var.name_hint == "observed")
+        assert _make_tuple(observed).elements[0] is tensor_type.shape[0]
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

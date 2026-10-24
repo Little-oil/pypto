@@ -1441,6 +1441,11 @@ class TestVariableRebinding:
         src = """
             def f(src, other):
                 before = src.shape[1]
+                saved = src
+                with scope():
+                    src = identity(src)
+                    src = saved
+                    restored = src.shape
                 with scope():
                     src = other
                     nested = src.shape[1]
@@ -1453,7 +1458,7 @@ class TestVariableRebinding:
                 src: object = src
                 annotated = src.shape
                 total = src.shape[0] * width
-                return before, nested, width, half, total, rows, cols, tail, whole, dtype, annotated
+                return before, nested, width, half, total, rows, cols, tail, whole, dtype, annotated, restored
         """
         transformed = self._transform(
             src,
@@ -1467,6 +1472,7 @@ class TestVariableRebinding:
                 tensor=SimpleNamespace(dim=lambda tensor, axis: tensor[axis]), FP16=DataType.FP16
             ),
             "scope": nullcontext,
+            "identity": lambda tensor: tensor,
         }
         exec(transformed, namespace)
         assert namespace["f"]((1, 128), (4, 64, 2)) == (
@@ -1481,6 +1487,7 @@ class TestVariableRebinding:
             (4, 64, 2),
             DataType.FP16,
             (4, 64, 2),
+            (1, 128),
         )
 
     def test_alias_skips_collision(self):

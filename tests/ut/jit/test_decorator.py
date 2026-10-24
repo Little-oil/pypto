@@ -5112,21 +5112,51 @@ class TestRuntimeSizedLocalExtents:
             view = pl.reshape(src, [rows * cols // half, half])
             return consume(view, view, out)
 
+        def via_add(
+            src: pl.Tensor[[4, 64], pl.FP32],
+            other: pl.Tensor[[4, 64], pl.FP32],
+            out: pl.Out[pl.Tensor[[1, 32], pl.FP32]],
+        ):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                src = pl.add(src, other)
+                rows, cols = pl.tensor.dim(src, 0), pl.tensor.dim(src, 1)
+                _shape_view = pl.reshape(src, shape=[rows, cols])
+                _buffer = pl.create_tensor([rows, cols], dtype=pl.FP32)
+                view = pl.reshape(src, [rows * cols // 32, 32])
+                out[:, :] = view[:1, :]
+            return out
+
+        def via_reshape(src: pl.Tensor, out: pl.Out[pl.Tensor[[1, 32], pl.FP32]]):
+            src = pl.reshape(src, [256])
+            length = pl.tensor.dim(src, 0)
+            view = pl.reshape(src, [length // 32, 32])
+            return consume(view, view, out)
+
         # Trace indexed shape syntax without Tensor.shape's optional Python type.
         get_lines = inspect.getsourcelines
-        lines, line = get_lines(rebound)
-        source = "".join(lines).replace(
-            "rows, cols = pl.tensor.dim(src, 0), pl.tensor.dim(src, 1)", "rows, cols = src.shape"
-        )
-        source = source.replace("pl.tensor.dim(src, 1)", "src.shape[1]")
-        source = source.replace("pl.tensor.dim(src, 0)", "src.shape[0]")
-        monkeypatch.setattr(
-            inspect,
-            "getsourcelines",
-            lambda f: (source.splitlines(keepends=True), line) if f is rebound else get_lines(f),
-        )
-        compiled = jit(rebound).compile(torch.empty(1, 128), torch.empty(4, 64), torch.empty(1, 32))
-        assert isinstance(compiled, CompiledProgram)
+        for func, args in (
+            (rebound, (torch.empty(1, 128), torch.empty(4, 64), torch.empty(1, 32))),
+            (via_add, (torch.empty(4, 64), torch.empty(4, 64), torch.empty(1, 32))),
+            (via_reshape, (torch.empty(4, 64), torch.empty(1, 32))),
+        ):
+            lines, line = get_lines(func)
+            source = "".join(lines).replace(
+                "rows, cols = pl.tensor.dim(src, 0), pl.tensor.dim(src, 1)", "rows, cols = src.shape"
+            )
+            source = source.replace("length = pl.tensor.dim(src, 0)", "length, = src.shape")
+            source = source.replace("pl.tensor.dim(src, 1)", "src.shape[1]")
+            source = source.replace("pl.tensor.dim(src, 0)", "src.shape[0]")
+            source = source.replace("shape=[rows, cols]", "shape=src.shape")
+            source = source.replace("dtype=pl.FP32", "dtype=src.dtype")
+            monkeypatch.setattr(
+                inspect,
+                "getsourcelines",
+                lambda f, func=func, source=source, line=line: (
+                    (source.splitlines(keepends=True), line) if f is func else get_lines(f)
+                ),
+            )
+            compiled = jit(func).compile(*args)
+            assert isinstance(compiled, CompiledProgram)
 
     def test_descriptor_reshape_alias_invalid_rebindings_are_forgotten(self):
         """Unknown rebindings and loop targets invalidate an earlier known arithmetic alias."""
