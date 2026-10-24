@@ -5106,15 +5106,19 @@ class TestRuntimeSizedLocalExtents:
             out: pl.Out[pl.Tensor[[1, 32], pl.FP32]],
         ):
             src = other
+            rows, cols = pl.tensor.dim(src, 0), pl.tensor.dim(src, 1)
             width = pl.tensor.dim(src, 1)
             half = width // 2
-            view = pl.reshape(src, [pl.tensor.dim(src, 0) * 2, half])
+            view = pl.reshape(src, [rows * cols // half, half])
             return consume(view, view, out)
 
         # Trace indexed shape syntax without Tensor.shape's optional Python type.
         get_lines = inspect.getsourcelines
         lines, line = get_lines(rebound)
-        source = "".join(lines).replace("pl.tensor.dim(src, 1)", "src.shape[1]")
+        source = "".join(lines).replace(
+            "rows, cols = pl.tensor.dim(src, 0), pl.tensor.dim(src, 1)", "rows, cols = src.shape"
+        )
+        source = source.replace("pl.tensor.dim(src, 1)", "src.shape[1]")
         source = source.replace("pl.tensor.dim(src, 0)", "src.shape[0]")
         monkeypatch.setattr(
             inspect,

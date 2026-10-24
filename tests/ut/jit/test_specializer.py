@@ -1447,21 +1447,41 @@ class TestVariableRebinding:
                 src = other
                 width = src.shape[1]
                 half = width // 2
-                return before, nested, width, half, src.shape[0] * width
+                rows, cols, tail = src.shape
+                whole = src.shape
+                dtype = src.dtype
+                src: object = src
+                annotated = src.shape
+                total = src.shape[0] * width
+                return before, nested, width, half, total, rows, cols, tail, whole, dtype, annotated
         """
         transformed = self._transform(
             src,
             tensor_meta={
                 "src": TensorMeta((1, 128), DataType.FP32),
-                "other": TensorMeta((4, 64), DataType.FP32),
+                "other": TensorMeta((4, 64, 2), DataType.FP16),
             },
         )
         namespace = {
-            "pl": SimpleNamespace(tensor=SimpleNamespace(dim=lambda tensor, axis: tensor[axis])),
+            "pl": SimpleNamespace(
+                tensor=SimpleNamespace(dim=lambda tensor, axis: tensor[axis]), FP16=DataType.FP16
+            ),
             "scope": nullcontext,
         }
         exec(transformed, namespace)
-        assert namespace["f"]((1, 128), (4, 64)) == (128, 64, 64, 32, 256)
+        assert namespace["f"]((1, 128), (4, 64, 2)) == (
+            128,
+            64,
+            64,
+            32,
+            256,
+            4,
+            64,
+            2,
+            (4, 64, 2),
+            DataType.FP16,
+            (4, 64, 2),
+        )
 
     def test_alias_skips_collision(self):
         """Generated alias skips names already defined by the user."""

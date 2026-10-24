@@ -847,7 +847,7 @@ class _BodyTransformer(ast.NodeTransformer):
         dep_call_targets: Mapping[int, str] | None = None,
     ) -> None:
         super().__init__()
-        self._meta = tensor_meta
+        self._meta = dict(tensor_meta)
         self._constexpr = dict(constexpr_values or {})
         self._dep_constexpr_params = dep_constexpr_params or {}
         self._dep_names = dep_names
@@ -944,9 +944,32 @@ class _BodyTransformer(ast.NodeTransformer):
         """Return mapping from generated alias → original user variable name."""
         return dict(self._alias_to_original)
 
+    def _known_tensor_name(self, name: str) -> str | None:
+        """Resolve known metadata without falling back to a rebound parameter."""
+        current = self._var_renames.get(name, name)
+        if current == name and name in self._var_renames:
+            return None
+        return current if current in self._meta else None
+
+    def _record_tensor_meta(self, name: str, meta: TensorMeta | None, *, reuses_name: bool = False) -> None:
+        """Keep metadata per emitted SSA name; invalidate conflicting scoped writes."""
+        if not reuses_name:
+            if meta is None:
+                self._meta.pop(name, None)
+            else:
+                self._meta[name] = meta
+        elif meta is None or meta != self._meta.get(name):
+            if name in self._alias_to_original:
+                self._meta.pop(name, None)
+            elif name in self._meta:
+                # Keep the original parameter metadata for its original version.
+                self._var_renames[name] = name
+
     def _visit_simple_assign(self, node: ast.Assign) -> ast.stmt:
         """Handle a single-target name assignment with alpha-renaming support."""
         var_name = cast(ast.Name, node.targets[0]).id
+        source = self._known_tensor_name(node.value.id) if isinstance(node.value, ast.Name) else None
+        value_meta = self._meta.get(source) if source is not None else None
         visited_value = self.visit(node.value)
         if var_name in self._assign_count:
             # Only rename at the same scope where the variable was first defined.
@@ -954,6 +977,7 @@ class _BodyTransformer(ast.NodeTransformer):
             # updates — do not rename them.
             if self._scope_depth == self._assign_depth[var_name]:
                 new_name = self._rebind(var_name)
+                self._record_tensor_meta(new_name, value_meta)
                 new_node = ast.Assign(
                     targets=[ast.Name(id=new_name, ctx=ast.Store())],
                     value=visited_value,
@@ -968,14 +992,12 @@ class _BodyTransformer(ast.NodeTransformer):
             if var_name in self._var_renames:
                 renamed = self._var_renames[var_name]
                 node.targets = [ast.Name(id=renamed, ctx=ast.Store())]
-            elif var_name in self._meta:
-                # A deeper-scope tensor rebind keeps its name, but invalidates
-                # shape constants from the original parameter all the same.
-                self._var_renames[var_name] = var_name
+            self._record_tensor_meta(self._var_renames.get(var_name, var_name), value_meta, reuses_name=True)
             node.value = visited_value
             return node
         # First assignment: record and keep original name.
         self._record_first_assign(var_name)
+        self._record_tensor_meta(var_name, value_meta)
         node.value = visited_value
         return node
 
@@ -1018,17 +1040,12 @@ class _BodyTransformer(ast.NodeTransformer):
 
     def _shape_tuple_node(self, param_name: str) -> ast.Tuple:
         meta = self._meta[param_name]
-        elts: list[ast.expr] = []
-        for i, d in enumerate(meta.shape):
-            if isinstance(d, DynDim):
-                elts.append(self._dyn_dim_expr(param_name, i))
-            else:
-                elts.append(ast.Constant(value=d))
+        elts = [self._shape_dim_node(param_name, i) for i in range(len(meta.shape))]
         return ast.Tuple(elts=elts, ctx=ast.Load())
 
     def _shape_dim_node(self, param_name: str, dim_idx: int) -> ast.expr:
         d = self._meta[param_name].shape[dim_idx]
-        if isinstance(d, DynDim):
+        if isinstance(d, DynDim) or param_name in self._alias_to_original:
             return self._dyn_dim_expr(param_name, dim_idx)
         return ast.Constant(value=d)
 
@@ -1091,10 +1108,8 @@ class _BodyTransformer(ast.NodeTransformer):
             and isinstance(node.value, ast.Attribute)
             and node.value.attr == "shape"
             and isinstance(node.value.value, ast.Name)
-            and node.value.value.id in self._meta
-            and node.value.value.id not in self._var_renames
+            and (param_name := self._known_tensor_name(node.value.value.id)) is not None
         ):
-            param_name = node.value.value.id
             meta = self._meta[param_name]
             target_names = node.targets[0].elts
             if len(target_names) == len(meta.shape):
@@ -1102,7 +1117,7 @@ class _BodyTransformer(ast.NodeTransformer):
                 for i, (tgt, dim) in enumerate(zip(target_names, meta.shape, strict=True)):
                     if not isinstance(tgt, ast.Name):
                         continue
-                    if isinstance(dim, DynDim):
+                    if isinstance(dim, DynDim) or param_name in self._alias_to_original:
                         # Dynamic dim: emit M = pl.tensor.dim(<param>, i) so the
                         # DynVar name never appears as a runtime expression.
                         lhs_name = tgt.id
@@ -1159,6 +1174,8 @@ class _BodyTransformer(ast.NodeTransformer):
         if not isinstance(node.target, ast.Name):
             return cast("ast.stmt", self.generic_visit(node))
         var_name = node.target.id
+        source = self._known_tensor_name(node.value.id) if isinstance(node.value, ast.Name) else None
+        value_meta = self._meta.get(source) if source is not None else None
         node.value = self.visit(node.value)
         # Inline shape constants in the local annotation too (e.g. a body-level
         # ``x: pl.Tile[[1, W_PAD], pl.FP32]`` where ``W_PAD`` is a module-level
@@ -1168,6 +1185,7 @@ class _BodyTransformer(ast.NodeTransformer):
         if var_name in self._assign_count:
             if self._scope_depth == self._assign_depth[var_name]:
                 new_name = self._rebind(var_name)
+                self._record_tensor_meta(new_name, value_meta)
                 new_node = ast.AnnAssign(
                     target=ast.Name(id=new_name, ctx=ast.Store()),
                     annotation=node.annotation,
@@ -1178,8 +1196,12 @@ class _BodyTransformer(ast.NodeTransformer):
                 )
                 ast.fix_missing_locations(new_node)
                 return new_node
+            current_name = self._var_renames.get(var_name, var_name)
+            node.target = ast.copy_location(ast.Name(id=current_name, ctx=ast.Store()), node.target)
+            self._record_tensor_meta(current_name, value_meta, reuses_name=True)
         else:
             self._record_first_assign(var_name)
+            self._record_tensor_meta(var_name, value_meta)
         return cast("ast.stmt", node)
 
     # ------------------------------------------------------------------
@@ -1239,10 +1261,8 @@ class _BodyTransformer(ast.NodeTransformer):
         """Replace a.shape → tuple and a.dtype → pl.XXX."""
         if (
             isinstance(node.value, ast.Name)
-            and node.value.id in self._meta
-            and node.value.id not in self._var_renames
+            and (param_name := self._known_tensor_name(node.value.id)) is not None
         ):
-            param_name = node.value.id
             if node.attr == "shape":
                 return self._shape_tuple_node(param_name)
             if node.attr == "dtype":
@@ -1253,6 +1273,15 @@ class _BodyTransformer(ast.NodeTransformer):
                 for part in parts[1:]:
                     result = ast.Attribute(value=result, attr=part, ctx=ast.Load())
                 return result
+        if (
+            isinstance(node.value, ast.Name)
+            and node.value.id in self._var_renames
+            and node.attr in ("shape", "dtype")
+        ):
+            raise ValueError(
+                f"Cannot resolve {node.value.id}.{node.attr} after a tensor rebinding with unknown metadata; "
+                "use pl.tensor.dim(tensor, axis) for individual dimensions"
+            )
         return cast("ast.expr", self.generic_visit(node))
 
     def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
@@ -1473,6 +1502,7 @@ class _BodyTransformer(ast.NodeTransformer):
         self._assign_count.pop(name, None)
         self._assign_depth.pop(name, None)
         self._var_renames.pop(name, None)
+        self._meta.pop(name, None)
 
     def _make_bridge_assignments(self, rebind_vars: list[str]) -> list[ast.stmt]:
         """Create bridge assignments (``x_v1 = x``) and apply renames for each variable.
@@ -1489,7 +1519,10 @@ class _BodyTransformer(ast.NodeTransformer):
         for var_name in rebind_vars:
             # Get the current read-name for this variable (could already be an alias)
             current_name = self._var_renames.get(var_name, var_name)
+            source = self._known_tensor_name(var_name)
+            value_meta = self._meta.get(source) if source is not None else None
             new_name = self._rebind(var_name)
+            self._record_tensor_meta(new_name, value_meta)
             # Update assign_depth to the outer scope so the loop body sees a
             # depth mismatch and does NOT trigger another rebind.
             self._assign_depth[var_name] = self._scope_depth
