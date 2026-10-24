@@ -198,8 +198,9 @@ a negative axis. Dynamic unary `+` remains unsupported.
 
 Intermediate scalar aliases work as well: `total = src.shape[0] * src.shape[1]`
 followed by `flat = pl.reshape(src, [total])` preserves the dynamic extent.
-Aliases snapshot their operands at assignment, so rebinding a source name does
-not change an already computed alias. Chains of simple names such as
+Scalar calculations stay scalar: inference records immutable expression snapshots
+and creates dynamic-axis symbols when recording a tensor shape. Rebinding a source
+name does not change an already computed alias. Chains of simple names such as
 `total = half = total // 2` evaluate the right-hand side once and are lowered
 to individual assignments before parsing. Static integer aliases fold normally;
 unknown runtime values and invalid arithmetic remain unresolved. Aliases rebound

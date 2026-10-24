@@ -1477,30 +1477,20 @@ def _assignment_parts(stmt: ast.stmt) -> tuple[list[ast.expr], ast.expr | None] 
     return None
 
 
-_DimValue = ShapeDim | None
-_PendingShapeDims = dict[int, tuple[DynDim, DynDim]]
+_ScalarExpr = tuple[type[ast.operator | ast.unaryop], tuple["_DimValue", ...]]
+_DimValue = ShapeDim | _ScalarExpr | None
+_BoundShapeDims = dict[int, tuple[_ScalarExpr, DynDim]]
 
 
-def _pending_dyn_dim() -> DynDim:
-    """Snapshot dimension arithmetic before a result axis supplies its symbol.
-
-    Names and bounds are placeholders, never emitted. Object identity keeps
-    aliases together without equating independent computations or retaining
-    an expression AST whose names could be rebound later.
-    """
-    return DynDim(name="", literal="", static_bound=1, synthesized=True, pending_binding=True)
-
-
-def _bind_pending_shape_dim(
-    value: _DimValue, bound_dim: DynDim | None, bound_dims: _PendingShapeDims | None
+def _bind_scalar_shape_dim(
+    value: _DimValue, bound_dim: DynDim | None, bound_dims: _BoundShapeDims | None
 ) -> ShapeDim | None:
-    """Bind a pending snapshot, sharing its symbol only within one result shape."""
-    if not isinstance(value, DynDim) or not value.pending_binding:
+    """Give a scalar expression an axis symbol, shared only within one result shape."""
+    if not isinstance(value, tuple):
         return value
     if bound_dim is None or bound_dims is None:
         return bound_dim
-    # Keep the marker alive: a temporary inline expression must not reuse the
-    # identity of an earlier axis after that marker has been garbage-collected.
+    # Keep the snapshot alive so a later inline expression cannot reuse its id.
     return bound_dims.setdefault(id(value), (value, bound_dim))[1]
 
 
@@ -1544,15 +1534,15 @@ def _resolve_dim_binop(elt: ast.BinOp, resolve: Callable[[ast.expr], _DimValue])
     rhs = resolve(elt.right)
     if isinstance(lhs, int) and isinstance(rhs, int):
         return _fold_int_arith(elt.op, lhs, rhs)
-    # An abstract result claims neither equality with an operand nor a sample
-    # value. Unknown or invalid subexpressions still invalidate the whole dim.
+    # Keep the operation and operand snapshots, not a sample dimension value.
+    # Unknown or invalid subexpressions still invalidate the whole expression.
     if (
         lhs is not None
         and rhs is not None
         and isinstance(elt.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv))
         and not (isinstance(elt.op, ast.FloorDiv) and rhs == 0)
     ):
-        return _pending_dyn_dim()
+        return type(elt.op), (lhs, rhs)
     return None
 
 
@@ -1638,7 +1628,24 @@ def _update_local_tensor_meta(
         elif isinstance(fn, ast.Name) and fn.id in deps.io:
             # The in-place ``Out``-param convention first; a callee that
             # allocates its own results falls through to its return statement.
-            dep_returns = [_dep_out_metas_or_return(value, fn.id, target, deps, local) for target in targets]
+            if len(targets) > 1 and all(isinstance(target, ast.Name) for target in targets):
+                names = [target.id for target in targets if isinstance(target, ast.Name)]
+                result = _dep_out_metas_or_return(value, fn.id, targets[0], deps, local)
+                shared_meta = result.metas.get(names[0])
+                shared_stale = names[0] in result.stale
+                # A chain evaluates one call. Relabel its single result rather
+                # than inventing fresh derived dimensions for every alias.
+                dep_returns = [
+                    _DepReturn(
+                        {} if shared_meta is None else {name: shared_meta},
+                        frozenset({name}) if shared_stale else frozenset(),
+                    )
+                    for name in names
+                ]
+            else:
+                dep_returns = [
+                    _dep_out_metas_or_return(value, fn.id, target, deps, local) for target in targets
+                ]
             # Preserve the existing dependency-result behavior when neither
             # rule resolves the callee's results: an already-known target keeps
             # its metadata until a later supported rebinding can refine it.
@@ -2193,8 +2200,8 @@ def _extract_local_tensor_metas(
                     static_unary_plus.get((elt.lineno, elt.col_offset)), _resolve_dim_value(elt.operand)
                 )
             v = _resolve_dim_value(elt.operand)
-            if isinstance(v, DynDim) and isinstance(elt.op, ast.USub):
-                return _pending_dyn_dim()
+            if isinstance(v, (DynDim, tuple)) and isinstance(elt.op, ast.USub):
+                return type(elt.op), (v,)
             if not isinstance(v, int):
                 return None
             if isinstance(elt.op, ast.USub):
@@ -2203,9 +2210,9 @@ def _extract_local_tensor_metas(
         return None
 
     def _resolve_shape_elt(
-        elt: ast.expr, bound_dim: DynDim | None = None, bound_dims: _PendingShapeDims | None = None
+        elt: ast.expr, bound_dim: DynDim | None = None, bound_dims: _BoundShapeDims | None = None
     ) -> ShapeDim | None:
-        return _bind_pending_shape_dim(_resolve_dim_value(elt), bound_dim, bound_dims)
+        return _bind_scalar_shape_dim(_resolve_dim_value(elt), bound_dim, bound_dims)
 
     def _resolve_int(elt: ast.expr) -> int | None:
         """Integer-only wrapper retained for _slice_meta's existing call site."""
@@ -2248,7 +2255,7 @@ def _extract_local_tensor_metas(
         if not isinstance(node, (ast.List, ast.Tuple)):
             return None
         dims: list[ShapeDim] = []
-        bound_dims: _PendingShapeDims = {}
+        bound_dims: _BoundShapeDims = {}
         for i, elt in enumerate(node.elts):
             bound_dim = (
                 _synthesized_dyn_dim(func_def.name, dyn_base, i)

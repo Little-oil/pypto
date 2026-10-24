@@ -67,25 +67,21 @@ constant-tracking mechanism. Persistent reuse additionally requires the full
 ### Dynamic dimension metadata
 
 Before parsing the specialized program, the JIT infers local `TensorMeta` values
-to type arguments passed to bare-annotated helpers. Scalar dimension bindings
-use `int`, `DynDim`, or `None` (unknown). Dynamic arithmetic creates a fresh
-`DynDim` with `pending_binding=True`; assignment aliases retain that object,
-while subsequent arithmetic creates a different snapshot.
+to type arguments passed to bare-annotated helpers. Scalar bindings use `int`
+constants, existing-axis `DynDim` references, immutable expression tuples, or
+`None` (unknown). For `width = n * 8`, the snapshot is `(ast.Mult, (n_dim, 8))`.
+Assignment aliases retain that tuple; subsequent arithmetic creates a different
+snapshot. Rebinding an operand's source name does not change an earlier snapshot.
 
-- `pending_binding=True`: recognized dimension arithmetic awaiting a result-axis
-  symbol. It cannot enter `TensorMeta.shape`.
-- `pending_binding=False`: a dynamic symbol usable in a tensor type.
-
-Reshape inference replaces pending values with result-specific symbols. Repeated
+Reshape inference gives scalar expressions result-specific `DynDim` symbols
+when recording `TensorMeta.shape`; scalar snapshots stay outside tensor types. Repeated
 uses of the same snapshot within one result shape share a symbol; separate
 results get independent bindings. The callee reads the dimension from its actual
 tensor argument's descriptor. The original arithmetic and reshape validation
 remain in the program; placeholder bounds do not replace runtime extents.
 
-`synthesized` is independent of `pending_binding`: it records an automatically
-generated placeholder symbol and retains its existing annotation-overlay and
-helper-return behavior. `TensorMeta` rejects pending dimensions at construction,
-so temporary scalar state cannot leak into generated tensor annotations.
+`synthesized` records an automatically generated placeholder symbol and retains
+its existing annotation-overlay and helper-return behavior.
 
 ### Compile options and diagnostic requests
 

@@ -4938,7 +4938,6 @@ class TestRuntimeSizedLocalExtents:
         square = metas["square"].shape
         another = metas["another"].shape
         assert isinstance(square[0], DynDim) and square[0].synthesized
-        assert not square[0].pending_binding
         assert square[0] is square[1]
         assert isinstance(another[0], DynDim)
         assert another[0] is another[1]
@@ -4950,12 +4949,6 @@ class TestRuntimeSizedLocalExtents:
             assert first is not second
             assert first.name != second.name
         assert metas["work"].shape[0] != metas["result"].shape[0]
-        assert all(
-            not dim.pending_binding
-            for meta in metas.values()
-            for dim in meta.shape
-            if isinstance(dim, DynDim)
-        )
 
     def test_descriptor_reshape_repeated_snapshot_square_dep_specializes(self):
         """A square reshape retains axis equality for transpose/fmod inside a bare-annotated dep."""
@@ -6102,7 +6095,7 @@ class TestRuntimeSizedLocalExtents:
         assert metas["view"].shape[0] is b_dim
 
     def test_descriptor_reshape_alias_helper_return_calls_specialize_independently(self):
-        """Separate helper calls get independent metadata symbols before IR passes.
+        """Chained aliases share a result; separate calls get independent symbols.
 
         Lowering helper-local dimension expressions additionally requires IR
         return-type closure support, outside this metadata regression.
@@ -6126,9 +6119,13 @@ class TestRuntimeSizedLocalExtents:
             b: pl.Tensor[[_M_SLICE, 128], pl.FP32],
             out: pl.Out[pl.Tensor[[128], pl.FP32]],
         ):
-            first = flatten(a)
+            first = first_alias = flatten(a)
             second = flatten(b)
-            return consume(first, second, out)
+            if pl.tensor.dim(a, 0) > 0:
+                selected = first
+            else:
+                selected = first_alias
+            return consume(selected, second, out)
 
         program = entry.specialize()
         kernel = program.get_function("consume")
