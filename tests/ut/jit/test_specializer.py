@@ -13,6 +13,7 @@ import ast
 import math
 import textwrap
 import warnings
+from contextlib import nullcontext
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -1323,6 +1324,37 @@ class TestVariableRebinding:
         out = self._transform(src, tensor_meta={"a": TensorMeta((64,), DataType.FP32)})
         assert "x =" in out
         assert "x_v1" not in out
+
+    def test_chained_assignment_keeps_rhs_snapshot(self):
+        """Chains evaluate once and do not read stale inlined or renamed targets."""
+        src = """
+            def f(a):
+                total = 32
+                total = half = total = observe(total // 2)
+                saved = total + half
+                total = total + 1
+                total = half = observe(a.shape[1])
+                width = a.shape[1]
+                with scope():
+                    width = other = observe(width // 2)
+                return saved, total, half, width, other
+        """
+        transformed = self._transform(src, tensor_meta={"a": TensorMeta((1, 128), DataType.FP32)})
+        calls = []
+
+        def observe(value):
+            calls.append(value)
+            return value
+
+        namespace: dict = {"observe": observe, "scope": nullcontext}
+        exec(transformed, namespace)
+        assert namespace["f"](None) == (32, 128, 128, 64, 64)
+        assert calls == [16, 128, 64]
+        assert all(
+            len(node.targets) == 1
+            for node in ast.walk(ast.parse(transformed))
+            if isinstance(node, ast.Assign)
+        )
 
     def test_rebind_generates_fresh_name(self):
         src = """

@@ -1052,6 +1052,20 @@ class _BodyTransformer(ast.NodeTransformer):
             if is_pl_dynamic:
                 return None
 
+        if len(node.targets) > 1 and all(isinstance(target, ast.Name) for target in node.targets):
+            # Evaluate the RHS before rebinding any target, then copy that value.
+            first_name = cast(ast.Name, node.targets[0]).id
+            value = node.value
+            assignments: list[ast.stmt] = []
+            for target in node.targets:
+                assignment = ast.copy_location(ast.Assign(targets=[target], value=value), node)
+                assignments.append(self._visit_simple_assign(assignment))
+                # A chain can replace a previously inlined shape even in a
+                # nested scope where the target does not receive an SSA name.
+                self._shape_inlined.pop(cast(ast.Name, target).id, None)
+                value = ast.copy_location(ast.Name(id=first_name, ctx=ast.Load()), node.value)
+            return assignments
+
         # Case 2: M, N = a.shape  →  individual assignments (dynamic) or inline (static)
         if (
             len(node.targets) == 1

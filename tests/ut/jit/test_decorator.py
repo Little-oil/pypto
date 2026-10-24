@@ -5062,6 +5062,33 @@ class TestRuntimeSizedLocalExtents:
         assert metas["constants"].shape == (8, 4)
         assert metas["arithmetic"].shape == (32,)
 
+    def test_descriptor_reshape_chained_aliases_cross_dep(self, monkeypatch, tmp_path):
+        """A self-referential chain compiles with both aliases usable across a dependency."""
+        torch = pytest.importorskip("torch")
+        monkeypatch.setenv("PTOAS_ROOT", str(tmp_path / "missing_ptoas"))
+
+        @jit.incore
+        def consume(first: pl.Tensor, second: pl.Tensor, out: pl.Out[pl.Tensor]):
+            left = pl.load(first, [0, 0], [1, 32])
+            right = pl.load(second, [0, 0], [1, 32])
+            pl.store(pl.add(left, right), [0, 0], out)
+            return out
+
+        @jit
+        def entry(
+            src: pl.Tensor[[_PAGES_3033, 128], pl.FP32],
+            out: pl.Out[pl.Tensor[[1, 32], pl.FP32]],
+        ):
+            total = pl.tensor.dim(src, 0) * 128
+            total = half = total // 2
+            total = total * 2
+            first = pl.reshape(src, [total // 32, 32])
+            second = pl.reshape(src, [half // 16, 32])
+            return consume(first, second, out)
+
+        compiled = entry.compile(torch.empty(4, 128), torch.empty(1, 32))
+        assert isinstance(compiled, CompiledProgram)
+
     def test_descriptor_reshape_alias_invalid_rebindings_are_forgotten(self):
         """Unknown rebindings and loop targets invalidate an earlier known arithmetic alias."""
         seed = {
