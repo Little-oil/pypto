@@ -968,12 +968,29 @@ class _BodyTransformer(ast.NodeTransformer):
             if var_name in self._var_renames:
                 renamed = self._var_renames[var_name]
                 node.targets = [ast.Name(id=renamed, ctx=ast.Store())]
+            elif var_name in self._meta:
+                # A deeper-scope tensor rebind keeps its name, but invalidates
+                # shape constants from the original parameter all the same.
+                self._var_renames[var_name] = var_name
             node.value = visited_value
             return node
         # First assignment: record and keep original name.
         self._record_first_assign(var_name)
         node.value = visited_value
         return node
+
+    def _visit_chained_assign(self, node: ast.Assign) -> list[ast.stmt]:
+        """Evaluate a chain's RHS once before rebinding and copying to its targets."""
+        first_name = cast(ast.Name, node.targets[0]).id
+        value = node.value
+        assignments: list[ast.stmt] = []
+        for target in node.targets:
+            assignment = ast.copy_location(ast.Assign(targets=[target], value=value), node)
+            assignments.append(self._visit_simple_assign(assignment))
+            # Clear an old inlined shape after reading the original RHS.
+            self._shape_inlined.pop(cast(ast.Name, target).id, None)
+            value = ast.copy_location(ast.Name(id=first_name, ctx=ast.Load()), node.value)
+        return assignments
 
     def _dyn_dim_expr(self, param_name: str, dim_idx: int) -> ast.expr:
         """Emit ``pl.tensor.dim(<param>, <dim_idx>)`` for a dynamic dim.
@@ -1050,21 +1067,22 @@ class _BodyTransformer(ast.NodeTransformer):
                 and func.value.id == "pl"
             ) or (isinstance(func, ast.Name) and func.id == "dynamic")
             if is_pl_dynamic:
-                return None
+                anchor = next(
+                    (
+                        self._dynvar_anchors[target.id]
+                        for target in node.targets
+                        if isinstance(target, ast.Name) and target.id in self._dynvar_anchors
+                    ),
+                    None,
+                )
+                if len(node.targets) == 1 or anchor is None:
+                    return None
+                # The declaration is promoted, but its chained aliases still
+                # need the same runtime value even when only one is anchored.
+                node.value = ast.copy_location(self._dyn_dim_expr(*anchor), node.value)
 
         if len(node.targets) > 1 and all(isinstance(target, ast.Name) for target in node.targets):
-            # Evaluate the RHS before rebinding any target, then copy that value.
-            first_name = cast(ast.Name, node.targets[0]).id
-            value = node.value
-            assignments: list[ast.stmt] = []
-            for target in node.targets:
-                assignment = ast.copy_location(ast.Assign(targets=[target], value=value), node)
-                assignments.append(self._visit_simple_assign(assignment))
-                # A chain can replace a previously inlined shape even in a
-                # nested scope where the target does not receive an SSA name.
-                self._shape_inlined.pop(cast(ast.Name, target).id, None)
-                value = ast.copy_location(ast.Name(id=first_name, ctx=ast.Load()), node.value)
-            return assignments
+            return self._visit_chained_assign(node)
 
         # Case 2: M, N = a.shape  →  individual assignments (dynamic) or inline (static)
         if (
@@ -1074,6 +1092,7 @@ class _BodyTransformer(ast.NodeTransformer):
             and node.value.attr == "shape"
             and isinstance(node.value.value, ast.Name)
             and node.value.value.id in self._meta
+            and node.value.value.id not in self._var_renames
         ):
             param_name = node.value.value.id
             meta = self._meta[param_name]
@@ -1114,6 +1133,7 @@ class _BodyTransformer(ast.NodeTransformer):
             and node.value.value.attr == "shape"
             and isinstance(node.value.value.value, ast.Name)
             and node.value.value.value.id in self._meta
+            and node.value.value.value.id not in self._var_renames
             and isinstance(node.value.slice, ast.Constant)
             and isinstance(node.value.slice.value, int)
         ):
@@ -1217,7 +1237,11 @@ class _BodyTransformer(ast.NodeTransformer):
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.expr:
         """Replace a.shape → tuple and a.dtype → pl.XXX."""
-        if isinstance(node.value, ast.Name) and node.value.id in self._meta:
+        if (
+            isinstance(node.value, ast.Name)
+            and node.value.id in self._meta
+            and node.value.id not in self._var_renames
+        ):
             param_name = node.value.id
             if node.attr == "shape":
                 return self._shape_tuple_node(param_name)
@@ -1241,6 +1265,9 @@ class _BodyTransformer(ast.NodeTransformer):
         ):
             param_name = node.value.value.id
             if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int):
+                if param_name in self._var_renames:
+                    # The parameter's original shape no longer describes this value.
+                    return self._dyn_dim_expr(self._var_renames[param_name], node.slice.value)
                 return self._shape_dim_node(param_name, node.slice.value)
         return cast("ast.expr", self.generic_visit(node))
 

@@ -14,6 +14,7 @@ import math
 import textwrap
 import warnings
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -1434,6 +1435,33 @@ class TestVariableRebinding:
         # x is a param, so re-assignment generates x_v1; reads of x after rebinding → x_v1
         assert "x_v1 = some_call(x)" in out
         assert "y = x_v1" in out
+
+    def test_rebound_tensor_shape_reads_current_value(self):
+        """Dimension arithmetic after a parameter rebind uses its new tensor."""
+        src = """
+            def f(src, other):
+                before = src.shape[1]
+                with scope():
+                    src = other
+                    nested = src.shape[1]
+                src = other
+                width = src.shape[1]
+                half = width // 2
+                return before, nested, width, half, src.shape[0] * width
+        """
+        transformed = self._transform(
+            src,
+            tensor_meta={
+                "src": TensorMeta((1, 128), DataType.FP32),
+                "other": TensorMeta((4, 64), DataType.FP32),
+            },
+        )
+        namespace = {
+            "pl": SimpleNamespace(tensor=SimpleNamespace(dim=lambda tensor, axis: tensor[axis])),
+            "scope": nullcontext,
+        }
+        exec(transformed, namespace)
+        assert namespace["f"]((1, 128), (4, 64)) == (128, 64, 64, 32, 256)
 
     def test_alias_skips_collision(self):
         """Generated alias skips names already defined by the user."""

@@ -5063,7 +5063,7 @@ class TestRuntimeSizedLocalExtents:
         assert metas["arithmetic"].shape == (32,)
 
     def test_descriptor_reshape_chained_aliases_cross_dep(self, monkeypatch, tmp_path):
-        """A self-referential chain compiles with both aliases usable across a dependency."""
+        """Chained aliases and rebound shape snapshots compile across a dependency."""
         torch = pytest.importorskip("torch")
         monkeypatch.setenv("PTOAS_ROOT", str(tmp_path / "missing_ptoas"))
 
@@ -5079,14 +5079,49 @@ class TestRuntimeSizedLocalExtents:
             src: pl.Tensor[[_PAGES_3033, 128], pl.FP32],
             out: pl.Out[pl.Tensor[[1, 32], pl.FP32]],
         ):
-            total = pl.tensor.dim(src, 0) * 128
+            PAGES = alias = pl.dynamic("PAGES")
+            src.bind_dynamic(0, PAGES)
+            total = alias * 128
             total = half = total // 2
             total = total * 2
             first = pl.reshape(src, [total // 32, 32])
             second = pl.reshape(src, [half // 16, 32])
             return consume(first, second, out)
 
-        compiled = entry.compile(torch.empty(4, 128), torch.empty(1, 32))
+        @jit
+        def alias_first(src: pl.Tensor, out: pl.Out[pl.Tensor[[1, 32], pl.FP32]]):
+            alias = PAGES = pl.dynamic("PAGES")
+            src.bind_dynamic(0, PAGES)
+            total = alias * 128
+            view = pl.reshape(src, [total // 32, 32])
+            return consume(view, view, out)
+
+        for kernel in (entry, alias_first):
+            compiled = kernel.compile(torch.empty(4, 128), torch.empty(1, 32))
+            assert isinstance(compiled, CompiledProgram)
+
+        def rebound(
+            src: pl.Tensor[[1, 128], pl.FP32],
+            other: pl.Tensor[[4, 64], pl.FP32],
+            out: pl.Out[pl.Tensor[[1, 32], pl.FP32]],
+        ):
+            src = other
+            width = pl.tensor.dim(src, 1)
+            half = width // 2
+            view = pl.reshape(src, [pl.tensor.dim(src, 0) * 2, half])
+            return consume(view, view, out)
+
+        # Trace indexed shape syntax without Tensor.shape's optional Python type.
+        get_lines = inspect.getsourcelines
+        lines, line = get_lines(rebound)
+        source = "".join(lines).replace("pl.tensor.dim(src, 1)", "src.shape[1]")
+        source = source.replace("pl.tensor.dim(src, 0)", "src.shape[0]")
+        monkeypatch.setattr(
+            inspect,
+            "getsourcelines",
+            lambda f: (source.splitlines(keepends=True), line) if f is rebound else get_lines(f),
+        )
+        compiled = jit(rebound).compile(torch.empty(1, 128), torch.empty(4, 64), torch.empty(1, 32))
         assert isinstance(compiled, CompiledProgram)
 
     def test_descriptor_reshape_alias_invalid_rebindings_are_forgotten(self):
