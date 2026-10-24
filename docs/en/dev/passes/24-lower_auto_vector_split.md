@@ -809,6 +809,11 @@ match each result's full and per-lane valid extents to the partitioned input.
 Keep the deduced capacity and track the logical partition stride independently;
 for nine rows that stride is five, even though each count tile has capacity eight.
 
+Tuple-derived positional data must also agree on localized non-broadcast valid
+extents; loop and branch carries retain the complete lane type. Automatic
+Vec-to-Cube reassembly rejects an explicit aligned partition whose logical
+stride differs from lane capacity until capacity-aware gather typing is supported.
+
 Every element must partition on exactly one axis. An element whose capacity and valid region stay **unchanged**
 is the dangerous case, not the harmless one — the operator produced a full-width output
 from an operand each lane owns only half of, so neither lane holds the whole answer while

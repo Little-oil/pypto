@@ -2443,18 +2443,198 @@ def test_aligned_tuple_consumers_reject_different_partitions(reverse):
         _lower(Before)
 
 
+@pytest.mark.parametrize("rows, full_valid, partial_valid", [(10, 10, 8), (16, 16, 14), (16, 16, 9)])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_tuple_consumers_reject_different_localized_valid_regions(rows, full_valid, partial_valid, reverse):
+    """Equal capacities/axes/strides still permit an unwritten tail on one lane.
+
+    R10 gives valid counts 5 versus 3 on lane 1. R16 also covers the ordinary
+    exact-halving path, where partition_stride is null; valid one inside an
+    eight-cell capacity must not be mistaken for a physical broadcast scalar.
+    """
+    first_valid, second_valid = (partial_valid, full_valid) if reverse else (full_valid, partial_valid)
+    count_cols = ((rows + 7) // 8) * 8
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            t: pl.Tensor[[rows, 64], pl.FP32],
+            tmp: pl.Tile[[1, 512], pl.UINT8, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out: pl.Out[pl.Tensor[[1, count_cols], pl.INT32]],
+        ) -> pl.Tensor[[1, count_cols], pl.INT32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            first = pl.tile.load(
+                t, [0, 0], [rows, 64], valid_shape=[first_valid, 64], target_memory=pl.Mem.Vec
+            )
+            second = pl.tile.load(
+                t, [0, 0], [rows, 64], valid_shape=[second_valid, 64], target_memory=pl.Mem.Vec
+            )
+            pa = pl.tile.gather_compare(first, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8)
+            pb = pl.tile.gather_compare(second, pl.const(2.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8)
+            combined = pl.tile.add(pa[1], pb[1])
+            return pl.tile.store(combined, [0, 0], out)
+
+    with pytest.raises(ValueError, match="different per-lane valid regions"):
+        _lower(Before)
+
+
+@pytest.mark.parametrize("rows", [10, 16])
+def test_tuple_consumers_accept_matching_partial_valid_regions(rows):
+    """Two independently produced partial count vectors retain the same lane validity."""
+    valid_rows = rows - 2
+    count_cols = ((rows + 7) // 8) * 8
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            t: pl.Tensor[[rows, 64], pl.FP32],
+            tmp: pl.Tile[[1, 512], pl.UINT8, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out: pl.Out[pl.Tensor[[1, count_cols], pl.INT32]],
+        ) -> pl.Tensor[[1, count_cols], pl.INT32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            src = pl.tile.load(t, [0, 0], [rows, 64], valid_shape=[valid_rows, 64], target_memory=pl.Mem.Vec)
+            pa = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8)
+            pb = pl.tile.gather_compare(src, pl.const(2.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8)
+            combined = pl.tile.add(pa[1], pb[1])
+            return pl.tile.store(combined, [0, 0], out)
+
+    after = _lower(Before)
+    lane_types = []
+
+    class LaneTypes(ir.IRVisitor):
+        def visit_call(self, op):
+            if op.op.name == ir.get_op("tile.gather_compare").name:
+                assert isinstance(op.type, ir.TupleType)
+                lane_types.append(op.type.types[1])
+            if op.op.name == ir.get_op("tile.add").name:
+                lane_types.append(op.type)
+            super().visit_call(op)
+
+    LaneTypes().visit_program(after)
+    assert len(lane_types) == 3
+    ir.assert_structural_equal(lane_types[0], lane_types[1])
+    ir.assert_structural_equal(lane_types[0], lane_types[2])
+    assert f"[0, 0 + subblock_idx * {(rows + 1) // 2}]" in after.as_python()
+
+
+@pytest.mark.parametrize("next_valid", [14, 16])
+def test_tuple_count_loop_carry_checks_generic_consumer_validity(next_valid):
+    """An exact eight-cell half must retain validity through a generic add.
+
+    The tuple init carries a lane type. A generic consumer used to drop that
+    fact when capacity halved exactly, letting a 6-valid backedge feed the
+    8-valid lane-1 carry. Matching full validity remains a legal loop.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            t: pl.Tensor[[16, 64], pl.FP32],
+            tmp: pl.Tile[[1, 512], pl.UINT8, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out: pl.Out[pl.Tensor[[1, 16], pl.INT32]],
+        ) -> pl.Tensor[[1, 16], pl.INT32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            full = pl.tile.load(t, [0, 0], [16, 64], target_memory=pl.Mem.Vec)
+            partial = pl.tile.load(
+                t, [0, 0], [16, 64], valid_shape=[next_valid, 64], target_memory=pl.Mem.Vec
+            )
+            initial = pl.tile.gather_compare(full, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8)
+            next_pair = pl.tile.gather_compare(
+                partial, pl.const(2.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8
+            )
+            for i, (acc,) in pl.range(2, init_values=(initial[1],)):
+                next_count = pl.tile.add(next_pair[1], next_pair[1])
+                result = pl.yield_(next_count)
+            return pl.tile.store(result, [0, 0], out)
+
+    if next_valid == 14:
+        with pytest.raises(ValueError, match="loop carry"):
+            _lower(Before)
+    else:
+        assert "[0, 0 + subblock_idx * 8]" in _lower(Before).as_python()
+
+
+@pytest.mark.parametrize("next_valid", [14, 16])
+def test_tuple_count_if_merge_checks_generic_consumer_validity(next_valid):
+    """Projected and generic-consumer branch facts must agree in actual lane type."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            t: pl.Tensor[[16, 64], pl.FP32],
+            tmp: pl.Tile[[1, 512], pl.UINT8, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            flag: pl.Scalar[pl.INT64],
+            out: pl.Out[pl.Tensor[[1, 16], pl.INT32]],
+        ) -> pl.Tensor[[1, 16], pl.INT32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            full = pl.tile.load(t, [0, 0], [16, 64], target_memory=pl.Mem.Vec)
+            partial = pl.tile.load(
+                t, [0, 0], [16, 64], valid_shape=[next_valid, 64], target_memory=pl.Mem.Vec
+            )
+            initial = pl.tile.gather_compare(full, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8)
+            next_pair = pl.tile.gather_compare(
+                partial, pl.const(2.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8
+            )
+            next_count = pl.tile.add(next_pair[1], next_pair[1])
+            if flag > 0:
+                result: pl.Tile[[1, 16], pl.INT32, pl.Mem.Vec] = pl.yield_(initial[1])
+            else:
+                result: pl.Tile[[1, 16], pl.INT32, pl.Mem.Vec] = pl.yield_(next_count)
+            return pl.tile.store(result, [0, 0], out)
+
+    if next_valid == 14:
+        with pytest.raises(ValueError, match="disagree about merge variable"):
+            _lower(Before)
+    else:
+        assert "[0, 0 + subblock_idx * 8]" in _lower(Before).as_python()
+
+
+def test_ordinary_partial_valid_scratch_keeps_its_existing_split_contract():
+    """Tuple-output validity checks do not reinterpret ordinary rsqrt scratch as data."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            t: pl.Tensor[[16, 64], pl.FP32],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            src = pl.tile.load(t, [0, 0], [16, 64], valid_shape=[14, 64], target_memory=pl.Mem.Vec)
+            tmp = pl.tile.create([16, 64], dtype=pl.FP32)
+            result = pl.tile.rsqrt(src, tmp)
+            return pl.tile.store(result, [0, 0], out)
+
+    printed = _lower(Before).as_python()
+    assert "pl.tile.rsqrt(src, tmp)" in printed
+    assert "pl.tile.store(result, [0 + subblock_idx * 8, 0], out)" in printed
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 def test_aligned_tuple_consumers_reject_equal_strides_on_different_axes(reverse):
     """A row shard cannot broadcast a column shard merely because both step by four.
 
     The index output becomes [4,8] along dim 0; the count output retains [1,8]
-    capacity but has four valid columns along dim 1. Lane-local counts cannot
-    serve as the shared eight-column vector that this broadcast would require.
+    capacity but has four valid columns along dim 1. Literal tuple indices keep
+    both operand-order cases within the parser's constant-index contract.
     """
-    first, second = (1, 0) if reverse else (0, 1)
 
     @pl.program
-    class Before:
+    class BeforeForward:
         @pl.function(type=pl.FunctionType.InCore)
         def split_auto(
             t: pl.Tensor[[8, 64], pl.FP32],
@@ -2466,11 +2646,27 @@ def test_aligned_tuple_consumers_reject_equal_strides_on_different_axes(reverse)
             seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
             src = pl.tile.load(t, [0, 0], [8, 64], target_memory=pl.Mem.Vec)
             pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8)
-            combined = pl.tile.add(pair[first], pair[second])
+            combined = pl.tile.add(pair[0], pair[1])
+            return pl.tile.store(combined, [0, 0], out)
+
+    @pl.program
+    class BeforeReverse:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            t: pl.Tensor[[8, 64], pl.FP32],
+            tmp: pl.Tile[[1, 512], pl.UINT8, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out: pl.Out[pl.Tensor[[8, 8], pl.INT32]],
+        ) -> pl.Tensor[[8, 8], pl.INT32]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            src = pl.tile.load(t, [0, 0], [8, 64], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8)
+            combined = pl.tile.add(pair[1], pair[0])
             return pl.tile.store(combined, [0, 0], out)
 
     with pytest.raises(ValueError, match="different logical partition axes"):
-        _lower(Before)
+        _lower(BeforeReverse if reverse else BeforeForward)
 
 
 def test_aligned_tuple_consumer_right_aligns_different_rank_split_axes():
@@ -2549,6 +2745,70 @@ def test_aligned_tuple_consumer_refusal_identifies_full_width_operand(rows):
     if rows == 9:
         assert "Operator validation:" in message
         assert "requires compatible shapes" in message
+
+
+@pytest.mark.parametrize("rows", [8, 9, 10, 18, 16])
+@pytest.mark.parametrize("inline", [False, True])
+def test_tuple_count_cube_boundary_requires_supported_reassembly(rows, inline):
+    """Automatic gather cannot infer a full tile by doubling aligned lane capacity.
+
+    R8 has capacity eight in each lane but logical stride four; R9/R10 use
+    stride five and R18 uses stride nine in capacity sixteen. Keep those
+    unsupported crossings user-facing. R16 remains the ordinary 8 -> 16 gather.
+    """
+    count_cols = ((rows + 7) // 8) * 8
+
+    @pl.program
+    class BeforeInline:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            t: pl.Tensor[[rows, 64], pl.FP32],
+            tmp: pl.Tile[[1, 512], pl.UINT8, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+        ) -> pl.Tile[[1, count_cols], pl.INT32, pl.Mem.Mat]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            src = pl.tile.load(t, [0, 0], [rows, 64], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8)
+            mat = pl.tile.move(pair[1], target_memory=pl.Mem.Mat)
+            return mat
+
+    @pl.program
+    class BeforeBound:
+        @pl.function(type=pl.FunctionType.InCore)
+        def split_auto(
+            t: pl.Tensor[[rows, 64], pl.FP32],
+            tmp: pl.Tile[[1, 512], pl.UINT8, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+        ) -> pl.Tile[[1, count_cols], pl.INT32, pl.Mem.Mat]:
+            pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            src = pl.tile.load(t, [0, 0], [rows, 64], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=8)
+            count = pair[1]
+            mat = pl.tile.move(count, target_memory=pl.Mem.Mat)
+            return mat
+
+    before = BeforeInline if inline else BeforeBound
+    if rows != 16:
+        with pytest.raises(ValueError, match="automatic reassembly of an aligned tile"):
+            _lower(before)
+    else:
+        after = _lower(before)
+        gather_types = []
+
+        class GatherTypes(ir.IRVisitor):
+            def visit_call(self, op):
+                if op.op.name == ir.get_op("tile.aic_gather").name:
+                    gather_types.append(op.type)
+                super().visit_call(op)
+
+        GatherTypes().visit_program(after)
+        assert len(gather_types) == 1
+        assert len(gather_types[0].shape) == 2
+        row_dim, col_dim = gather_types[0].shape
+        assert isinstance(row_dim, ir.ConstInt) and isinstance(col_dim, ir.ConstInt)
+        assert [row_dim.value, col_dim.value] == [1, 16]
 
 
 def test_aligned_tuple_consumer_refusal_preserves_operator_error_without_full_width_operand():

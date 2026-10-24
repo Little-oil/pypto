@@ -170,7 +170,10 @@ std::optional<TileInfo> SplitInfoFromHalvedType(const TypePtr& before_type, cons
   if (!before || !after || before->shape_.size() != after->shape_.size()) return std::nullopt;
   for (size_t d = 0; d < before->shape_.size(); ++d) {
     if (structural_equal(before->shape_[d], after->shape_[d])) continue;
-    return TileInfo{ComputeHalfDimSize(before->shape_[d]), static_cast<int>(d)};
+    TileInfo info{ComputeHalfDimSize(before->shape_[d]), static_cast<int>(d)};
+    info.lane_type = after;
+    info.requires_valid_region_match = true;
+    return info;
   }
   return std::nullopt;
 }
@@ -518,6 +521,38 @@ ExprPtr LogicalLaneStep(const TileInfo& info, const ExprPtr& lane_stride) {
   return info.partition_stride ? info.partition_stride : LaneStep(lane_stride, info.half_dim_size);
 }
 
+// Positional operands with broadcast-compatible physical shapes must describe
+// the same per-lane valid region. A valid extent of one in a larger allocation
+// is not a broadcast scalar: only a physical singleton (or absent leading
+// axis) broadcasts. Different physical geometries, such as packed predicate
+// bytes versus data elements, remain the operator's type contract to validate.
+bool BroadcastLaneValidRegionsAgree(const TileType& lhs, const TileType& rhs) {
+  const size_t overlap = std::min(lhs.shape_.size(), rhs.shape_.size());
+  for (size_t offset = 1; offset <= overlap; ++offset) {
+    const auto& left = lhs.shape_[lhs.shape_.size() - offset];
+    const auto& right = rhs.shape_[rhs.shape_.size() - offset];
+    if (!IsSingletonDim(left) && !IsSingletonDim(right) && !DimensionsEqual(left, right)) return true;
+  }
+
+  const auto left_valid = tile_view_semantics::GetEffectiveTileView(lhs).valid_shape;
+  const auto right_valid = tile_view_semantics::GetEffectiveTileView(rhs).valid_shape;
+  if (left_valid.size() != lhs.shape_.size() || right_valid.size() != rhs.shape_.size()) return false;
+  for (size_t offset = 1; offset <= overlap; ++offset) {
+    const size_t left_axis = lhs.shape_.size() - offset;
+    const size_t right_axis = rhs.shape_.size() - offset;
+    const bool left_broadcast = IsSingletonDim(lhs.shape_[left_axis]);
+    const bool right_broadcast = IsSingletonDim(rhs.shape_[right_axis]);
+    if (left_broadcast && !right_broadcast) {
+      if (!IsSingletonDim(left_valid[left_axis])) return false;
+    } else if (right_broadcast && !left_broadcast) {
+      if (!IsSingletonDim(right_valid[right_axis])) return false;
+    } else if (ProveValidExtentEqual(left_valid[left_axis], right_valid[right_axis]) != ProofResult::kTrue) {
+      return false;
+    }
+  }
+  return true;
+}
+
 ExprPtr MakeConstLike(const ExprPtr& ref, int64_t value, const Span& span) {
   return std::make_shared<ConstInt>(value, GetScalarDtype(ref), span);
 }
@@ -720,6 +755,7 @@ std::optional<TileInfo> DiscoverElementSplit(const TileTypePtr& before, const Ti
     }
   }
   info.lane_type = after;
+  info.requires_valid_region_match = true;
   return info;
 }
 
@@ -1089,6 +1125,10 @@ StmtPtr TryMigrateReshapeSplit(const CallPtr& call, const std::shared_ptr<const 
       std::make_shared<Call>(call->op_, std::move(new_args), call->kwargs_, new_result_type, call->span_);
   auto new_var = std::make_shared<Var>(assign->var_->name_hint_, new_result_type, assign->var_->span_);
   TileInfo info{half_dim_size, d_out};
+  info.lane_type = new_result_type;
+  if (auto input = OperandSplitInfo(call->args_[0], tile_vars, var_replacements)) {
+    info.requires_valid_region_match = input->requires_valid_region_match;
+  }
   tile_vars[assign->var_.get()] = info;
   tile_vars[new_var.get()] = info;
   var_replacements[assign->var_.get()] = new_var;
@@ -1110,6 +1150,12 @@ StmtPtr ProcessStmt(const StmtPtr& stmt, SplitMode mode, int split_dim,
     if (IsOp(call, "tile.tpush_to_aiv") || IsOp(call, "tile.tpush_to_aic")) {
       INTERNAL_CHECK_SPAN(!call->args_.empty(), call->span_)
           << "Internal error: " << op_name << " must carry the pushed tile";
+      if (IsOp(call, "tile.tpush_to_aic")) {
+        if (auto info = OperandSplitInfo(call->args_[0], tile_vars, var_replacements)) {
+          auto source = ReplacedOperand(call->args_[0], var_replacements);
+          CheckAlignedGatherSource(source ? source : call->args_[0], *info, call->span_);
+        }
+      }
       const int push_code =
           IsOp(call, "tile.tpush_to_aic")
               ? GatherSplitCode(mode, call->args_[0]->GetType(), split_dim, op_name, call->span_)
@@ -1135,6 +1181,7 @@ StmtPtr ProcessStmt(const StmtPtr& stmt, SplitMode mode, int split_dim,
           std::make_shared<Var>(assign->var_->name_hint_, new_call->GetType(), assign->var_->span_);
       if (tt && split_dim < static_cast<int>(tt->shape_.size())) {
         TileInfo info{ComputeHalfDimSize(tt->shape_[split_dim]), split_dim};
+        info.lane_type = new_call->GetType();
         tile_vars[assign->var_.get()] = info;
         tile_vars[new_var.get()] = info;
       }
@@ -1178,6 +1225,7 @@ StmtPtr ProcessStmt(const StmtPtr& stmt, SplitMode mode, int split_dim,
           std::make_shared<Call>(call->op_, std::move(new_args), call->kwargs_, new_result_type, call->span_);
       auto new_var = std::make_shared<Var>(assign->var_->name_hint_, new_result_type, assign->var_->span_);
       TileInfo info{half_dim_size, split_dim};
+      info.lane_type = new_result_type;
       tile_vars[assign->var_.get()] = info;
       tile_vars[new_var.get()] = info;
       var_replacements[assign->var_.get()] = new_var;
@@ -1205,7 +1253,9 @@ StmtPtr ProcessStmt(const StmtPtr& stmt, SplitMode mode, int split_dim,
       std::shared_ptr<const TileType> lane_input;
       TileInfo input_info;
       std::vector<std::pair<TileInfo, int>> positional_inputs;
+      std::vector<TileTypePtr> positional_valid_types;
       bool has_aligned_input = false;
+      bool requires_valid_region_match = false;
       for (size_t i = 0; i < call->args_.size(); ++i) {
         const auto& a = call->args_[i];
         if (auto info = OperandSplitInfo(a, tile_vars, var_replacements)) {
@@ -1216,14 +1266,17 @@ StmtPtr ProcessStmt(const StmtPtr& stmt, SplitMode mode, int split_dim,
               << "Internal error: a tracked tile operand has no valid split axis";
           if (!DeclaredLaneInvariantKind(call, i)) {
             positional_inputs.emplace_back(*info, static_cast<int>(arg_type->shape_.size()));
+            if (!OpRegistry::GetInstance().GetEntry(op_name).IsWorkspaceArg(i)) {
+              positional_valid_types.push_back(As<TileType>(info->lane_type));
+            }
             has_aligned_input |= info->partition_stride != nullptr;
+            requires_valid_region_match |= info->requires_valid_region_match;
           }
           if (in_split_dim >= 0) continue;
           in_split_dim = info->split_dim;
           in_tt = arg_type;
           input_info = *info;
-          auto replaced = ReplacedOperand(a, var_replacements);
-          lane_input = replaced ? As<TileType>(replaced->GetType()) : nullptr;
+          lane_input = As<TileType>(input_info.lane_type);
         }
       }
       if (has_aligned_input) {
@@ -1287,6 +1340,21 @@ StmtPtr ProcessStmt(const StmtPtr& stmt, SplitMode mode, int split_dim,
             << " Produce it OUTSIDE the automatically split region and pass it in, so it stays full "
                "width while the index operand is halved. Note that pl.gather / pl.scatter over a tensor "
                "lower to a tile.load feeding the tile op, so loading it inside the region hits this too.";
+      }
+
+      if (requires_valid_region_match) {
+        // Tuple-derived data retain this contract even when capacity happens to
+        // halve exactly. Ordinary scratch flows keep their existing operator
+        // contract; a full-valid workspace need not share a source's data tail.
+        for (const auto& other_lane : positional_valid_types) {
+          INTERNAL_CHECK_SPAN(lane_input && other_lane, call->span_)
+              << "Internal error: a tracked positional operand has no per-lane tile type";
+          CHECK_SPAN(BroadcastLaneValidRegionsAgree(*lane_input, *other_lane), call->span_)
+              << "LowerAutoVectorSplit: '" << op_name
+              << "' combines tiles with different per-lane valid regions. Matching capacities, axes and "
+                 "strides do not initialize the missing values; derive operands with the same valid "
+                 "region or move the operation outside the automatically split region.";
+        }
       }
 
       // A TupleType result carries one split axis PER ELEMENT, so the generic path
@@ -1561,6 +1629,8 @@ StmtPtr ProcessStmt(const StmtPtr& stmt, SplitMode mode, int split_dim,
             auto slice_assign = std::make_shared<AssignStmt>(slice_var, slice_call, assign->span_);
 
             TileInfo info{half_dim_size, result_split_dim};
+            info.lane_type = slice_call->GetType();
+            info.requires_valid_region_match = requires_valid_region_match;
             // Track both the original var and the slice replacement, matching the
             // other tile-producing branches: a later tile.store / loop init that
             // references the original var (before the final Substitute) must still
@@ -1710,6 +1780,8 @@ StmtPtr ProcessStmt(const StmtPtr& stmt, SplitMode mode, int split_dim,
                                                call->span_);
         auto new_var = std::make_shared<Var>(assign->var_->name_hint_, new_result_type, assign->var_->span_);
         TileInfo info{half_dim_size, result_split_dim};
+        info.lane_type = new_result_type;
+        info.requires_valid_region_match = requires_valid_region_match;
         tile_vars[assign->var_.get()] = info;
         tile_vars[new_var.get()] = info;
         var_replacements[assign->var_.get()] = new_var;
@@ -1727,6 +1799,12 @@ StmtPtr ProcessStmt(const StmtPtr& stmt, SplitMode mode, int split_dim,
     if (IsOp(call, "tile.tpush_to_aiv") || IsOp(call, "tile.tpush_to_aic")) {
       INTERNAL_CHECK_SPAN(!call->args_.empty(), call->span_)
           << "Internal error: " << call->op_->name_ << " must carry the pushed tile";
+      if (IsOp(call, "tile.tpush_to_aic")) {
+        if (auto info = OperandSplitInfo(call->args_[0], tile_vars, var_replacements)) {
+          auto source = ReplacedOperand(call->args_[0], var_replacements);
+          CheckAlignedGatherSource(source ? source : call->args_[0], *info, call->span_);
+        }
+      }
       const int push_code =
           IsOp(call, "tile.tpush_to_aic")
               ? GatherSplitCode(mode, call->args_[0]->GetType(), split_dim, call->op_->name_, call->span_)
@@ -1851,6 +1929,24 @@ std::string ReserveFreshName(std::unordered_set<std::string>& used_names, const 
 }
 
 }  // namespace
+
+void CheckAlignedGatherSource(const ExprPtr& source, const TileInfo& info, const Span& span) {
+  // Ordinary box partitions and the body's existing valid-data rebalancing
+  // retain their transport contract. An explicit per-value override marks the
+  // different case: aligned allocation capacity can exceed the lane interval.
+  if (!info.partition_stride) return;
+  auto tile = As<TileType>(source->GetType());
+  INTERNAL_CHECK_SPAN(tile && info.split_dim >= 0 && info.split_dim < static_cast<int>(tile->shape_.size()),
+                      span)
+      << "Internal error: an aligned gather source has no valid tile split axis";
+  CHECK_SPAN(ProveValidExtentEqual(LogicalLaneStep(info, nullptr), tile->shape_[info.split_dim]) ==
+                 ProofResult::kTrue,
+             span)
+      << "LowerAutoVectorSplit: automatic reassembly of an aligned tile whose per-lane capacity differs "
+         "from its logical partition stride is unsupported at a Vec-to-Cube boundary. Keep the value "
+         "on the vector side or assemble the logical lane intervals explicitly before crossing to the "
+         "cube side.";
+}
 
 // Shared loop/branch carry repair. Extracted so the AUTO affinity-gated path in
 // lower_auto_vector_split_pass.cpp gets the same treatment as ProcessStmts: it
@@ -2004,7 +2100,8 @@ bool SameTileInfo(const TileInfo& a, const TileInfo& b) {
   }
   return a.split_dim == b.split_dim && structural_equal(a.half_dim_size, b.half_dim_size) &&
          structural_equal(a.partition_stride, b.partition_stride) &&
-         (!a.lane_type || !b.lane_type || structural_equal(a.lane_type, b.lane_type));
+         a.requires_valid_region_match == b.requires_valid_region_match &&
+         structural_equal(a.lane_type, b.lane_type);
 }
 
 }  // namespace
@@ -2037,8 +2134,9 @@ void ValidateCarryBackedge(const StmtPtr& new_body, const std::vector<IterArgPtr
       }
       CHECK_SPAN(agrees, span)
           << "LowerAutoVectorSplit: the tuple loop carry '" << new_iter_args[i]->name_hint_
-          << "' inside the automatically split vector region declares a per-lane type that the value "
-             "yielded back into it does not match. The carry's declared tuple would contradict the "
+          << "' inside the automatically split vector region declares a per-lane type or logical "
+             "partition contract that the value yielded back into it does not match. The carry's declared "
+             "tuple would contradict the "
              "value flowing into it on every iteration after the first. Derive both the same way -- "
              "produce the tuple inside the split region on both the init and the backedge, or keep "
              "both shared by the two lanes -- or move the loop outside the automatically split region.";
@@ -2051,6 +2149,15 @@ void ValidateCarryBackedge(const StmtPtr& new_body, const std::vector<IterArgPtr
 
     if (!carry_is_lane_local && !yielded.has_value()) continue;
     if (carry_is_lane_local && yielded.has_value() && SameTileInfo(carry_it->second, *yielded)) continue;
+    if (carry_is_lane_local && yielded.has_value()) {
+      CHECK_SPAN(false, span)
+          << "LowerAutoVectorSplit: the loop carry '" << new_iter_args[i]->name_hint_
+          << "' is lane-local on both entry and backedge, but their per-lane types, valid regions, or "
+             "logical partition contracts are incompatible. Equal physical capacities cannot justify "
+             "retaining the entry's wider valid region or dropping tuple-data validation on later "
+             "iterations. Derive both sides with the same per-lane contract, or move the loop outside "
+             "the automatically split region.";
+    }
 
     // An UNBOUND yielded expression is its own diagnosis, and by far the more common
     // one: this pass halves STATEMENTS, and the parser does not hoist an expression
@@ -2154,11 +2261,11 @@ std::vector<VarPtr> RepairIfReturnVars(const std::vector<VarPtr>& return_vars, c
         << "LowerAutoVectorSplit: the branches of an if inside the automatically split vector region "
            "disagree about merge variable '"
         << new_return_vars[i]->name_hint_
-        << "': one yields a value the split made lane-local while the other does not (or they are split "
-           "along different axes). There is no single per-lane type for the merged value, and picking "
-           "either one silently gives one AIV lane the wrong extent. Make both branches yield values "
-           "derived the same way -- load or slice inside the region on both sides, or keep the value "
-           "shared by both lanes on both sides -- or move the if outside the automatically split region.";
+        << "': the branches have incompatible per-lane types, valid regions, or logical partition "
+           "contracts, or only one branch is lane-local. There is no single proven per-lane contract "
+           "for the merged value. Make both branches yield values with the same lane type and "
+           "partition contract, keep both shared by the lanes, or move the if outside the "
+           "automatically split region.";
 
     tile_vars[new_return_vars[i].get()] = *then_info;
     auto new_type = then_info->lane_type
@@ -2503,8 +2610,16 @@ std::optional<TileInfo> OperandSplitInfo(const ExprPtr& arg,
   if (!arg) return std::nullopt;
   if (auto arg_var = AsVarLike(arg)) {
     auto it = tile_vars.find(arg_var.get());
-    return it != tile_vars.end() && !it->second.tuple_elements ? std::optional<TileInfo>{it->second}
-                                                               : std::nullopt;
+    if (it == tile_vars.end() || it->second.tuple_elements) return std::nullopt;
+    auto info = it->second;
+    if (!info.lane_type) {
+      // Boundary entry points can seed only capacity/axis facts. Complete the
+      // contract from the actual replacement, never the original full tile;
+      // subsequent consumers and carries must compare validity as well.
+      auto replaced = ReplacedOperand(arg, var_replacements);
+      info.lane_type = replaced ? replaced->GetType() : arg->GetType();
+    }
+    return info;
   }
   if (auto get_item = std::dynamic_pointer_cast<const TupleGetItemExpr>(arg)) {
     if (get_item->index_ >= 0) {

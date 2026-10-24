@@ -262,13 +262,22 @@ struct TileInfo {
   // Aligned result capacity can stay unchanged (or round up) while its logical
   // lane interval shrinks. Keep that interval's stride separate from capacity.
   ExprPtr partition_stride = nullptr;
-  // The operator's re-deduced per-lane type is authoritative for padded outputs;
-  // carrying it through aliases avoids re-halving an already aligned capacity.
+  // Authoritative per-lane type, including localized validity. Producers and
+  // aliases retain it so a missing type cannot conceal a carry mismatch.
   TypePtr lane_type = nullptr;
   // A tuple binding has no single axis. Its entry stores these per-element
   // facts, and only projection lookups expose them as individual tile facts.
   std::shared_ptr<const std::vector<TileInfo>> tuple_elements = nullptr;
+  // Deduced tuple data and its consumers must preserve the localized valid
+  // region even when physical capacity halves exactly. Keep this contract
+  // separate from legacy positional scratch whose validity is op-defined.
+  bool requires_valid_region_match = false;
 };
+
+/// Reject automatic Vec-to-Cube reassembly when an explicitly aligned
+/// partition's logical stride differs from its actual per-lane capacity.
+/// Ordinary body-wide lane rebalancing keeps its existing boundary rules.
+void CheckAlignedGatherSource(const ExprPtr& source, const TileInfo& info, const Span& span);
 
 /// Admission facts for a lowered data-parallel body. Broadcast roots remain
 /// neutral: allowing a replicated producer does not prove its consumers split.
