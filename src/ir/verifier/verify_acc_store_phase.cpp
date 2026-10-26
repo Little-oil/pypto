@@ -53,6 +53,7 @@
 #include <vector>
 
 #include "pypto/core/error.h"
+#include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
@@ -301,7 +302,12 @@ class AccumulatorStorageLineage : public IRVisitor {
     // In pre-SSA control flow either binding may reach a subsequent use. Merge
     // that ambiguity conservatively; a straight-line fresh rebind stays fresh.
     if (!yields_.empty() && old != variables_.end()) storage = Merge(old->second, storage);
-    variables_[var.get()] = *storage;
+    if (storage.has_value()) {
+      variables_[var.get()] = *storage;
+    } else {
+      INTERNAL_UNREACHABLE_SPAN(var->span_)
+          << "Internal error: merging known accumulator storage identities produced no identity";
+    }
   }
 
   std::optional<StorageId> Value(const ExprPtr& expr) {
@@ -370,7 +376,7 @@ class AccumulatorStorageLineage : public IRVisitor {
       if (argument && As<TupleType>(argument->GetType())) {
         BindTuple(argument, Tuple(argument->initValue_));
         MarkUnresolvedTuple(argument->GetType());
-        initial.push_back(std::nullopt);
+        initial.emplace_back(std::nullopt);
         continue;
       }
       initial.push_back(argument ? Value(argument->initValue_) : std::nullopt);

@@ -1534,6 +1534,9 @@ class CanonicalSplitKRetiler : public IRMutator {
       plan.rhs_src = AsVarLike(rebuilt->args_[lhs_index + 1]);
       plan.acc_init = is_acc ? AsVarLike(rebuilt->args_[0]) : nullptr;
       plan.init_cond = is_acc && rebuilt->args_.size() == 4 ? rebuilt->args_[3] : nullptr;
+      // This emitter bypasses MakeKLoop, so retain the source phase here too.
+      plan.acc_phase = static_cast<AccPhase>(
+          rebuilt->GetKwarg<int>("acc_phase", static_cast<int>(AccPhase::kUnspecified)));
       plan.M = plan.m = window_.physical_m;
       plan.N = plan.n = window_.physical_n;
       plan.K = k_;
