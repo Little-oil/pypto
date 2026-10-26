@@ -191,11 +191,14 @@ print(pto_code)
 下沉，它是源 tile 的纯视图别名（不搬数据，也不会额外发 `pto.alloc_tile`）。
 `pto.subview` 要求结果 `tile_buf` 与源 `tile_buf` 在 `dtype`、`memory_space`、
 `blayout`、`slayout`、`fractal`、`pad` 和 `compact` 上完全一致，因此
-`DeduceTileSliceType` 会将源 `TileView` 的这五个字段透传到结果，使新生成的
-`TileType` 天然满足约束。后端 codegen 还会在下沉时执行 `CheckSubviewTileCompat`
+`DeduceTileSliceType` 会继承源 tile 的有效 `TileView` 中的这五个字段，
+未显式存储视图时也会采用源内存空间的默认布局，而不会按切片形状重新推导布局。
+例如，隐式 Acc tile 的列切片仍保持 `col_major` / `row_major` / fractal 1024。
+切片重新计算自己的有效形状，不复制父视图的 stride 或 start_offset。
+后端 codegen 还会在下沉时执行 `CheckSubviewTileCompat`
 做兜底校验：
 
-- 源和结果都必须显式携带 `TileView`。
+- 省略的视图按其内存空间解析为有效布局。
 - `dtype`、`blayout`、`slayout`、`fractal`、`pad` 与 `compact` 必须严格相等。
 - `pad` 必须为 `PadValue::null`——`pto.subview` 是视图而不是 fillpad；如果
   需要 zero/min/max 填充，请在切出来的子 tile 上再调用 `tile.fillpad`。

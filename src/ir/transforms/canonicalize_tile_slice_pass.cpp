@@ -180,6 +180,8 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -808,8 +810,9 @@ class SliceStorageAnalysis : public IRVisitor {
  public:
   /// How a Var is consumed, restricted to what CanonicalizeMutator materializes.
   struct Uses {
-    bool col_expand = false;   ///< Operand of a lazily materializing `tile.col_expand_*`.
-    bool vec_operand = false;  ///< Call operand, yield value, loop initializer, or plain-alias source.
+    bool col_expand = false;    ///< Operand of a lazily materializing `tile.col_expand_*`.
+    bool vec_operand = false;   ///< Call operand, yield value, loop initializer, or plain-alias source.
+    bool control_flow = false;  ///< Yield value or loop initializer whose layout must agree at a join.
   };
 
   const Uses* FindUses(const Var* var) const {
@@ -851,7 +854,10 @@ class SliceStorageAnalysis : public IRVisitor {
   void VisitStmt_(const YieldStmtPtr& op) override {
     if (!op) return;
     for (const auto& value : op->value_) {
-      if (auto var = AsVarLike(value)) uses_[var.get()].vec_operand = true;
+      if (auto var = AsVarLike(value)) {
+        uses_[var.get()].vec_operand = true;
+        uses_[var.get()].control_flow = true;
+      }
     }
     IRVisitor::VisitStmt_(op);
   }
@@ -917,7 +923,10 @@ class SliceStorageAnalysis : public IRVisitor {
                        const std::vector<VarPtr>& return_vars) {
     for (const auto& iter_arg : iter_args) {
       if (!iter_arg) continue;
-      if (auto init = AsVarLike(iter_arg->initValue_)) uses_[init.get()].vec_operand = true;
+      if (auto init = AsVarLike(iter_arg->initValue_)) {
+        uses_[init.get()].vec_operand = true;
+        uses_[init.get()].control_flow = true;
+      }
       Union(iter_arg, iter_arg->initValue_);
     }
     auto yield = transform_utils::GetLastYieldStmt(body);
@@ -1003,14 +1012,55 @@ class CanonicalizeMutator : public IRMutator {
       const auto* uses = storage.FindUses(slice_var.get());
       if (!uses || !IsVecOrUnassigned(info)) continue;
       const bool materializes = (uses->col_expand && MaterializationCorruptsSource(slice_var, info)) ||
-                                (uses->vec_operand && NeedsAlignedVecMaterialization(info));
+                                (uses->vec_operand && NeedsAlignedVecMaterialization(info)) ||
+                                (uses->control_flow && NeedsDenseVecControlFlowLayout(slice_var));
       if (!materializes || storage.MayBeWritten(slice_var.get())) continue;
       definition_site_extracts_.emplace(
           slice_var.get(), BuildOperandExtract(slice_var, info, MemorySpace::Vec, slice_var->span_));
     }
   }
 
+  /// Pure view definitions eligible for cleanup include aliases discovered
+  /// during rewriting, not only the original tile.slice results.
+  const std::unordered_map<const Var*, SliceInfo>& GetTrackedWindows() const { return slices_; }
+
  protected:
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    auto call = As<Call>(IRMutator::VisitExpr_(op));
+    bool operand_type_changed = false;
+    for (size_t i = 0; i < op->args_.size(); ++i) {
+      if (!structural_equal(op->args_[i]->GetType(), call->args_[i]->GetType())) {
+        operand_type_changed = true;
+        break;
+      }
+    }
+    if (!operand_type_changed) return call;
+    auto& registry = OpRegistry::GetInstance();
+    if (As<GlobalVar>(call->op_) || !registry.IsRegistered(call->op_->name_) ||
+        registry.GetEntry(call->op_->name_).RequiresExplicitType()) {
+      return call;
+    }
+    // A copied Vec column is dense, unlike its source-inherited subview. Let
+    // each consumer deduce its layout again only when an operand's type
+    // changed; unrelated calls retain pass-refined descriptors and storage.
+    auto deduced = registry.Create(call->op_->name_, call->args_, call->kwargs_, call->span_);
+    auto type = WithCarriedMemRef(deduced->GetType(), call->GetType());
+    if (!type || As<UnknownType>(type)) return call;
+    if (structural_equal(type, call->GetType())) return call;
+    return std::make_shared<Call>(call->op_, call->args_, call->kwargs_, call->attrs_, type, call->span_);
+  }
+
+  ExprPtr VisitExpr_(const IterArgPtr& op) override {
+    auto arg = As<IterArg>(IRMutator::VisitExpr_(op));
+    if (structural_equal(op->initValue_->GetType(), arg->initValue_->GetType())) return arg;
+    auto type = WithCarriedMemRef(arg->initValue_->GetType(), arg->GetType());
+    if (structural_equal(type, arg->GetType())) return arg;
+    auto fresh = std::make_shared<IterArg>(arg->name_hint_, type, arg->initValue_, arg->span_);
+    retained_vars_.push_back(arg);
+    var_remap_[op.get()] = fresh;
+    return fresh;
+  }
+
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     if (op && op->var_) {
       auto planned = definition_site_extracts_.find(op->var_.get());
@@ -1024,6 +1074,7 @@ class CanonicalizeMutator : public IRMutator {
     auto base = IRMutator::VisitStmt_(op);
     auto assign = As<AssignStmt>(base);
     if (!assign) return base;
+    assign = BindResultType(op, assign);
     auto call = As<Call>(assign->value_);
     if (call && call->op_ && IsOp(call, "tile.extract") && call->args_.size() == 4) {
       auto src = AsVarLike(call->args_[0]);
@@ -1038,8 +1089,8 @@ class CanonicalizeMutator : public IRMutator {
         auto& reg = OpRegistry::GetInstance();
         auto new_call = reg.Create("tile.extract", args, call->kwargs_, sp);
         auto new_assign = MutableCopy(assign);
-        new_assign->value_ = new_call;
-        return new_assign;
+        new_assign->value_ = transform_utils::PreserveCallAttrs(call, new_call);
+        return BindResultType(op, new_assign);
       }
     }
 
@@ -1050,11 +1101,19 @@ class CanonicalizeMutator : public IRMutator {
     if (auto rewrite = TryMaterializeUnalignedVecCall(call)) {
       auto new_assign = MutableCopy(assign);
       new_assign->value_ = rewrite->call;
-      rewrite->extracts.push_back(new_assign);
+      rewrite->extracts.push_back(BindResultType(op, new_assign));
       return SeqStmts::Flatten(std::move(rewrite->extracts), assign->span_);
     }
     if (auto rewrite = TryMaterializeUnalignedVecAlias(assign)) return *rewrite;
-    return base;
+    if (auto source = AsVarLike(assign->value_)) {
+      // An aligned plain alias still names the source window, including its
+      // parent stride. A later control-flow copy must fold to that parent
+      // rather than read the alias as an independently dense allocation.
+      // Sources replaced by extracts have no slice entry and stop the lineage.
+      auto window = slices_.find(source.get());
+      if (window != slices_.end()) slices_.emplace(assign->var_.get(), window->second);
+    }
+    return assign;
   }
 
   StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
@@ -1081,8 +1140,9 @@ class CanonicalizeMutator : public IRMutator {
     for (size_t i = 0; i < yield->value_.size(); ++i) {
       auto value = AsVarLike(yield->value_[i]);
       auto it = value ? slices_.find(value.get()) : slices_.end();
-      if (it == slices_.end() || !NeedsAlignedVecMaterialization(it->second)) continue;
-      auto extract = BuildOperandExtract(value, it->second, MemorySpace::Vec, yield->span_);
+      const bool unaligned = it != slices_.end() && NeedsAlignedVecMaterialization(it->second);
+      if (!unaligned && !NeedsDenseVecControlFlowLayout(value)) continue;
+      auto extract = BuildControlFlowExtract(value, yield->span_);
       extracts.push_back(extract);
       new_values[i] = extract->var_;
     }
@@ -1098,7 +1158,60 @@ class CanonicalizeMutator : public IRMutator {
 
   StmtPtr VisitStmt_(const WhileStmtPtr& op) override { return MaterializeLoopInitsAndVisit(op); }
 
+  StmtPtr VisitStmt_(const IfStmtPtr& op) override {
+    auto result = As<IfStmt>(IRMutator::VisitStmt_(op));
+    auto yield = transform_utils::GetLastYieldStmt(result->then_body_);
+    if (!yield && result->else_body_) yield = transform_utils::GetLastYieldStmt(*result->else_body_);
+    if (!yield) return result;
+    auto vars = result->return_vars_;
+    bool changed = false;
+    for (size_t i = 0; i < vars.size() && i < yield->value_.size(); ++i) {
+      auto type = WithCarriedMemRef(yield->value_[i]->GetType(), vars[i]->GetType());
+      auto var = RetypeResult(op->return_vars_[i], vars[i], type);
+      changed |= var.get() != vars[i].get();
+      vars[i] = std::move(var);
+    }
+    if (!changed) return result;
+    auto copy = MutableCopy(result);
+    copy->return_vars_ = std::move(vars);
+    return copy;
+  }
+
  private:
+  /// Keep the changed type closed over SSA definitions as well as uses. Plain
+  /// aliases, consumer results, and control-flow results must all name the
+  /// dense extract's type rather than the original view's layout.
+  VarPtr RetypeResult(const VarPtr& original, const VarPtr& current, const TypePtr& type) {
+    if (structural_equal(current->GetType(), type) &&
+        GetTypeMemRef(current->GetType()) == GetTypeMemRef(type)) {
+      return current;
+    }
+    auto fresh = std::make_shared<Var>(current->name_hint_, type, current->span_);
+    // Intermediate Vars may also key IRMutator's remap. Keep them alive to
+    // prevent a later allocation from reusing a mapped raw pointer.
+    retained_vars_.push_back(current);
+    var_remap_[original.get()] = fresh;
+    if (current.get() != original.get()) var_remap_[current.get()] = fresh;
+    return fresh;
+  }
+
+  AssignStmtPtr BindResultType(const AssignStmtPtr& original, const AssignStmtPtr& assign) {
+    if (assign->value_.get() == original->value_.get()) return assign;
+    auto type = WithCarriedMemRef(assign->value_->GetType(), assign->var_->GetType());
+    if (!type || As<UnknownType>(type)) return assign;
+    auto var = RetypeResult(original->var_, assign->var_, type);
+    if (var.get() == assign->var_.get()) return assign;
+    if (IsOp(As<Call>(assign->value_), "tile.slice")) {
+      // A retyped slice is still a view: retain its peeled window for later
+      // alignment checks. Fresh extracts deliberately do not inherit it.
+      auto window = slices_.find(original->var_.get());
+      if (window != slices_.end()) slices_.emplace(var.get(), window->second);
+    }
+    auto copy = MutableCopy(assign);
+    copy->var_ = std::move(var);
+    return copy;
+  }
+
   struct MaterializedCall {
     std::vector<StmtPtr> extracts;
     CallPtr call;
@@ -1135,6 +1248,41 @@ class CanonicalizeMutator : public IRMutator {
     return std::make_shared<AssignStmt>(var, call, span);
   }
 
+  /// Pure column views retain their parent's row-major layout, while copying
+  /// the same values into a fresh Vec tile gives the implicit column-major
+  /// layout. A join cannot carry both types. Give flat Vec control-flow edges
+  /// the dense orientation, including edges from functional consumers of a
+  /// slice, so an aligned path agrees with a materialized unaligned path.
+  /// Only blayout may differ: boxed/padded/compact configurations have other
+  /// contracts and must not be silently erased by this normalization.
+  static bool NeedsDenseVecControlFlowLayout(const VarPtr& value) {
+    auto tile = value ? As<TileType>(value->GetType()) : nullptr;
+    if (!tile || tile->shape_.size() != 2) return false;
+    if (tile->memory_space_ && *tile->memory_space_ != MemorySpace::Vec) return false;
+    const auto view = tile_view_semantics::GetEffectiveTileView(*tile);
+    const auto dense = tile_view_semantics::GetImplicitTileLayout(tile->shape_, MemorySpace::Vec);
+    return view.slayout == TileLayout::none_box && view.fractal == dense.fractal &&
+           view.pad == PadValue::null && view.compact == CompactMode::null &&
+           (view.blayout == TileLayout::row_major || view.blayout == TileLayout::col_major) &&
+           view.blayout != dense.blayout;
+  }
+
+  /// Preserve the existing consumer-site snapshot when storage may be written.
+  /// A tracked slice folds directly to its source; an already computed value
+  /// is copied from its own full window rather than resurrecting slice lineage.
+  AssignStmtPtr BuildControlFlowExtract(const VarPtr& value, const Span& span) {
+    auto window = slices_.find(value.get());
+    if (window != slices_.end()) {
+      return BuildOperandExtract(value, window->second, MemorySpace::Vec, span);
+    }
+    const auto zero = std::make_shared<ConstInt>(0, DataType::INDEX, span);
+    SliceInfo full_window{};
+    full_window.base = value;
+    full_window.off_row = zero;
+    full_window.off_col = zero;
+    return BuildOperandExtract(value, full_window, MemorySpace::Vec, span);
+  }
+
   /// If `assign` is a matmul-family op with a Mat-slice lhs/rhs operand, return
   /// the per-operand `tile.extract` statement(s) followed by the rebuilt
   /// matmul.  Returns nullopt when no operand is a Mat slice.
@@ -1166,9 +1314,9 @@ class CanonicalizeMutator : public IRMutator {
     auto& reg = OpRegistry::GetInstance();
     auto new_call = reg.Create(call->op_->name_, new_args, call->kwargs_, sp);
     auto new_assign = MutableCopy(assign);
-    new_assign->value_ = new_call;
+    new_assign->value_ = transform_utils::PreserveCallAttrs(call, new_call);
     std::vector<StmtPtr> out = std::move(extracts);
-    out.push_back(new_assign);
+    out.push_back(BindResultType(assign, new_assign));
     return out;
   }
 
@@ -1271,9 +1419,9 @@ class CanonicalizeMutator : public IRMutator {
     auto& reg = OpRegistry::GetInstance();
     auto new_call = reg.Create(call->op_->name_, new_args, call->kwargs_, sp);
     auto new_assign = MutableCopy(assign);
-    new_assign->value_ = new_call;
+    new_assign->value_ = transform_utils::PreserveCallAttrs(call, new_call);
     std::vector<StmtPtr> out = std::move(extracts);
-    out.push_back(new_assign);
+    out.push_back(BindResultType(assign, new_assign));
     return out;
   }
 
@@ -1389,7 +1537,7 @@ class CanonicalizeMutator : public IRMutator {
 
     auto& reg = OpRegistry::GetInstance();
     auto new_call = reg.Create(call->op_->name_, new_args, call->kwargs_, sp);
-    return MaterializedCall{std::move(extracts), std::move(new_call)};
+    return MaterializedCall{std::move(extracts), transform_utils::PreserveCallAttrs(call, new_call)};
   }
 
   /// Replace a plain SSA alias of an unaligned slice with an extract assigned
@@ -1403,7 +1551,7 @@ class CanonicalizeMutator : public IRMutator {
     auto extract = BuildOperandExtract(source, it->second, MemorySpace::Vec, assign->span_);
     auto new_assign = MutableCopy(assign);
     new_assign->value_ = extract->value_;
-    return new_assign;
+    return BindResultType(assign, new_assign);
   }
 
   /// Materialize unaligned slice initializers before a loop and substitute the
@@ -1416,14 +1564,29 @@ class CanonicalizeMutator : public IRMutator {
     for (const auto& iter_arg : op->iter_args_) {
       auto init = AsVarLike(VisitExpr(iter_arg->initValue_));
       auto it = init ? slices_.find(init.get()) : slices_.end();
-      if (it == slices_.end() || !NeedsAlignedVecMaterialization(it->second)) continue;
-      auto extract = BuildOperandExtract(init, it->second, MemorySpace::Vec, op->span_);
+      const bool unaligned = it != slices_.end() && NeedsAlignedVecMaterialization(it->second);
+      if (!unaligned && !NeedsDenseVecControlFlowLayout(init)) continue;
+      auto extract = BuildControlFlowExtract(init, op->span_);
       extracts.push_back(extract);
       var_remap_[init.get()] = extract->var_;
       remapped_sources.push_back(init.get());
     }
 
-    auto new_loop = IRMutator::VisitStmt_(op);
+    auto loop = std::static_pointer_cast<typename LoopStmtPtr::element_type>(IRMutator::VisitStmt_(op));
+    auto return_vars = loop->return_vars_;
+    bool changed = false;
+    for (size_t i = 0; i < return_vars.size() && i < loop->iter_args_.size(); ++i) {
+      auto type = WithCarriedMemRef(loop->iter_args_[i]->GetType(), return_vars[i]->GetType());
+      auto var = RetypeResult(op->return_vars_[i], return_vars[i], type);
+      changed |= var.get() != return_vars[i].get();
+      return_vars[i] = std::move(var);
+    }
+    StmtPtr new_loop = loop;
+    if (changed) {
+      auto copy = MutableCopy(loop);
+      copy->return_vars_ = std::move(return_vars);
+      new_loop = copy;
+    }
     for (const auto* source : remapped_sources) var_remap_.erase(source);
     if (extracts.empty()) return new_loop;
     extracts.push_back(new_loop);
@@ -1454,20 +1617,40 @@ class CanonicalizeMutator : public IRMutator {
   const std::unordered_map<const Var*, ExprPtr>& scalar_defs_;
   /// Slice Var -> the `tile.extract` assignment that replaces its definition.
   std::unordered_map<const Var*, AssignStmtPtr> definition_site_extracts_;
+  std::vector<ExprPtr> retained_vars_;
 };
 
-/// Phase 3a — collect every Var *used* (referenced on a statement's RHS).  An
-/// AssignStmt's LHS is a definition, not a use, so it is deliberately skipped.
+/// Phase 3a — count Var uses and index RHS dependencies of tracked pure-view
+/// definitions that actually remain after rewriting. AssignStmt's LHS is a
+/// definition, not a use. Repeated RHS references are recorded separately so
+/// deleting a definition removes exactly its contribution to each use count.
 class VarUseCollector : public IRVisitor {
  public:
-  std::unordered_set<const Var*> used;
+  explicit VarUseCollector(const std::unordered_map<const Var*, SliceInfo>& tracked) : tracked_(tracked) {}
+
+  std::unordered_map<const Var*, size_t> use_counts;
+  std::unordered_map<const Var*, std::vector<const Var*>> dependencies;
 
  protected:
-  void VisitStmt_(const AssignStmtPtr& op) override { VisitExpr(op->value_); }
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    const auto* saved = active_definition_;
+    active_definition_ = tracked_.count(op->var_.get()) ? op->var_.get() : nullptr;
+    if (active_definition_) dependencies.try_emplace(active_definition_);
+    VisitExpr(op->value_);
+    active_definition_ = saved;
+  }
+
   void VisitVarLike_(const VarPtr& op) override {
-    used.insert(op.get());
+    ++use_counts[op.get()];
+    if (active_definition_ && tracked_.count(op.get())) {
+      dependencies[active_definition_].push_back(op.get());
+    }
     IRVisitor::VisitVarLike_(op);
   }
+
+ private:
+  const std::unordered_map<const Var*, SliceInfo>& tracked_;
+  const Var* active_definition_ = nullptr;
 };
 
 /// Phase 3b — drop the AssignStmts whose result Var is in the `dead` set.
@@ -1483,7 +1666,7 @@ class DropDeadSliceMutator : public IRMutator {
     for (const auto& child : op->stmts_) {
       auto assign = As<AssignStmt>(child);
       if (assign && assign->var_ && dead_.count(assign->var_.get())) {
-        changed = true;  // dead Mat-slice definition — drop it
+        changed = true;  // Dead slice or pure-alias definition — drop it.
         continue;
       }
       auto visited = VisitStmt(child);
@@ -1518,24 +1701,32 @@ Pass CanonicalizeTileSlice() {
     mutator.PlanDefinitionSiteExtracts(collector.slice_order, storage);
     auto new_body = mutator.VisitStmt(func->body_);
 
-    // Phase 3 — drop the slice defs that no longer have any use.  A chained
-    // slice (a slice of a slice) only becomes dead once the slice that consumes
-    // it is dropped, so iterate to a fixpoint — bounded by the slice count,
-    // since every non-terminating iteration drops at least one statement.  A
-    // slice still used at the end had a consumer this pass does not
-    // canonicalize; it is left intact (no regression versus the pre-pass IR).
-    for (size_t round = 0; round <= collector.slices.size(); ++round) {
-      VarUseCollector uses;
-      uses.VisitStmt(new_body);
-      std::unordered_set<const Var*> dead;
-      for (const auto& [slice_var, info] : collector.slices) {
-        if (uses.used.find(slice_var) == uses.used.end()) dead.insert(slice_var);
+    // Phase 3 — delete unused pure slices/aliases in O(N + E), where E is their
+    // RHS-reference count. Removing the tail of an alias chain releases its
+    // source through this worklist; rescanning the IR per layer would be
+    // quadratic. Index only definitions still present, since the tracked map
+    // also contains original Vars replaced during materialization.
+    VarUseCollector uses(mutator.GetTrackedWindows());
+    uses.VisitStmt(new_body);
+    std::vector<const Var*> pending;
+    for (const auto& [var, dependencies] : uses.dependencies) {
+      if (uses.use_counts[var] == 0) pending.push_back(var);
+    }
+    std::unordered_set<const Var*> dead;
+    while (!pending.empty()) {
+      const auto* var = pending.back();
+      pending.pop_back();
+      if (!dead.insert(var).second) continue;
+      for (const auto* dependency : uses.dependencies.at(var)) {
+        if (!uses.dependencies.count(dependency)) continue;
+        auto& count = uses.use_counts.at(dependency);
+        INTERNAL_CHECK(count > 0) << "CanonicalizeTileSlice: inconsistent pure-view use count";
+        if (--count == 0) pending.push_back(dependency);
       }
-      if (dead.empty()) break;
+    }
+    if (!dead.empty()) {
       DropDeadSliceMutator dropper(dead);
-      auto dropped = dropper.VisitStmt(new_body);
-      if (dropped.get() == new_body.get()) break;  // nothing left to remove
-      new_body = dropped;
+      new_body = dropper.VisitStmt(new_body);
     }
 
     if (new_body.get() == func->body_.get()) return func;

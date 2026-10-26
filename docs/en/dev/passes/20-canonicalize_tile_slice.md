@@ -70,7 +70,7 @@ For each InCore-typed function, in four steps:
 
    The Vec consumer rules apply only to a slice step 2 did not plan — one whose storage may be written between the definition and the consumer. There, only a copy placed at the consumer reads what the view would have read.
 
-4. **Drop dead slices** — a `tile.slice` whose result no longer has any use is removed. A chained slice only becomes dead once the slice consuming it is dropped, so this iterates to a fixpoint (bounded by the slice count). A slice still used at the end had a consumer this pass does not canonicalize; it is left intact — no regression versus the pre-pass IR.
+4. **Drop dead views and aliases** — index uses and dependencies of remaining pure slice/alias definitions, then cascade zero-use definitions through a worklist and remove them in one traversal. This takes `O(N + E)` time, where `E` counts references from tracked definitions. Live views remain intact.
 
 The pass is a `FunctionPass`; functions are returned unchanged when no canonical `tile.slice` is present.
 
@@ -214,6 +214,18 @@ scaled: pl.Tile[[1, 256], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(row, gam
 ```
 
 The written-storage test is whole-function, not between the two sites, so it can only decline a definition-site placement, never admit a wrong one. A declined slice falls back to the consumer placement above, which can still cross a region boundary.
+
+Materialization can change the tile layout: a `[16, 1]` view of a row-major
+matrix inherits that row-major layout, while a fresh dense Vec extract is
+column-major. The pass propagates the extract's deduced type through affected
+operations, plain aliases, and control-flow results rather than retaining the
+slice's view type. Call attributes are preserved when a result is re-deduced.
+Flat Vec inputs to loops and yields use the dense orientation so aligned and
+materialized paths agree at a join. An aligned column view entering such a
+boundary can therefore also acquire an extract; boxed, padded, and compact
+configurations keep their existing contracts.
+The target's extract dtype restrictions still apply: A2/A3 PTOAS accepts
+`i8/f16/bf16/f32` for TEXTRACT and rejects INT32 materialization.
 
 ## Implementation
 

@@ -70,7 +70,7 @@ program_canon = passes.canonicalize_tile_slice()(program)
 
    Vec 消费者规则只作用于第 2 步未规划的 slice——即其存储可能在定义与消费者之间被写入的 slice。此时只有放在消费者处的拷贝才能读到视图本应读到的内容。
 
-4. **删除死 slice (Drop dead slices)** —— 结果不再被任何使用者引用的 `tile.slice` 被删除。链式 slice（slice 的 slice）只有在消费它的那个 slice 被删除后才会变死，因此该步骤迭代至不动点（迭代次数以 slice 数量为上界）。结束时仍被使用的 slice，说明其消费者不被本 pass 规范化——保持原样，相对 pass 前的 IR 无回退。
+4. **删除死视图与别名 (Drop dead views and aliases)** —— 为仍存在的纯切片/别名定义建立引用与依赖索引，通过工作队列级联标记零引用定义，最后单次遍历删除。时间复杂度为 `O(N + E)`，其中 `E` 是被跟踪定义中的引用次数。仍有使用者的视图保持不变。
 
 本 pass 是 `FunctionPass`；当不存在规范 `tile.slice` 时 function 原样返回。
 
@@ -214,6 +214,16 @@ scaled: pl.Tile[[1, 256], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(row, gam
 ```
 
 写入检查针对整个 function，而非两处之间，因此它只会拒绝定义处放置，绝不会接受错误的放置。被拒绝的 slice 回退到上面的消费者处放置，这种放置仍可能跨越区域边界。
+
+物化可能改变 tile 的布局：行主序矩阵的 `[16, 1]` 视图继承行主序布局，
+而新分配的密集 Vec extract 采用列主序。因此，该 pass 会把 extract 推导出的
+类型传播到受影响的算子、普通别名和控制流结果，而不会保留旧切片的视图类型。
+重新推导结果时会保留调用的属性。
+循环输入及 yield 中的平面 Vec 值统一采用密集方向，使对齐路径和已物化路径
+在合流处保持一致。因此，进入此类边界的对齐列视图也可能增加一次 extract；
+boxed、pad 和 compact 配置仍遵循原有约束。
+目标平台的 extract 类型限制仍然生效：A2/A3 PTOAS 的 TEXTRACT 接受
+`i8/f16/bf16/f32`，不支持 INT32 物化。
 
 ## 实现
 

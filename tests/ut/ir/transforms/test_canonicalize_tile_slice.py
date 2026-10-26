@@ -1151,6 +1151,97 @@ class TestUnalignedVecSlice:
         ir.assert_structural_equal(_run_pass(Before), Expected)
 
 
+class TestMaterializedSliceJoins:
+    """All edges must agree when one borrowed column becomes a dense tile."""
+
+    def test_mixed_alignment_if_yields_share_dense_layout(self):
+        """Materializing one branch must also normalize the aligned branch.
+
+        Both original slices inherit row-major storage. Extracting column one
+        makes that edge column-major, so leaving column zero as a borrowed view
+        would give the same If result two incompatible tile types.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                flag: pl.Scalar[pl.INT32],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                if flag > 0:
+                    head = pl.tile.slice(local, [16, 1], [0, 1])
+                    selected = pl.yield_(head)
+                else:
+                    aligned = pl.tile.slice(local, [16, 1], [0, 0])
+                    selected = pl.yield_(aligned)
+                scaled = pl.tile.muls(selected, 0.5)
+                return pl.store(scaled, [0, 0], out)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                flag: pl.Scalar[pl.INT32],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                if flag > 0:
+                    head_ext = pl.tile.extract(local, 0, 1, shape=[16, 1], target_memory=pl.Mem.Vec)
+                    selected = pl.yield_(head_ext)
+                else:
+                    aligned_ext = pl.tile.extract(local, 0, 0, shape=[16, 1], target_memory=pl.Mem.Vec)
+                    selected = pl.yield_(aligned_ext)
+                scaled = pl.tile.muls(selected, 0.5)
+                return pl.store(scaled, [0, 0], out)
+
+        ir.assert_structural_equal(_run_pass(Before), Expected)
+
+    def test_mixed_alignment_loop_init_and_yield_share_dense_layout(self):
+        """The zero-trip initializer and materialized back edge need one type."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                trip: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                seed = pl.tile.slice(local, [16, 1], [0, 0])
+                for _i, (carried,) in pl.range(trip, init_values=(seed,)):
+                    head = pl.tile.slice(local, [16, 1], [0, 1])
+                    result = pl.yield_(head)
+                scaled = pl.tile.muls(result, 0.5)
+                return pl.store(scaled, [0, 0], out)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                trip: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                seed_ext = pl.tile.extract(local, 0, 0, shape=[16, 1], target_memory=pl.Mem.Vec)
+                for _i, (carried,) in pl.range(trip, init_values=(seed_ext,)):
+                    head_ext = pl.tile.extract(local, 0, 1, shape=[16, 1], target_memory=pl.Mem.Vec)
+                    result = pl.yield_(head_ext)
+                scaled = pl.tile.muls(result, 0.5)
+                return pl.store(scaled, [0, 0], out)
+
+        ir.assert_structural_equal(_run_pass(Before), Expected)
+
+
 class TestSliceIntoColExpand:
     """A Vec tile.slice consumed by tile.col_expand_mul / tile.col_expand_add is
     materialized through a fresh tile.extract (issue #1640) so the lazy
