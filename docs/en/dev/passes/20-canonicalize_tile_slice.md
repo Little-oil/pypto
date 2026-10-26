@@ -192,7 +192,7 @@ column_ext = pl.tile.extract(local, 0, 0, shape=[16, 1], target_memory=pl.Mem.Ve
 scaled = pl.tile.muls(column_ext, 0.5)
 ```
 
-This rule applies to registered computations with functional memory-access evidence, a Vec result, read-only operands, and no declared writeback or scratch destination. Optional reuse of an input allocation does not turn a functional computation into a view. A store-only use keeps its zero-copy subview; metadata views and mutable destinations retain their existing contracts.
+This rule applies to registered computations with functional memory-access evidence, a Vec result, and no declared result writeback. Eligibility is checked per operand: a read-only source may be materialized even when the call writes a separate scratch tile, as in `tile.sels`. This layout normalization leaves writable and scratch operands unchanged. Optional reuse of an input allocation does not turn a functional computation into a view. A store-only use keeps its zero-copy subview; metadata views and mutable destinations retain their existing contracts.
 
 ### Where a Vec extract goes
 
@@ -231,7 +231,7 @@ scaled: pl.Tile[[1, 256], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(row, gam
 
 The written-storage test is whole-function, not between the two sites, so it can only decline a definition-site placement, never admit a wrong one. A declined slice falls back to the consumer placement above, which can still cross a region boundary.
 
-Window analysis precedes rewriting, so an alias or loop argument recorded there may later be replaced with a new SSA variable. Planned extract assignments are remapped before emission; consumer-site extracts resolve their cached base and both offset expressions at the current insertion point. The shared window cache keeps its original expressions rather than storing replacements that exist only within a branch or loop.
+Window analysis precedes rewriting, so an alias or loop argument recorded there may later be replaced with a new SSA variable. Planned extract assignments are remapped before emission; both consumer-site materialization and folding an explicit `tile.extract` resolve the cached base and both offset expressions at the current insertion point. The shared window cache keeps its original expressions rather than storing replacements that exist only within a branch or loop.
 
 Materialization can change the tile layout: a `[16, 1]` view of a row-major
 matrix inherits that row-major layout, while a fresh dense Vec extract is

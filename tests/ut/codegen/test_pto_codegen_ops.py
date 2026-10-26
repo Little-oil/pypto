@@ -1197,6 +1197,49 @@ class TestB02SelectionAndPreluCodegen:
         self._assert_named_ssas(ins[:3], ["mask", "src", "tmp"])
         self._assert_named_ssas(outs, ["result"])
 
+    @pytest.mark.ptoas_compile
+    def test_tsels_materializes_aligned_column_and_preserves_writable_tmp(self, tmp_path):
+        """Normalize a read-only source even when the same call writes scratch.
+
+        The aligned column is a legal borrowed view, but an arithmetic result
+        cannot inherit its four-byte row-major axis. Copy that source densely
+        while keeping the caller's separately allocated scratch destination.
+        """
+
+        @pl.program
+        class ColumnSelect:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 8], pl.FP32],
+                mask_in: pl.Tensor[[16, 32], pl.UINT8],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                local = pl.load(src, [0, 0], [16, 8])
+                mask = pl.load(mask_in, [0, 0], [16, 32])
+                column = pl.tile.slice(local, [16, 1], [0, 0])
+                tmp = pl.tile.create([1, 16], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                result = pl.tile.sels(mask, column, tmp, -1.0)
+                return pl.store(result, [0, 0], out)
+
+        mlir = self._generate_mlir(ColumnSelect, BackendType.Ascend910)
+        extracts = [line for line in mlir.splitlines() if "pto.textract " in line]
+        assert len(extracts) == 1, mlir
+        assert "rows=16, cols=8" in extracts[0].split("outs(", 1)[0], mlir
+        select = strip_loc(self._op_line(mlir, "pto.tsels"))
+        inputs, _outputs = self._ins_outs_ssas(select)
+        scratch = next(
+            line.strip().split(" = ", 1)[0]
+            for line in mlir.splitlines()
+            if "= pto.alloc_tile " in line and "%tmp__" in line.split("=", 1)[0]
+        )
+        assert inputs[2] == scratch, mlir
+        assert mlir.index("pto.textract ") < mlir.index("pto.tsels "), mlir
+        if find_ptoas_binary() is None:
+            pytest.skip("PTOAS is not available")
+        cpp = pto_backend._compile_pto_module(mlir, "kernel", str(tmp_path))
+        assert "TEXTRACT(" in cpp and "TSELS(" in cpp, cpp
+
     def test_tprelu_emits_target_specific_exact_operands(self):
         @pl.program
         class Prog:

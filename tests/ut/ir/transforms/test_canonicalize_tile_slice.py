@@ -1740,6 +1740,47 @@ class TestVecExtractPlacement:
 class TestPlannedExtractSourceRemapping:
     """Extract plans must use definitions retyped during the actual rewrite."""
 
+    def test_explicit_extract_fold_uses_retyped_alias(self):
+        """An explicit extract folds its window through the current alias Var.
+
+        The tail has no definition-site extract plan because its consumer is
+        already an extract. Folding that consumer must still remap the cached
+        alias after head's materialization changes the alias's layout.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                out: pl.Out[pl.Tensor[[8, 1], pl.FP32]],
+            ) -> pl.Tensor[[8, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                head = pl.tile.slice(local, [16, 1], [0, 1])
+                alias = head
+                tail = pl.tile.slice(alias, [8, 1], [1, 0])
+                result = pl.tile.extract(tail, 0, 0, shape=[8, 1], target_memory=pl.Mem.Vec)
+                stored = pl.store(result, [0, 0], out)
+                return stored
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                out: pl.Out[pl.Tensor[[8, 1], pl.FP32]],
+            ) -> pl.Tensor[[8, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                head_ext = pl.tile.extract(local, 0, 1, shape=[16, 1], target_memory=pl.Mem.Vec)
+                alias = head_ext
+                result = pl.tile.extract(alias, 1, 0, shape=[8, 1], target_memory=pl.Mem.Vec)
+                stored = pl.store(result, [0, 0], out)
+                return stored
+
+        ir.assert_structural_equal(_run_pass(Before), Expected)
+
     def test_planned_extract_uses_retyped_alias(self):
         """The second plan cannot retain the alias's original SSA identity.
 

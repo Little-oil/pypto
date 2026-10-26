@@ -790,10 +790,13 @@ bool IsColExpandMaterializingOp(const OpPtr& op) {
 }
 
 /// A functional Vec computation owns a result buffer even when the allocator
-/// may reuse an input's storage. This is distinct from a real view (NoAccess)
-/// or a declared writeback, whose source window must remain its destination.
-bool IsReadOnlyVecCompute(const CallPtr& call) {
-  if (!call || !call->op_) return false;
+/// may reuse an input's storage. Read operands may need a dense layout without
+/// changing a writable scratch operand's destination. Real views (NoAccess)
+/// and declared writebacks retain their existing source-window semantics.
+bool IsReadOnlyVecComputeOperand(const CallPtr& call, size_t index) {
+  if (!call || !call->op_ || index >= call->args_.size() || !As<TileType>(call->args_[index]->GetType())) {
+    return false;
+  }
   auto result = As<TileType>(call->GetType());
   if (!result || (result->memory_space_ && *result->memory_space_ != MemorySpace::Vec)) return false;
   auto& registry = OpRegistry::GetInstance();
@@ -803,12 +806,11 @@ bool IsReadOnlyVecCompute(const CallPtr& call) {
       entry.GetOutputReusesInputArg().has_value()) {
     return false;
   }
-  for (size_t i = 0; i < call->args_.size(); ++i) {
-    if (entry.GetArgEffect(i, call->kwargs_) != ArgEffect::Read) return false;
-    auto kind = entry.GetLaneInvariantArgKind(i);
-    if (kind && *kind != LaneInvariantArg::IndexAddressedSource) return false;
+  if (entry.IsWorkspaceArg(index) || entry.GetArgEffect(index, call->kwargs_) != ArgEffect::Read) {
+    return false;
   }
-  return true;
+  auto kind = entry.GetLaneInvariantArgKind(index);
+  return !kind || *kind == LaneInvariantArg::IndexAddressedSource;
 }
 
 /// Phase 1b — the facts that decide whether a Vec slice can be materialized
@@ -911,14 +913,13 @@ class SliceStorageAnalysis : public IRVisitor {
     // peeled and a tile.extract operand is folded, so neither materializes.
     if (!IsOp(call, "tile.slice") && !IsOp(call, "tile.extract")) {
       const bool col_expand = IsColExpandMaterializingOp(call->op_) && call->args_.size() == 2;
-      const bool dense_compute = IsReadOnlyVecCompute(call);
-      for (const auto& arg : call->args_) {
-        auto var = AsVarLike(arg);
+      for (size_t i = 0; i < call->args_.size(); ++i) {
+        auto var = AsVarLike(call->args_[i]);
         if (!var) continue;
         auto& uses = uses_[var.get()];
         uses.vec_operand = true;
         uses.col_expand |= col_expand;
-        uses.dense_compute |= dense_compute;
+        uses.dense_compute |= IsReadOnlyVecComputeOperand(call, i);
       }
     }
 
@@ -1115,8 +1116,11 @@ class CanonicalizeMutator : public IRMutator {
         //   -> extract(base, ir + or, ic + oc, shape)
         const auto& info = it->second;
         const Span& sp = call->span_;
-        std::vector<ExprPtr> args = {info.base, MakeCanonicalIndexAdd(call->args_[1], info.off_row, sp),
-                                     MakeCanonicalIndexAdd(call->args_[2], info.off_col, sp), call->args_[3]};
+        // This fold bypasses BuildOperandExtract, so apply the same current
+        // SSA remaps to the cached window before synthesizing its operands.
+        std::vector<ExprPtr> args = {
+            VisitExpr(info.base), MakeCanonicalIndexAdd(call->args_[1], VisitExpr(info.off_row), sp),
+            MakeCanonicalIndexAdd(call->args_[2], VisitExpr(info.off_col), sp), call->args_[3]};
         auto& reg = OpRegistry::GetInstance();
         auto new_call = reg.Create("tile.extract", args, call->kwargs_, sp);
         auto new_assign = MutableCopy(assign);
@@ -1561,13 +1565,13 @@ class CanonicalizeMutator : public IRMutator {
     std::vector<StmtPtr> extracts;
     std::vector<ExprPtr> new_args = call->args_;
     bool rewrote = false;
-    const bool dense_compute = IsReadOnlyVecCompute(call);
     for (size_t i = 0; i < call->args_.size(); ++i) {
       auto operand = AsVarLike(call->args_[i]);
       if (!operand) continue;
       auto it = slices_.find(operand.get());
       if (it == slices_.end()) continue;
-      if (!NeedsAlignedVecMaterialization(it->second) && !(dense_compute && NeedsDenseVecLayout(operand))) {
+      if (!NeedsAlignedVecMaterialization(it->second) &&
+          !(IsReadOnlyVecComputeOperand(call, i) && NeedsDenseVecLayout(operand))) {
         continue;
       }
       auto extract = BuildOperandExtract(operand, it->second, MemorySpace::Vec, sp);
