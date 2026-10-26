@@ -275,8 +275,8 @@ int64_t KnownMultipleModuloAlignment(const ExprPtr& expr,
 
 /// If `assign` is `var = tile.slice(src, shape, [off_row, off_col])`, return the
 /// peeled base/offset.  `known` holds slices collected so far; a slice whose
-/// source is itself a recorded slice is peeled through it (offsets summed), so
-/// `base` is always a non-slice tile.
+/// source is itself a recorded slice is peeled through it (offsets summed).
+/// Unrecorded validity/layout boundaries remain as the base.
 std::optional<SliceInfo> ParseSliceWindow(const AssignStmtPtr& assign,
                                           const std::unordered_map<const Var*, SliceInfo>& known,
                                           const std::unordered_map<const Var*, ExprPtr>& known_consts,
@@ -284,13 +284,7 @@ std::optional<SliceInfo> ParseSliceWindow(const AssignStmtPtr& assign,
   if (!assign || !assign->var_) return std::nullopt;
   auto call = As<Call>(assign->value_);
   if (!call || !call->op_ || !IsOp(call, "tile.slice")) return std::nullopt;
-  // Rewriting is restricted to canonical 3-arg slices (input, shape, offset): a
-  // slice carrying valid_shape / drop_dims is not a plain window, so the
-  // canonicalization rules below do not apply to it.  The Acc safety check has
-  // no such restriction — it only needs the physical base and offset, and a
-  // non-canonical slice miscompiles exactly the same way — so it parses with
-  // `require_canonical = false`.
-  if (require_canonical ? call->args_.size() != 3 : call->args_.size() < 3) return std::nullopt;
+  if (call->args_.size() < 3 || (require_canonical && call->args_.size() > 5)) return std::nullopt;
 
   auto src = AsVarLike(call->args_[0]);
   if (!src) return std::nullopt;
@@ -301,6 +295,36 @@ std::optional<SliceInfo> ParseSliceWindow(const AssignStmtPtr& assign,
   // InferTileMemorySpace, so it may be unset (nullopt); that is treated as
   // "Vec-or-unassigned" by the col-expand rewrite (see TryRewriteColExpand).
   auto slice_tile = As<TileType>(assign->var_->GetType());
+  if (require_canonical && call->args_.size() != 3) {
+    // Explicit validity is supported for flat Vec windows whose physical 2-D
+    // geometry is unchanged (including no-op drop_dims). L0 boundary transfers
+    // have compact-layout contracts of their own, so Mat/Acc/Left/Right forms
+    // remain unpeeled. The separate Acc safety analysis still sees all forms.
+    auto source_tile = As<TileType>(src->GetType());
+    auto shape = As<MakeTuple>(call->args_[1]);
+    if (!source_tile || !slice_tile || source_tile->shape_.size() != 2 || !shape ||
+        shape->elements_.size() != 2 || slice_tile->shape_.size() != 2 ||
+        !tile_view_semantics::ShapeExprListsEquivalent(shape->elements_, slice_tile->shape_)) {
+      return std::nullopt;
+    }
+    for (const auto& tile : {source_tile, slice_tile}) {
+      const auto space = tile->GetMemorySpace();
+      if (space && *space != MemorySpace::Vec) return std::nullopt;
+    }
+    const auto source_view = tile_view_semantics::GetEffectiveTileView(*source_tile);
+    const auto result_view = tile_view_semantics::GetEffectiveTileView(*slice_tile);
+    const auto flat_layout =
+        tile_view_semantics::GetImplicitTileLayout(source_tile->shape_, MemorySpace::Vec);
+    // Do not erase the existing pure-subview rejection of pad overrides, or
+    // reinterpret boxed/compact bytes through a flat extraction.
+    if (source_view.slayout != TileLayout::none_box || source_view.fractal != flat_layout.fractal ||
+        source_view.pad != PadValue::null || source_view.compact != CompactMode::null ||
+        source_view.blayout != result_view.blayout || source_view.slayout != result_view.slayout ||
+        source_view.fractal != result_view.fractal || source_view.pad != result_view.pad ||
+        source_view.compact != result_view.compact) {
+      return std::nullopt;
+    }
+  }
   std::optional<MemorySpace> memory_space = slice_tile ? slice_tile->GetMemorySpace() : std::nullopt;
   bool is_mat = IsMatTile(assign->var_->GetType());
   const ExprPtr source_off_row = ResolveKnownConstInt(offset->elements_[0], known_consts);
@@ -521,9 +545,9 @@ class SliceCollector : public IRVisitor {
   std::unordered_map<const Var*, ExprPtr> scalar_defs;
   /// Which window each Var *names*, whether or not that Var is itself a
   /// `tile.slice` result.  Seeded from every `tile.slice`, canonical or not —
-  /// `slices` drives the rewrites and is therefore restricted to the canonical
-  /// 3-arg form, while the Acc safety check needs the physical base and offset
-  /// of *any* window, since a slice carrying an explicit valid_shape reaches
+  /// `slices` drives the rewrites and additionally admits geometry-preserving
+  /// explicit-valid flat Vec windows, while the Acc safety check needs the
+  /// physical base and offset of *any* window, since explicit valid_shape reaches
   /// the MAD with exactly the same broken stride — and then extended along
   /// identity-preserving edges by `BindWindowAlias`.
   std::unordered_map<const Var*, SliceInfo> windows;
@@ -1009,6 +1033,22 @@ class SliceStorageAnalysis : public IRVisitor {
 /// folded into `tile.extract` / matmul, hazardous col-expand operands get fresh
 /// storage, and unaligned Vec operands are materialized before ordinary ops.
 class CanonicalizeMutator : public IRMutator {
+  struct OperandExtract {
+    std::vector<StmtPtr> prefix;
+    AssignStmtPtr assignment;
+
+    void AppendTo(std::vector<StmtPtr>& statements) const {
+      statements.insert(statements.end(), prefix.begin(), prefix.end());
+      statements.push_back(assignment);
+    }
+
+    [[nodiscard]] StmtPtr AsStmt() const {
+      auto statements = prefix;
+      statements.push_back(assignment);
+      return SeqStmts::Flatten(std::move(statements), assignment->span_);
+    }
+  };
+
  public:
   CanonicalizeMutator(const std::unordered_map<const Var*, SliceInfo>& slices,
                       const std::unordered_map<const Var*, ExprPtr>& scalar_defs)
@@ -1095,11 +1135,12 @@ class CanonicalizeMutator : public IRMutator {
         // Planning precedes SSA/type rewrites. Earlier materialized slices can
         // retype aliases or loop carries used by this extract, so substitute
         // those definitions before returning the planned assignment.
-        auto rewritten = As<AssignStmt>(IRMutator::VisitStmt_(planned->second));
-        rewritten = BindResultType(planned->second, rewritten);
+        auto rewritten = VisitStmt(planned->second.AsStmt());
+        auto result = AsVarLike(VisitExpr(planned->second.assignment->var_));
+        INTERNAL_CHECK(result) << "CanonicalizeTileSlice: planned extract result must remain a Var";
         // Every later reference to the slice now reads the extract. SSA puts
         // the definition before its uses, so the remap is in place in time.
-        var_remap_[op->var_.get()] = rewritten->var_;
+        var_remap_[op->var_.get()] = result;
         return rewritten;
       }
     }
@@ -1125,7 +1166,15 @@ class CanonicalizeMutator : public IRMutator {
         auto new_call = reg.Create("tile.extract", args, call->kwargs_, sp);
         auto new_assign = MutableCopy(assign);
         new_assign->value_ = transform_utils::PreserveCallAttrs(call, new_call);
-        return BindResultType(op, new_assign);
+        auto expected_type = As<TileType>(call->GetType());
+        INTERNAL_CHECK_SPAN(expected_type, sp) << "CanonicalizeTileSlice: extract must return a tile";
+        auto extract =
+            RefineExtractValidity(BindResultType(op, new_assign),
+                                  tile_view_semantics::GetEffectiveTileView(*expected_type).valid_shape);
+        if (extract.assignment->var_.get() != op->var_.get()) {
+          var_remap_[op->var_.get()] = extract.assignment->var_;
+        }
+        return extract.AsStmt();
       }
     }
 
@@ -1178,8 +1227,8 @@ class CanonicalizeMutator : public IRMutator {
       const bool unaligned = it != slices_.end() && NeedsAlignedVecMaterialization(it->second);
       if (!unaligned && !NeedsDenseVecLayout(value)) continue;
       auto extract = BuildControlFlowExtract(value, yield->span_);
-      extracts.push_back(extract);
-      new_values[i] = extract->var_;
+      extract.AppendTo(extracts);
+      new_values[i] = extract.assignment->var_;
     }
     if (extracts.empty()) return base;
 
@@ -1269,8 +1318,8 @@ class CanonicalizeMutator : public IRMutator {
   /// slice's result tile shape is forwarded as the extract shape — passing the
   /// existing shape expressions through (rather than extracting int64 values
   /// and rebuilding ConstInts) keeps the path safe under future symbolic dims.
-  AssignStmtPtr BuildOperandExtract(const VarPtr& slice_var, const SliceInfo& info, MemorySpace target,
-                                    const Span& span) {
+  OperandExtract BuildOperandExtract(const VarPtr& slice_var, const SliceInfo& info, MemorySpace target,
+                                     const Span& span) {
     auto slice_tile = As<TileType>(slice_var->GetType());
     INTERNAL_CHECK(slice_tile && slice_tile->shape_.size() == 2)
         << "CanonicalizeTileSlice: materialized slice must have a 2-D TileType result";
@@ -1285,7 +1334,27 @@ class CanonicalizeMutator : public IRMutator {
     auto& reg = OpRegistry::GetInstance();
     auto call = reg.Create("tile.extract", args, kwargs, span);
     auto var = std::make_shared<Var>(slice_var->name_hint_ + "_textract", call->GetType(), span);
-    return std::make_shared<AssignStmt>(var, call, span);
+    auto extract = std::make_shared<AssignStmt>(var, call, span);
+    return RefineExtractValidity(extract, tile_view_semantics::GetEffectiveTileView(*slice_tile).valid_shape);
+  }
+
+  /// Extract from the aligned parent and preserve the original window's
+  /// effective validity on the new private buffer. Refining only this fresh
+  /// allocation avoids changing its parent's masks or losing a partial/dynamic
+  /// valid_shape while peeling an explicit-valid slice.
+  OperandExtract RefineExtractValidity(const AssignStmtPtr& extract, const std::vector<ExprPtr>& valid) {
+    auto tile = As<TileType>(extract->var_->GetType());
+    INTERNAL_CHECK(tile && valid.size() == 2)
+        << "CanonicalizeTileSlice: extracted window must have 2-D validity";
+    std::vector<ExprPtr> requested = {VisitExpr(valid[0]), VisitExpr(valid[1])};
+    if (tile_view_semantics::ShapeExprListsEquivalent(
+            tile_view_semantics::GetEffectiveTileView(*tile).valid_shape, requested)) {
+      return {{}, extract};
+    }
+    auto call = OpRegistry::GetInstance().Create("tile.set_validshape",
+                                                 {extract->var_, requested[0], requested[1]}, extract->span_);
+    auto var = std::make_shared<Var>(extract->var_->name_hint_ + "_valid", call->GetType(), extract->span_);
+    return {{extract}, std::make_shared<AssignStmt>(var, call, extract->span_)};
   }
 
   /// Pure column views retain their parent's row-major layout, while copying
@@ -1311,7 +1380,7 @@ class CanonicalizeMutator : public IRMutator {
   /// Preserve the existing consumer-site snapshot when storage may be written.
   /// A tracked slice folds directly to its source; an already computed value
   /// is copied from its own full window rather than resurrecting slice lineage.
-  AssignStmtPtr BuildControlFlowExtract(const VarPtr& value, const Span& span) {
+  OperandExtract BuildControlFlowExtract(const VarPtr& value, const Span& span) {
     auto window = slices_.find(value.get());
     if (window != slices_.end()) {
       return BuildOperandExtract(value, window->second, MemorySpace::Vec, span);
@@ -1344,8 +1413,8 @@ class CanonicalizeMutator : public IRMutator {
       auto it = slices_.find(operand.get());
       if (it == slices_.end() || !it->second.is_mat) return;
       auto extract = BuildOperandExtract(operand, it->second, target, sp);
-      extracts.push_back(extract);
-      new_args[arg_idx] = extract->var_;
+      extract.AppendTo(extracts);
+      new_args[arg_idx] = extract.assignment->var_;
       rewrote = true;
     };
     rewrite_operand(indices->first, MemorySpace::Left);
@@ -1451,8 +1520,8 @@ class CanonicalizeMutator : public IRMutator {
       if (ms.has_value() && *ms != MemorySpace::Vec) continue;
       if (!MaterializationCorruptsSource(operand, it->second)) continue;  // identity textract, safe
       auto extract = BuildOperandExtract(operand, it->second, MemorySpace::Vec, sp);
-      extracts.push_back(extract);
-      new_args[i] = extract->var_;
+      extract.AppendTo(extracts);
+      new_args[i] = extract.assignment->var_;
       rewrote = true;
     }
     if (!rewrote) return std::nullopt;
@@ -1575,8 +1644,8 @@ class CanonicalizeMutator : public IRMutator {
         continue;
       }
       auto extract = BuildOperandExtract(operand, it->second, MemorySpace::Vec, sp);
-      extracts.push_back(extract);
-      new_args[i] = extract->var_;
+      extract.AppendTo(extracts);
+      new_args[i] = extract.assignment->var_;
       rewrote = true;
     }
     if (!rewrote) return std::nullopt;
@@ -1596,8 +1665,9 @@ class CanonicalizeMutator : public IRMutator {
 
     auto extract = BuildOperandExtract(source, it->second, MemorySpace::Vec, assign->span_);
     auto new_assign = MutableCopy(assign);
-    new_assign->value_ = extract->value_;
-    return BindResultType(assign, new_assign);
+    new_assign->value_ = extract.assignment->value_;
+    extract.assignment = BindResultType(assign, new_assign);
+    return extract.AsStmt();
   }
 
   /// Materialize unaligned slice initializers before a loop and substitute the
@@ -1613,8 +1683,8 @@ class CanonicalizeMutator : public IRMutator {
       const bool unaligned = it != slices_.end() && NeedsAlignedVecMaterialization(it->second);
       if (!unaligned && !NeedsDenseVecLayout(init)) continue;
       auto extract = BuildControlFlowExtract(init, op->span_);
-      extracts.push_back(extract);
-      var_remap_[init.get()] = extract->var_;
+      extract.AppendTo(extracts);
+      var_remap_[init.get()] = extract.assignment->var_;
       remapped_sources.push_back(init.get());
     }
 
@@ -1646,7 +1716,7 @@ class CanonicalizeMutator : public IRMutator {
   void RebaseOnPlannedSource(SliceInfo& info, const Span& span) {
     auto planned = definition_site_extracts_.find(info.source.get());
     if (planned != definition_site_extracts_.end()) {
-      info.base = planned->second->var_;
+      info.base = planned->second.assignment->var_;
       info.off_row = info.source_off_row;
       info.off_col = info.source_off_col;
       return;
@@ -1661,8 +1731,8 @@ class CanonicalizeMutator : public IRMutator {
   /// Own copy: planning rebases chained windows in place.
   std::unordered_map<const Var*, SliceInfo> slices_;
   const std::unordered_map<const Var*, ExprPtr>& scalar_defs_;
-  /// Slice Var -> the `tile.extract` assignment that replaces its definition.
-  std::unordered_map<const Var*, AssignStmtPtr> definition_site_extracts_;
+  /// Slice Var -> private extract and optional validity refinement replacing it.
+  std::unordered_map<const Var*, OperandExtract> definition_site_extracts_;
   std::vector<ExprPtr> retained_vars_;
 };
 

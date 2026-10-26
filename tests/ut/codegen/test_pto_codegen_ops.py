@@ -2375,13 +2375,22 @@ class TestTileSliceCodegen:
     fractal/pad) and only the shape/valid_shape change.
     """
 
-    def _generate_mlir(self, program_cls) -> str:
+    def _generate_mlir(self, program_cls, *, canonicalize_slices: bool = True) -> str:
         """Run PassManager and PTOCodegen on the given program, return MLIR string."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910)
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
-        optimized = pm.run_passes(program_cls)
+        if canonicalize_slices:
+            optimized = pm.run_passes(program_cls)
+        else:
+            # Exercise codegen's last-resort guard on the same input as the
+            # successful pipeline, retaining every other normal lowering pass.
+            pipeline = passes.PassPipeline()
+            for pass_obj in pm.passes:
+                if pass_obj.get_name() != "CanonicalizeTileSlice":
+                    pipeline.add_pass(pass_obj)
+            optimized = pipeline.run(program_cls)
         codegen_instance = codegen.PTOCodegen()
         funcs = list(optimized.functions.values())
         assert funcs, "Program has no functions"
@@ -2503,6 +2512,43 @@ class TestTileSliceCodegen:
         assert "rows=16, cols=8" in extracts[0].split("outs(", 1)[0], mlir
         assert mlir.count("pto.tmuls ") == 1, mlir
         assert mlir.index("pto.textract ") < mlir.index("pto.tmuls "), mlir
+        if find_ptoas_binary() is None:
+            pytest.skip("PTOAS is not available")
+        cpp = pto_backend._compile_pto_module(mlir, "kernel", str(tmp_path))
+        assert "TEXTRACT(" in cpp and "TMULS(" in cpp and "TSTORE(" in cpp, cpp
+
+    @pytest.mark.ptoas_compile
+    @pytest.mark.parametrize("column_offset", [0, 1], ids=["aligned", "unaligned"])
+    @pytest.mark.parametrize("valid_rows", [16, 8], ids=["full-valid", "partial-valid"])
+    def test_explicit_valid_column_arithmetic_compiles_with_requested_extent(
+        self, tmp_path, valid_rows, column_offset
+    ):
+        """An explicit valid shape must not bypass dense arithmetic layout repair.
+
+        Both cases keep sixteen physical rows. The partial case must continue
+        to store only eight logical rows after the source is copied densely.
+        """
+
+        @pl.program
+        class ExplicitValidColumn:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 8], pl.FP32],
+                dst: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                local = pl.load(src, [0, 0], [16, 8])
+                column = pl.tile.slice(local, [16, 1], [0, column_offset], valid_shape=[valid_rows, 1])
+                scaled = pl.tile.muls(column, 0.5)
+                return pl.store(scaled, [0, 0], dst)
+
+        mlir = self._generate_mlir(ExplicitValidColumn)
+        extracts = [line for line in mlir.splitlines() if "pto.textract " in line]
+        assert len(extracts) == 1, mlir
+        assert "rows=16, cols=1" in extracts[0].split("outs(", 1)[1], mlir
+        store = next(line for line in mlir.splitlines() if "pto.tstore " in line)
+        assert f"!pto.partition_tensor_view<{valid_rows}x1xf32>" in store, mlir
+        assert mlir.count("pto.tmuls ") == 1, mlir
         if find_ptoas_binary() is None:
             pytest.skip("PTOAS is not available")
         cpp = pto_backend._compile_pto_module(mlir, "kernel", str(tmp_path))
@@ -2800,17 +2846,21 @@ class TestTileSliceCodegen:
             f"{addrs[src]} — the repack would corrupt its own source (#2010)"
         )
 
-    def test_dynamic_offset_slice_escaping_the_pass_into_col_expand_is_rejected(self):
-        """A dynamic-offset slice that ``CanonicalizeTileSlice`` cannot rewrite must be
-        rejected by codegen, not silently materialized onto its own source.
+    @pytest.mark.parametrize(
+        "canonicalize_slices",
+        [
+            pytest.param(False, id="codegen-guard"),
+            pytest.param(True, id="canonicalized", marks=pytest.mark.ptoas_compile),
+        ],
+    )
+    def test_dynamic_row_slice_col_expand_canonicalization_and_codegen_guard(
+        self, tmp_path, canonicalize_slices
+    ):
+        """Canonicalize a geometry-preserving five-argument row slice safely.
 
-        The pass only canonicalizes plain 3-arg windows, so a rank-reducing ``t[row]``
-        (a 5-arg slice carrying drop_dims) escapes it. Its window is a single row —
-        contiguous — but the offset is dynamic, and a dynamic offset cannot be folded
-        into the source-inherited buffer's address: the destination falls back to the
-        source base, so the lazy ``pto.textract`` would extract row ``row`` on top of
-        the source's row 0 while the source is still live (#1640). The contiguity
-        guard alone lets this through, so the offset must be checked too.
+        With that pass deliberately omitted, the original dynamic-offset
+        codegen guard must still reject the slice: lazy materialization would
+        copy row ``row`` over the still-live source's row zero (#1640).
         """
 
         @pl.program
@@ -2825,8 +2875,8 @@ class TestTileSliceCodegen:
             ) -> pl.Tensor[[1, 32], pl.FP32]:
                 t: pl.Tile[[16, 32], pl.FP32] = pl.load(x, [0, 0], [16, 32])
                 gamma_t: pl.Tile[[1, 32], pl.FP32] = pl.load(gamma, [0, 0], [1, 32])
-                # Rank-reducing subscript -> tile.slice with drop_dims: not a plain
-                # 3-arg window, so CanonicalizeTileSlice leaves it alone.
+                # The five-argument subscript keeps its [1, 32] geometry after
+                # the minimum-rank clamp, so canonicalization is now eligible.
                 row_tile: pl.Tile[[1, 32], pl.FP32] = t[row]
                 scaled: pl.Tile[[1, 32], pl.FP32] = pl.tile.col_expand_mul(row_tile, gamma_t)
                 # Keep the source live past the materialization.
@@ -2835,8 +2885,34 @@ class TestTileSliceCodegen:
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            with pytest.raises(RuntimeError, match="dynamic-offset tile.slice"):
-                self._generate_mlir(Prog)
+            if not canonicalize_slices:
+                with pytest.raises(RuntimeError, match="dynamic-offset tile.slice"):
+                    self._generate_mlir(Prog, canonicalize_slices=False)
+                return
+            mlir = self._generate_mlir(Prog)
+
+        extracts = [line for line in mlir.splitlines() if "pto.textract " in line]
+        assert len(extracts) == 1, mlir
+        source = re.search(r"ins\((%[\w.$]+)", extracts[0])
+        destination = re.search(r"outs\((%[\w.$]+)", extracts[0])
+        assert source is not None and destination is not None, extracts[0]
+        source_ssa, destination_ssa = source.group(1), destination.group(1)
+        allocations = {
+            line.strip().split(" = ", 1)[0]: line.split("addr = ", 1)[1].split()[0]
+            for line in mlir.splitlines()
+            if "= pto.alloc_tile " in line
+        }
+        assert allocations[source_ssa] != allocations[destination_ssa], mlir
+        col_expand = next(line for line in mlir.splitlines() if "pto.tcolexpandmul " in line)
+        assert col_expand.split("ins(", 1)[1].startswith(f"{destination_ssa},"), mlir
+        # The later t[0] read keeps the parent live across extraction, making a
+        # private address necessary rather than an incidental planner choice.
+        after_expand = mlir[mlir.index("pto.tcolexpandmul ") :]
+        assert f"pto.subview {source_ssa}[" in after_expand and "pto.tadd " in after_expand, mlir
+        if find_ptoas_binary() is None:
+            pytest.skip("PTOAS is not available")
+        cpp = pto_backend._compile_pto_module(mlir, "kernel", str(tmp_path))
+        assert "TEXTRACT(" in cpp and "TCOLEXPANDMUL(" in cpp, cpp
 
     def test_tile_slice_codegen_rank_reducing(self):
         """A rank-reducing tile subscript `t[i]` (→ tile.slice with drop_dims) reaches

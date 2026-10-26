@@ -53,16 +53,16 @@ program_canon = passes.canonicalize_tile_slice()(program)
 
 For each InCore-typed function, in four steps:
 
-1. **Collect** — index every `AssignStmt` whose value is a `tile.slice(src, shape, offset)` in canonical 3-argument form. A slice whose `src` is itself a recorded slice is peeled, accumulating the offset, so each entry resolves to a non-slice base tile plus a total `(off_row, off_col)`. Direct `ConstInt` SSA definitions and their plain aliases are resolved before this analysis, so a literal offset does not become artificially dynamic after `ConvertToSSA`. Scalar SSA definitions are also retained for modular alignment proofs: for example, `block_idx * 32` is dynamic but has a statically known 32-element multiple. Slices carrying `valid_shape` / `drop_dims` (4–5 arguments) are not plain windows and are skipped.
+1. **Collect** — index every `AssignStmt` whose value is a `tile.slice(src, shape, offset)` in canonical 3-argument form. Also admit 4–5-argument Vec-or-unassigned slices when the source and result are flat 2-D tiles with identical tile configuration, without padding or compact layout, and the requested window shape equals the result's physical shape; a `drop_dims` that changes that shape is excluded. A slice whose `src` is itself a recorded slice is peeled, accumulating the offset, so each entry resolves to a non-slice base tile plus a total `(off_row, off_col)`. Direct `ConstInt` SSA definitions and their plain aliases are resolved before this analysis, so a literal offset does not become artificially dynamic after `ConvertToSSA`. Scalar SSA definitions are also retained for modular alignment proofs: for example, `block_idx * 32` is dynamic but has a statically known 32-element multiple. Explicit-valid Mat/Acc/Left/Right windows remain unpeeled boundaries.
 
 2. **Plan definition-site extracts** (Vec slices only) — a slice is materialized by replacing its own definition with `tile.extract(base, off_row, off_col, slice_shape, target_memory=Vec)` when both hold:
    - some consumer would materialize it under the consumer rules below (a `tile.col_expand_*` operand with a non-identity lazy textract, or an ordinary call operand, alias, loop initializer, or yield whose address is not provably aligned); and
    - nothing in the function may write its storage. Storage sharing is an equivalence class built with union-find over plain aliases, outputs that inherit a source buffer (views and in-place ops, read from the registry), and loop / if merges. A write is a declared writeback operand (`set_output_reuses_input`), a declared scratch or absolute-indexed destination (`set_lane_invariant_arg`), or any operand of an unregistered call.
 
-   Every later reference to the slice then reads the extract, so the consumer rules below no longer match it. Slices are planned in program order: a chained slice of a planned slice is rebased onto the extract (base = the extract, offsets restart from the chained slice's own), since the extract is a fresh, dense buffer — its alignment is recomputed against that buffer, not the original root.
+   Every later reference to the slice then reads the extract, so the consumer rules below no longer match it. If extracting from the parent would widen validity, a `tile.set_validshape` on the fresh copy restores the original window's inferred valid extent. Slices are planned in program order: a chained slice of a planned slice is rebased onto the copy (base = the copy, offsets restart from the chained slice's own), since it is a fresh, dense buffer — its alignment is recomputed against that buffer, not the original root.
 
 3. **Rewrite consumers** — for each remaining slice:
-   - **`tile.extract(slice, ir, ic, shape)`** → `tile.extract(base, ir + off_row, ic + off_col, shape)`. The extract reads the slice's source directly; the index add is constant-folded when both terms are `ConstInt`.
+   - **`tile.extract(slice, ir, ic, shape)`** → `tile.extract(base, ir + off_row, ic + off_col, shape)`. The extract reads the slice's source directly; the index add is constant-folded when both terms are `ConstInt`. An optional `tile.set_validshape` on the private result preserves the original extract's effective validity when peeling would widen it.
    - **`tile.matmul` / `tile.matmul_acc` / `tile.matmul_bias` operand** (Mat slices only) → the operand is replaced by a fresh `tile.extract(base, off_row, off_col, slice_shape, target_memory=Left|Right)` — `Left` for the lhs operand, `Right` for the rhs. (The `tile.matmul_acc` accumulator operand is `Acc`-resident and never a Mat slice, so it is not rewritten here; it is instead checked for L0C contiguity — see [Acc accumulator windows](#acc-accumulator-windows).)
    - **`tile.col_expand_*` operand** (Vec slices only) → when the lazy `pto.textract` would not be an identity copy — a dynamic offset, or a window that is not contiguous in the base tile (more than one row *and* narrower than the base) — the operand is replaced by a fresh `tile.extract(base, off_row, off_col, slice_shape, target_memory=Vec)`. Both operands are checked. Contiguous const-offset windows are left untouched.
    - **Ordinary call operand** (Vec slices only, in either an `AssignStmt` or an `EvalStmt`) → compute `(base_byte_offset * 8 + (off_row * base_cols + off_col) * storage_bits) mod 256`. A known concrete MemRef byte offset is included before the modulo calculation; the allocation-planning sentinel is treated as an aligned root, while a non-constant base offset is not statically provable. Scalar SSA definitions are followed through aliases, addition/subtraction, and multiplication to prove aligned dynamic multiples. If the result is nonzero or cannot be proved, replace the operand by a fresh `tile.extract(base, off_row, off_col, slice_shape, target_memory=Vec)`. `tile.slice` itself is skipped so chained views can be peeled, and `tile.extract` uses the direct folding rule above.
@@ -193,6 +193,23 @@ scaled = pl.tile.muls(column_ext, 0.5)
 ```
 
 This rule applies to registered computations with functional memory-access evidence, a Vec result, and no declared result writeback. Eligibility is checked per operand: a read-only source may be materialized even when the call writes a separate scratch tile, as in `tile.sels`. This layout normalization leaves writable and scratch operands unchanged. Optional reuse of an input allocation does not turn a functional computation into a view. A store-only use keeps its zero-copy subview; metadata views and mutable destinations retain their existing contracts.
+
+### Explicit valid shapes on Vec windows
+
+An explicit `valid_shape` follows the same layout rules. Materialization keeps the physical allocation shape and restores the original value's effective validity on the private copy when needed:
+
+```python
+# Before: eight logical rows in a sixteen-row physical column.
+column = pl.tile.slice(local, [16, 1], [0, 0], valid_shape=[8, 1])
+scaled = pl.tile.muls(column, 0.5)
+
+# After: the parent's validity and physical row stride remain unchanged.
+raw = pl.tile.extract(local, 0, 0, shape=[16, 1], target_memory=pl.Mem.Vec)
+column_ext = pl.tile.set_validshape(raw, 8, 1)
+scaled = pl.tile.muls(column_ext, 0.5)
+```
+
+The refinement preserves the source/window validity already inferred for the original value, including partial and runtime extents and limits inherited through chained slices. It changes metadata on the new allocation; it does not fill invalid elements. Explicit-valid Mat-to-Left/Right transfers retain their existing compact-layout boundary, and the Acc contiguity check still examines every slice form.
 
 ### Where a Vec extract goes
 
@@ -410,11 +427,13 @@ deleted rather than kept.
 | Static-offset **non-contiguous** Vec `tile.slice` (multi-row *and* narrower than its base, e.g. `t[:, a:b]`) feeding a `tile.col_expand_*` op | Replaced by `tile.extract(target_memory=Vec)`; slice dropped (#2010 — the dense repack would run on top of its own live source) |
 | Static-offset **contiguous** Vec `tile.slice` (single row, or full source width) feeding a `tile.col_expand_*` op | Untouched (the lazy textract is a safe identity copy; keeps sharing the source buffer) |
 | Vec `tile.slice` feeding an ordinary call, inherited address not provably 32-byte aligned | Replaced by `tile.extract(target_memory=Vec)`; slice dropped (#1789) |
-| Vec `tile.slice` feeding an ordinary call, inherited address provably 32-byte aligned | Untouched; keeps the zero-copy subview |
+| Vec `tile.slice` feeding an ordinary call, inherited address provably 32-byte aligned and consumer accepts its layout | Untouched; keeps the zero-copy subview |
+| Aligned Vec column feeding a read-only operand of an allocating Vec computation, inherited layout differs from a dense tile | Replaced by a dense private extract (#3132) |
 | Vec `tile.slice` that one of the Vec rows above materializes, storage never written in the function | The **definition** is replaced by the `tile.extract`; every consumer reads it (one copy, in the author's region) |
 | Vec `tile.slice` that one of the Vec rows above materializes, storage possibly written in the function | The extract is inserted before **each consumer**; slice dropped |
 | Chained Mat `tile.slice` (slice of a slice) | Peeled; offsets accumulated |
-| `tile.slice` with `valid_shape` / `drop_dims` | Skipped (not a plain window). If such a slice *also* fails either identity-copy condition above — a dynamic offset (e.g. a rank-reducing `t[i]`) or a non-contiguous window — while feeding a col-expand op, codegen rejects it with an `INTERNAL_CHECK` rather than emitting the source-corrupting materialization. The Acc accumulator check above still applies to such a slice: it needs only the physical base and offset, which are recorded for every window regardless of canonicalization eligibility |
+| Flat Vec-or-unassigned `tile.slice` with `valid_shape` / shape-preserving `drop_dims`, unchanged tile configuration, no padding or compact layout | Uses the Vec rules above; the private copy retains the original effective validity through `tile.set_validshape` when needed |
+| Other `tile.slice` with `valid_shape` / `drop_dims` | Remains an unpeeled boundary. Hazardous lazy col-expand materialization is still rejected by codegen. The Acc accumulator check still applies regardless of canonicalization eligibility |
 | `Acc`-resident `tile.slice` used as a matmul **accumulator**, window neither spanning the parent's full row extent nor inside one 16-column block | **Rejected** with a `ValueError` naming the column-slice spelling — the MAD has no destination stride, so the write would silently land in the wrong row tile (pto-isa#253). The operand does not have to *be* the slice: a loop `IterArg` carrying it, a plain SSA alias, or a shape-preserving view / in-place op over it resolves back to the same window (see "Resolving the accumulator operand back to its window") |
 | Other Left/Right/Acc-resident `tile.slice`, including a *contiguous* Acc accumulator window | Untouched (no matching consumer) |
 | Functions with no canonical `tile.slice` | Returned unchanged |

@@ -53,16 +53,16 @@ program_canon = passes.canonicalize_tile_slice()(program)
 
 对每个 InCore 类型的 function，分四步：
 
-1. **收集 (Collect)** —— 索引每个 value 为规范 3 参数形式 `tile.slice(src, shape, offset)` 的 `AssignStmt`。若某 slice 的 `src` 本身又是一个已记录的 slice，则进行剥离 (peel) 并累加偏移，使每个条目最终解析为一个非 slice 的 base tile 加上总偏移 `(off_row, off_col)`。分析前会解析直接的 `ConstInt` SSA 定义及其普通别名，避免字面量偏移在 `ConvertToSSA` 后被误判为动态值；同时保留标量 SSA 定义用于模对齐证明，例如 `block_idx * 32` 虽是动态值，但可静态确定其为 32 个元素的倍数。带有 `valid_shape` / `drop_dims` 的 slice（4–5 参数）不是普通窗口，跳过。
+1. **收集 (Collect)** —— 索引每个 value 为规范 3 参数形式 `tile.slice(src, shape, offset)` 的 `AssignStmt`。也收集满足以下条件的 4–5 参数 slice：源和结果位于 Vec 或尚未指定内存空间，都是 tile 配置相同的二维 flat tile，且没有 padding 或 compact 布局；请求的窗口形状与结果的物理形状一致，改变该形状的 `drop_dims` 不在此范围内。若某 slice 的 `src` 本身又是一个已记录的 slice，则进行剥离 (peel) 并累加偏移，使每个条目最终解析为一个非 slice 的 base tile 加上总偏移 `(off_row, off_col)`。分析前会解析直接的 `ConstInt` SSA 定义及其普通别名，避免字面量偏移在 `ConvertToSSA` 后被误判为动态值；同时保留标量 SSA 定义用于模对齐证明，例如 `block_idx * 32` 虽是动态值，但可静态确定其为 32 个元素的倍数。带显式有效形状的 Mat/Acc/Left/Right 窗口仍保留为不剥离的边界。
 
 2. **规划定义处 extract (Plan definition-site extracts)**（仅 Vec slice） —— 同时满足以下两点时，slice 通过把其自身定义替换为 `tile.extract(base, off_row, off_col, slice_shape, target_memory=Vec)` 来实例化：
    - 按下面的消费者规则，某个消费者会实例化它（一个惰性 textract 不是恒等拷贝的 `tile.col_expand_*` 操作数，或地址无法证明对齐的普通 call 操作数、别名、循环初始值或 yield）；并且
    - function 中没有任何地方可能写入它的存储。存储共享是用 union-find 在普通别名、继承源缓冲区的输出（视图与原地算子，从 registry 读取）以及循环 / if 合并上构建的等价类。写入指声明的回写操作数（`set_output_reuses_input`）、声明的 scratch 或按绝对索引寻址的目的地（`set_lane_invariant_arg`），或未注册 call 的任意操作数。
 
-   此后对该 slice 的所有引用都读取这个 extract，下面的消费者规则因此不再匹配它。slice 按程序顺序规划：已规划 slice 的链式 slice 会被重定基到该 extract 上（base = extract，偏移从链式 slice 自身的偏移重新开始），因为 extract 是一块新的稠密缓冲区——其对齐按这块缓冲区重新计算，而不是原来的根。
+   此后对该 slice 的所有引用都读取这个 extract，下面的消费者规则因此不再匹配它。若从父 tile 提取会扩大有效范围，则对新拷贝执行 `tile.set_validshape`，恢复原窗口推导出的有效范围。slice 按程序顺序规划：已规划 slice 的链式 slice 会被重定基到该拷贝上（base = 拷贝，偏移从链式 slice 自身的偏移重新开始），因为它是一块新的稠密缓冲区——其对齐按这块缓冲区重新计算，而不是原来的根。
 
 3. **改写消费者 (Rewrite consumers)** —— 对每个剩余的 slice：
-   - **`tile.extract(slice, ir, ic, shape)`** → `tile.extract(base, ir + off_row, ic + off_col, shape)`。extract 直接读取 slice 的源 tile；当两个加数都是 `ConstInt` 时对索引加法做常量折叠。
+   - **`tile.extract(slice, ir, ic, shape)`** → `tile.extract(base, ir + off_row, ic + off_col, shape)`。extract 直接读取 slice 的源 tile；当两个加数都是 `ConstInt` 时对索引加法做常量折叠。若剥离会扩大有效范围，则对独立结果补充 `tile.set_validshape`，保留原 extract 的有效范围。
    - **`tile.matmul` / `tile.matmul_acc` / `tile.matmul_bias` 的操作数**（仅 Mat slice） → 该操作数被替换为一个新的 `tile.extract(base, off_row, off_col, slice_shape, target_memory=Left|Right)`——lhs 操作数用 `Left`，rhs 操作数用 `Right`。（`tile.matmul_acc` 的累加器操作数位于 `Acc`，永远不会是 Mat slice。）
    - **`tile.col_expand_*` 的操作数**（仅 Vec slice） → 当惰性 `pto.textract` 不是恒等拷贝时——即偏移是动态的，或窗口在基 tile 中不连续（行数大于 1 *且* 比基 tile 窄）——该操作数被替换为一个新的 `tile.extract(base, off_row, off_col, slice_shape, target_memory=Vec)`。两个操作数都会检查。常量偏移且窗口连续的 slice 保持原样。
    - **普通 call 的操作数**（仅 Vec slice，位于 `AssignStmt` 或 `EvalStmt` 中） → 计算 `(base_byte_offset * 8 + (off_row * base_cols + off_col) * storage_bits) mod 256`。取模前会计入已知的具体 MemRef 字节偏移；内存规划哨兵值按对齐的根分配处理，而非常量基址偏移无法在静态证明。分析会沿普通别名、加减法及乘法追踪标量 SSA 定义，以证明动态倍数仍满足对齐。若结果非零或无法证明，则把操作数替换为新的 `tile.extract(base, off_row, off_col, slice_shape, target_memory=Vec)`。`tile.slice` 自身会被跳过，以便剥离链式视图；`tile.extract` 使用上面的直接折叠规则。
@@ -193,6 +193,23 @@ scaled = pl.tile.muls(column_ext, 0.5)
 ```
 
 此规则适用于具有 functional 内存访问证据、结果位于 Vec，且未声明结果写回的已注册计算算子。是否物化按操作数分别判断：即使调用像 `tile.sels` 一样写入另一个 scratch tile，只读（read-only）源仍可被物化。这项布局归一化不改变可写操作数或 scratch 操作数。分配器允许复用输入缓冲，并不代表 functional 计算是视图。仅供 store 使用时仍保留零拷贝子视图；元数据视图和可变目标继续遵循原有约束。
+
+### Vec 窗口的显式有效形状
+
+显式指定 `valid_shape` 时也遵循相同的布局规则。物化保留物理分配形状，并在必要时对独立拷贝恢复原值的有效范围：
+
+```python
+# Before: eight logical rows in a sixteen-row physical column.
+column = pl.tile.slice(local, [16, 1], [0, 0], valid_shape=[8, 1])
+scaled = pl.tile.muls(column, 0.5)
+
+# After: the parent's validity and physical row stride remain unchanged.
+raw = pl.tile.extract(local, 0, 0, shape=[16, 1], target_memory=pl.Mem.Vec)
+column_ext = pl.tile.set_validshape(raw, 8, 1)
+scaled = pl.tile.muls(column_ext, 0.5)
+```
+
+这一步保留原值已经推导出的源/窗口有效范围，支持部分有效范围、运行时范围及链式 slice 继承的限制。它只修改新分配的元数据，不填充无效元素。带显式有效形状的 Mat-to-Left/Right 搬运保留既有 compact 布局边界；Acc 连续性检查仍检查所有 slice 形式。
 
 ### Vec extract 的放置位置
 
@@ -383,11 +400,13 @@ stride，应放宽或删除该拒绝，而不是把它保留为长期规则。
 | 喂给 `tile.col_expand_*` 的常量偏移**非连续** Vec `tile.slice`（多行 *且* 比基 tile 窄，如 `t[:, a:b]`） | 替换为 `tile.extract(target_memory=Vec)`；删除 slice（#2010——稠密重排会写在自己仍然存活的源上） |
 | 喂给 `tile.col_expand_*` 的常量偏移**连续** Vec `tile.slice`（单行，或覆盖源的全部列） | 保持原样（惰性 textract 是安全的恒等拷贝；继续共享源缓冲区） |
 | 喂给普通 call、继承地址无法证明按 32 字节对齐的 Vec `tile.slice` | 替换为 `tile.extract(target_memory=Vec)`；删除 slice（#1789） |
-| 喂给普通 call、继承地址可证明按 32 字节对齐的 Vec `tile.slice` | 保持原样；继续使用零拷贝 subview |
+| 喂给普通 call、继承地址可证明按 32 字节对齐且消费者接受其布局的 Vec `tile.slice` | 保持原样；继续使用零拷贝 subview |
+| 喂给需要分配结果的 Vec 计算的只读操作数、继承布局与稠密 tile 不同的对齐 Vec 列视图 | 替换为独立的稠密 extract（#3132） |
 | 被上述某条 Vec 规则实例化、且其存储在 function 中从未被写入的 Vec `tile.slice` | **定义**被替换为 `tile.extract`；所有消费者读取它（一次拷贝，位于作者的区域中） |
 | 被上述某条 Vec 规则实例化、且其存储在 function 中可能被写入的 Vec `tile.slice` | 在**每个消费者**之前插入 extract；删除 slice |
 | 链式 Mat `tile.slice`（slice 的 slice） | 剥离；累加偏移 |
-| 带 `valid_shape` / `drop_dims` 的 `tile.slice` | 跳过（不是普通窗口）。若这样的 slice 同时不满足上述任一恒等拷贝条件——动态偏移（例如降秩的 `t[i]`）或非连续窗口——并喂给 col-expand op，codegen 会以 `INTERNAL_CHECK` 直接报错，而不是生成会破坏源 tile 的代码。上面的 Acc 累加器检查对这类 slice 仍然生效：它只需要物理基址和偏移，而这些信息对每个窗口都会记录，与是否可规范化无关 |
+| 位于 Vec 或尚未指定内存空间、带 `valid_shape` / 物理形状不变的 `drop_dims` 的 flat `tile.slice`，tile 配置不变且无 padding 或 compact 布局 | 遵循上述 Vec 规则；必要时通过 `tile.set_validshape` 在独立拷贝上保留原有效范围 |
+| 其他带 `valid_shape` / `drop_dims` 的 `tile.slice` | 保留为不剥离的边界；危险的惰性 col-expand 物化仍由 codegen 拒绝。Acc 累加器检查仍生效，与是否可规范化无关 |
 | 用作 matmul **累加器**、且窗口既不覆盖父 tile 全部行范围、也不落在单个 16 列 block 内的 `Acc` `tile.slice` | **拒绝**并抛出 `ValueError`，错误信息给出切列的写法——MAD 没有目的地 stride，该写入会静默落到错误的行 tile 上（pto-isa#253）。操作数不必**就是**该 slice：循环 `IterArg` 携带、普通 SSA 别名，或保持形状的视图 / 原地算子都会被解析回同一窗口（见"把累加器操作数解析回它所指的窗口"） |
 | 其他位于 Left/Right/Acc 的 `tile.slice`，含**连续**的 Acc 累加器窗口 | 不处理（无匹配的消费者） |
 | 不含规范 `tile.slice` 的 function | 原样返回 |
