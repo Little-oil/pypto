@@ -176,7 +176,23 @@ head_ext: pl.Tile[[16, 1], pl.FP32, pl.Mem.Vec] = pl.tile.extract(
 scaled:   pl.Tile[[16, 1], pl.FP32, pl.Mem.Vec] = pl.tile.muls(head_ext, 0.5)
 ```
 
-作为边界情况，FP32 的第 8 列距源基址恰好 32 字节，因此仍保持零拷贝。当源行跨度按 32 字节对齐时，动态行偏移也可保持零拷贝。
+FP32 的第 8 列距源基址恰好 32 字节，因此不需要修复地址对齐；消费者也接受继承的布局时，它仍保持零拷贝。当源行跨度按 32 字节对齐时，动态行偏移同样不需要修复地址对齐。
+
+### Vec 算术使用对齐列切片（#3132）
+
+地址对齐不代表继承的布局适合新分配的结果。行主序 `[16, 8]` FP32 矩阵的 `[16, 1]` 列视图保留父 tile 的布局和物理行跨度。store 可以直接读取该子视图，但新分配的行主序 `[16, 1]` tile 的连续轴只有 4 字节，不满足 32 字节的分配粒度。因此，在需要分配结果的 Vec 计算前，本 pass 仍会物化这个已经对齐的操作数：
+
+```python
+# Before: column is aligned, but scaled would inherit an illegal allocation layout.
+column = pl.tile.slice(local, [16, 1], [0, 0])
+scaled = pl.tile.muls(column, 0.5)
+
+# After: extract reads the parent's row stride and produces a dense column-major tile.
+column_ext = pl.tile.extract(local, 0, 0, shape=[16, 1], target_memory=pl.Mem.Vec)
+scaled = pl.tile.muls(column_ext, 0.5)
+```
+
+此规则适用于已注册的计算算子：具有 functional 内存访问证据、结果位于 Vec、操作数为只读（read-only），且没有声明写回或 scratch 目标。分配器允许复用输入缓冲，并不代表 functional 计算是视图。仅供 store 使用时仍保留零拷贝子视图；元数据视图和可变目标继续遵循原有约束。
 
 ### Vec extract 的放置位置
 
@@ -214,6 +230,8 @@ scaled: pl.Tile[[1, 256], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(row, gam
 ```
 
 写入检查针对整个 function，而非两处之间，因此它只会拒绝定义处放置，绝不会接受错误的放置。被拒绝的 slice 回退到上面的消费者处放置，这种放置仍可能跨越区域边界。
+
+窗口分析早于改写，因此当时记录的别名或循环参数随后可能被新的 SSA 变量替换。预先规划的 extract 赋值在输出前会应用当前替换；在消费者处构造 extract 时，也会在当前插入位置解析缓存的基址及两个偏移表达式。共享窗口缓存保留原表达式，不存入仅在某个分支或循环内有效的替换变量。
 
 物化可能改变 tile 的布局：行主序矩阵的 `[16, 1]` 视图继承行主序布局，
 而新分配的密集 Vec extract 采用列主序。因此，该 pass 会把 extract 推导出的

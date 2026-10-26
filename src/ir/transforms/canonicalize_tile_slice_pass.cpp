@@ -789,6 +789,28 @@ bool IsColExpandMaterializingOp(const OpPtr& op) {
          IsOp(op, "tile.col_expand_expdif");
 }
 
+/// A functional Vec computation owns a result buffer even when the allocator
+/// may reuse an input's storage. This is distinct from a real view (NoAccess)
+/// or a declared writeback, whose source window must remain its destination.
+bool IsReadOnlyVecCompute(const CallPtr& call) {
+  if (!call || !call->op_) return false;
+  auto result = As<TileType>(call->GetType());
+  if (!result || (result->memory_space_ && *result->memory_space_ != MemorySpace::Vec)) return false;
+  auto& registry = OpRegistry::GetInstance();
+  if (!registry.IsRegistered(call->op_->name_)) return false;
+  const auto& entry = registry.GetEntry(call->op_->name_);
+  if (entry.GetExecutionMemoryAccessEvidence() != ExecutionMemoryAccessEvidence::Functional ||
+      entry.GetOutputReusesInputArg().has_value()) {
+    return false;
+  }
+  for (size_t i = 0; i < call->args_.size(); ++i) {
+    if (entry.GetArgEffect(i, call->kwargs_) != ArgEffect::Read) return false;
+    auto kind = entry.GetLaneInvariantArgKind(i);
+    if (kind && *kind != LaneInvariantArg::IndexAddressedSource) return false;
+  }
+  return true;
+}
+
 /// Phase 1b — the facts that decide whether a Vec slice can be materialized
 /// where it is *defined* rather than where it is consumed: which consumers
 /// would materialize it, and whether the storage it names can change between
@@ -810,9 +832,10 @@ class SliceStorageAnalysis : public IRVisitor {
  public:
   /// How a Var is consumed, restricted to what CanonicalizeMutator materializes.
   struct Uses {
-    bool col_expand = false;    ///< Operand of a lazily materializing `tile.col_expand_*`.
-    bool vec_operand = false;   ///< Call operand, yield value, loop initializer, or plain-alias source.
-    bool control_flow = false;  ///< Yield value or loop initializer whose layout must agree at a join.
+    bool col_expand = false;     ///< Operand of a lazily materializing `tile.col_expand_*`.
+    bool vec_operand = false;    ///< Call operand, yield value, loop initializer, or plain-alias source.
+    bool control_flow = false;   ///< Yield value or loop initializer whose layout must agree at a join.
+    bool dense_compute = false;  ///< Readonly Vec consumer whose fresh result needs a dense layout.
   };
 
   const Uses* FindUses(const Var* var) const {
@@ -888,12 +911,14 @@ class SliceStorageAnalysis : public IRVisitor {
     // peeled and a tile.extract operand is folded, so neither materializes.
     if (!IsOp(call, "tile.slice") && !IsOp(call, "tile.extract")) {
       const bool col_expand = IsColExpandMaterializingOp(call->op_) && call->args_.size() == 2;
+      const bool dense_compute = IsReadOnlyVecCompute(call);
       for (const auto& arg : call->args_) {
         auto var = AsVarLike(arg);
         if (!var) continue;
         auto& uses = uses_[var.get()];
         uses.vec_operand = true;
         uses.col_expand |= col_expand;
+        uses.dense_compute |= dense_compute;
       }
     }
 
@@ -1011,9 +1036,10 @@ class CanonicalizeMutator : public IRMutator {
       RebaseOnPlannedSource(info, slice_var->span_);
       const auto* uses = storage.FindUses(slice_var.get());
       if (!uses || !IsVecOrUnassigned(info)) continue;
-      const bool materializes = (uses->col_expand && MaterializationCorruptsSource(slice_var, info)) ||
-                                (uses->vec_operand && NeedsAlignedVecMaterialization(info)) ||
-                                (uses->control_flow && NeedsDenseVecControlFlowLayout(slice_var));
+      const bool materializes =
+          (uses->col_expand && MaterializationCorruptsSource(slice_var, info)) ||
+          (uses->vec_operand && NeedsAlignedVecMaterialization(info)) ||
+          ((uses->control_flow || uses->dense_compute) && NeedsDenseVecLayout(slice_var));
       if (!materializes || storage.MayBeWritten(slice_var.get())) continue;
       definition_site_extracts_.emplace(
           slice_var.get(), BuildOperandExtract(slice_var, info, MemorySpace::Vec, slice_var->span_));
@@ -1146,7 +1172,7 @@ class CanonicalizeMutator : public IRMutator {
       auto value = AsVarLike(yield->value_[i]);
       auto it = value ? slices_.find(value.get()) : slices_.end();
       const bool unaligned = it != slices_.end() && NeedsAlignedVecMaterialization(it->second);
-      if (!unaligned && !NeedsDenseVecControlFlowLayout(value)) continue;
+      if (!unaligned && !NeedsDenseVecLayout(value)) continue;
       auto extract = BuildControlFlowExtract(value, yield->span_);
       extracts.push_back(extract);
       new_values[i] = extract->var_;
@@ -1245,7 +1271,12 @@ class CanonicalizeMutator : public IRMutator {
     INTERNAL_CHECK(slice_tile && slice_tile->shape_.size() == 2)
         << "CanonicalizeTileSlice: materialized slice must have a 2-D TileType result";
     auto shape_tuple = std::make_shared<MakeTuple>(slice_tile->shape_, span);
-    std::vector<ExprPtr> args = {info.base, info.off_row, info.off_col, shape_tuple};
+    // Window analysis predates rewriting. A mutable source prevents the
+    // definition-site plan, but earlier consumer-site copies can still retype
+    // its aliases/carries. Resolve cached expressions at this insertion point
+    // without storing branch-local replacements back into the shared window.
+    std::vector<ExprPtr> args = {VisitExpr(info.base), VisitExpr(info.off_row), VisitExpr(info.off_col),
+                                 shape_tuple};
     std::vector<std::pair<std::string, std::any>> kwargs = {{"target_memory", target}};
     auto& reg = OpRegistry::GetInstance();
     auto call = reg.Create("tile.extract", args, kwargs, span);
@@ -1255,12 +1286,13 @@ class CanonicalizeMutator : public IRMutator {
 
   /// Pure column views retain their parent's row-major layout, while copying
   /// the same values into a fresh Vec tile gives the implicit column-major
-  /// layout. A join cannot carry both types. Give flat Vec control-flow edges
-  /// the dense orientation, including edges from functional consumers of a
-  /// slice, so an aligned path agrees with a materialized unaligned path.
+  /// layout. Fresh computation results need this dense orientation as well:
+  /// inheriting a row-major [M, 1] view can violate 32-byte row alignment. Give
+  /// such operands and control-flow edges the dense orientation so consumers
+  /// allocate legal results and every path through a join agrees.
   /// Only blayout may differ: boxed/padded/compact configurations have other
   /// contracts and must not be silently erased by this normalization.
-  static bool NeedsDenseVecControlFlowLayout(const VarPtr& value) {
+  static bool NeedsDenseVecLayout(const VarPtr& value) {
     auto tile = value ? As<TileType>(value->GetType()) : nullptr;
     if (!tile || tile->shape_.size() != 2) return false;
     if (tile->memory_space_ && *tile->memory_space_ != MemorySpace::Vec) return false;
@@ -1514,8 +1546,9 @@ class CanonicalizeMutator : public IRMutator {
     return !address_modulo.has_value() || *address_modulo != 0;
   }
 
-  /// Materialize every unaligned Vec slice operand of an ordinary call through
-  /// a fresh Vec `tile.extract`.  This is deliberately consumer-independent:
+  /// Materialize Vec slice operands that are unaligned or whose readonly
+  /// computation would allocate an invalid inherited layout. This is
+  /// deliberately consumer-independent:
   /// the alignment contract belongs to PTO vector operands, not to one
   /// elementwise opcode. `tile.slice` is only another view and remains peeled;
   /// `tile.extract` has its own direct slice-folding rewrite above.
@@ -1528,11 +1561,15 @@ class CanonicalizeMutator : public IRMutator {
     std::vector<StmtPtr> extracts;
     std::vector<ExprPtr> new_args = call->args_;
     bool rewrote = false;
+    const bool dense_compute = IsReadOnlyVecCompute(call);
     for (size_t i = 0; i < call->args_.size(); ++i) {
       auto operand = AsVarLike(call->args_[i]);
       if (!operand) continue;
       auto it = slices_.find(operand.get());
-      if (it == slices_.end() || !NeedsAlignedVecMaterialization(it->second)) continue;
+      if (it == slices_.end()) continue;
+      if (!NeedsAlignedVecMaterialization(it->second) && !(dense_compute && NeedsDenseVecLayout(operand))) {
+        continue;
+      }
       auto extract = BuildOperandExtract(operand, it->second, MemorySpace::Vec, sp);
       extracts.push_back(extract);
       new_args[i] = extract->var_;
@@ -1570,7 +1607,7 @@ class CanonicalizeMutator : public IRMutator {
       auto init = AsVarLike(VisitExpr(iter_arg->initValue_));
       auto it = init ? slices_.find(init.get()) : slices_.end();
       const bool unaligned = it != slices_.end() && NeedsAlignedVecMaterialization(it->second);
-      if (!unaligned && !NeedsDenseVecControlFlowLayout(init)) continue;
+      if (!unaligned && !NeedsDenseVecLayout(init)) continue;
       auto extract = BuildControlFlowExtract(init, op->span_);
       extracts.push_back(extract);
       var_remap_[init.get()] = extract->var_;

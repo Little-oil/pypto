@@ -2417,6 +2417,54 @@ class TestTileSliceCodegen:
         assert mlir.count("pto.alloc_tile ") == 1, mlir
         assert "TSTORE(" in cpp, cpp
 
+    @pytest.mark.ptoas_compile
+    @pytest.mark.parametrize("use_alias", [False, True], ids=["direct", "plain-alias"])
+    def test_aligned_column_arithmetic_materializes_dense_operand(self, tmp_path, use_alias):
+        """An aligned borrowed column still needs a legal fresh arithmetic result.
+
+        The column's inherited row-major [16, 1] type is valid as a subview,
+        but propagating that type to muls would allocate four-byte rows. Copy
+        from the parent's actual pitch before producing the arithmetic result.
+        """
+
+        @pl.program
+        class ColumnArithmetic:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 8], pl.FP32],
+                dst: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                local = pl.load(src, [0, 0], [16, 8])
+                column = pl.tile.slice(local, [16, 1], [0, 0])
+                scaled = pl.tile.muls(column, 0.5)
+                return pl.store(scaled, [0, 0], dst)
+
+        @pl.program
+        class ColumnAliasArithmetic:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 8], pl.FP32],
+                dst: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                local = pl.load(src, [0, 0], [16, 8])
+                column = pl.tile.slice(local, [16, 1], [0, 0])
+                alias = column
+                scaled = pl.tile.muls(alias, 0.5)
+                return pl.store(scaled, [0, 0], dst)
+
+        mlir = self._generate_mlir(ColumnAliasArithmetic if use_alias else ColumnArithmetic)
+        extracts = [line for line in mlir.splitlines() if "pto.textract " in line]
+        assert len(extracts) == 1, mlir
+        assert "rows=16, cols=8" in extracts[0].split("outs(", 1)[0], mlir
+        assert mlir.count("pto.tmuls ") == 1, mlir
+        assert mlir.index("pto.textract ") < mlir.index("pto.tmuls "), mlir
+        if find_ptoas_binary() is None:
+            pytest.skip("PTOAS is not available")
+        cpp = pto_backend._compile_pto_module(mlir, "kernel", str(tmp_path))
+        assert "TEXTRACT(" in cpp and "TMULS(" in cpp and "TSTORE(" in cpp, cpp
+
     def test_unaligned_vec_column_slice_into_muls_uses_aligned_extract(self):
         """Regression for #1789: an FP32 column subview at offset 1 starts four
         bytes past its source allocation and must not feed ``pto.tmuls``

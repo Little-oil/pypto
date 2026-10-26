@@ -176,7 +176,23 @@ head_ext: pl.Tile[[16, 1], pl.FP32, pl.Mem.Vec] = pl.tile.extract(
 scaled:   pl.Tile[[16, 1], pl.FP32, pl.Mem.Vec] = pl.tile.muls(head_ext, 0.5)
 ```
 
-By contrast, FP32 column 8 is 32 bytes from the source base and remains a zero-copy slice. A dynamic row offset also remains zero-copy when the source row stride is 32-byte aligned.
+FP32 column 8 is 32 bytes from the source base, so its address needs no alignment repair. It remains a zero-copy slice when its consumer also accepts the inherited layout. A dynamic row offset likewise needs no alignment repair when the source row stride is 32-byte aligned.
+
+### Aligned columns used by Vec arithmetic (#3132)
+
+Address alignment does not make every inherited layout suitable for a fresh result. A `[16, 1]` column of a row-major `[16, 8]` FP32 matrix keeps the parent's layout and physical row stride. A store can consume that subview directly, but a new row-major `[16, 1]` allocation would have only four bytes on its contiguous axis, violating the 32-byte allocation granularity. The pass therefore materializes the aligned operand before an allocating Vec computation:
+
+```python
+# Before: column is aligned, but scaled would inherit an illegal allocation layout.
+column = pl.tile.slice(local, [16, 1], [0, 0])
+scaled = pl.tile.muls(column, 0.5)
+
+# After: extract reads the parent's row stride and produces a dense column-major tile.
+column_ext = pl.tile.extract(local, 0, 0, shape=[16, 1], target_memory=pl.Mem.Vec)
+scaled = pl.tile.muls(column_ext, 0.5)
+```
+
+This rule applies to registered computations with functional memory-access evidence, a Vec result, read-only operands, and no declared writeback or scratch destination. Optional reuse of an input allocation does not turn a functional computation into a view. A store-only use keeps its zero-copy subview; metadata views and mutable destinations retain their existing contracts.
 
 ### Where a Vec extract goes
 
@@ -214,6 +230,8 @@ scaled: pl.Tile[[1, 256], pl.FP32, pl.Mem.Vec] = pl.tile.col_expand_mul(row, gam
 ```
 
 The written-storage test is whole-function, not between the two sites, so it can only decline a definition-site placement, never admit a wrong one. A declined slice falls back to the consumer placement above, which can still cross a region boundary.
+
+Window analysis precedes rewriting, so an alias or loop argument recorded there may later be replaced with a new SSA variable. Planned extract assignments are remapped before emission; consumer-site extracts resolve their cached base and both offset expressions at the current insertion point. The shared window cache keeps its original expressions rather than storing replacements that exist only within a branch or loop.
 
 Materialization can change the tile layout: a `[16, 1]` view of a row-major
 matrix inherits that row-major layout, while a fresh dense Vec extract is

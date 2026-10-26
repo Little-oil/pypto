@@ -797,8 +797,13 @@ class TestUnalignedVecSlice:
 
         ir.assert_structural_equal(_run_pass(Before), Expected)
 
-    def test_aligned_fp32_column_slice_into_muls_left_untouched(self):
-        """Column 8 of an FP32 tile starts at the next 32-byte boundary."""
+    def test_aligned_fp32_column_slice_into_muls_materialized(self):
+        """An aligned column still needs a dense layout for a fresh result.
+
+        Column eight begins at a 32-byte boundary, but inherits its parent's
+        row-major layout. Propagating that layout through muls would allocate
+        a [16, 1] result with four-byte rows, which the backend cannot address.
+        """
 
         @pl.program
         class Before:
@@ -816,7 +821,25 @@ class TestUnalignedVecSlice:
                 out = pl.store(scaled, [0, 0], out)
                 return out
 
-        ir.assert_structural_equal(_run_pass(Before), Before)
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                local: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                    x, [0, 0], [16, 16], target_memory=pl.Mem.Vec
+                )
+                head_ext: pl.Tile[[16, 1], pl.FP32, pl.Mem.Vec] = pl.tile.extract(
+                    local, 0, 8, shape=[16, 1], target_memory=pl.Mem.Vec
+                )
+                scaled: pl.Tile[[16, 1], pl.FP32, pl.Mem.Vec] = pl.tile.muls(head_ext, 0.5)
+                out = pl.store(scaled, [0, 0], out)
+                return out
+
+        ir.assert_structural_equal(_run_pass(Before), Expected)
 
     def test_dynamic_row_with_aligned_stride_left_untouched(self):
         """A dynamic row is safe when every source row begins 32-byte aligned."""
@@ -1791,6 +1814,59 @@ class TestPlannedExtractSourceRemapping:
                     stored = pl.store(tail_ext, [0, 0], output)
                     _final_head, result = pl.yield_(carried, stored)
                 return result
+
+        ir.assert_structural_equal(_run_pass(Before), Expected)
+
+
+class TestConsumerSiteExtractSourceRemapping:
+    """Mutable storage keeps extract insertion at consumers, after planning."""
+
+    def test_consumer_extract_uses_retyped_alias_with_written_source(self):
+        """Cached windows must follow an alias retyped by an earlier copy.
+
+        The scatter makes definition-site planning decline this storage. It
+        precedes all views so this test isolates SSA remapping rather than a
+        write between a view's definition and the read that materializes it.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                updates: pl.Tensor[[1, 8], pl.FP32],
+                indices: pl.Tensor[[1, 8], pl.INT32],
+                out: pl.Out[pl.Tensor[[8, 1], pl.FP32]],
+            ) -> pl.Tensor[[8, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                values = pl.tile.load(updates, [0, 0], [1, 8], target_memory=pl.Mem.Vec)
+                offsets = pl.tile.load(indices, [0, 0], [1, 8], target_memory=pl.Mem.Vec)
+                _written = pl.tile.scatter(local, values, offsets)
+                head = pl.tile.slice(local, [16, 1], [0, 1])
+                alias = head
+                tail = pl.tile.slice(alias, [8, 1], [1, 0])
+                stored = pl.store(tail, [0, 0], out)
+                return stored
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                updates: pl.Tensor[[1, 8], pl.FP32],
+                indices: pl.Tensor[[1, 8], pl.INT32],
+                out: pl.Out[pl.Tensor[[8, 1], pl.FP32]],
+            ) -> pl.Tensor[[8, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                values = pl.tile.load(updates, [0, 0], [1, 8], target_memory=pl.Mem.Vec)
+                offsets = pl.tile.load(indices, [0, 0], [1, 8], target_memory=pl.Mem.Vec)
+                _written = pl.tile.scatter(local, values, offsets)
+                alias = pl.tile.extract(local, 0, 1, shape=[16, 1], target_memory=pl.Mem.Vec)
+                tail_ext = pl.tile.extract(alias, 1, 0, shape=[8, 1], target_memory=pl.Mem.Vec)
+                stored = pl.store(tail_ext, [0, 0], out)
+                return stored
 
         ir.assert_structural_equal(_run_pass(Before), Expected)
 
