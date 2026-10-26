@@ -951,7 +951,7 @@ class TileToBufferMutator : public IRMutator {
 
   VarPtr MatchReferenceDescriptor(const ExprPtr& value, const ExprPtr& result,
                                   std::vector<StmtPtr>& aliases) {
-    const auto source = Handle(value);
+    auto source = Handle(value);
     const auto tile = As<TileType>(result->GetType());
     const auto descriptor = ReferenceDescriptor(tile, result->span_);
     const auto original = As<TileType>(value->GetType());
