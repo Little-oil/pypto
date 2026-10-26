@@ -25,11 +25,16 @@ from pypto.backend import BackendType
 from pypto.ir.op import tile
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
+from .buffer_test_utils import TileHandleOrigins
+from .buffer_test_utils import statements as storage_statements
 from .storage_test_utils import without_call_memrefs
 
 # Tile-producing reads from GM. Built through the getter so a renamed operator fails at import
 # rather than silently dropping out of the membership test below.
 _LOAD_LIKE_OPS = frozenset({ir.get_op("tile.load").name, ir.get_op("tile.read").name})
+_LOOP_INPUT_CONFLICT = (
+    "independently live loop input without a same-space copy|independently observed older value version"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -159,6 +164,13 @@ def _collect_op_calls(program: ir.Program, op_name: str) -> list[ir.Call]:
     for function in program.functions.values():
         collector.visit_stmt(function.body)
     return calls
+
+
+def _assert_no_same_space_tile_moves(program: ir.Program) -> None:
+    for call in _collect_op_calls(program, _TILE_MOVE_OP):
+        source_type, result_type = call.args[0].type, call.type
+        assert isinstance(source_type, ir.TileType) and isinstance(result_type, ir.TileType)
+        assert source_type.memory_space != result_type.memory_space
 
 
 def _carry_memref(expr):
@@ -1149,8 +1161,8 @@ def _divergent_acc_phi_program() -> ir.Program:
 
     The accumulator coalescer must decline this shape (``pre`` runs
     unconditionally, so retargeting it onto ``prev`` would clobber the
-    accumulator), leaving a divergent Acc carry that YieldFixup must reject.
-    Shared by the tests that assert each half of that contract.
+    accumulator). The result instead selects the independent source handles.
+    Shared by tests for the missing repair copy and the original seed storage.
     """
 
     @pl.program
@@ -2906,16 +2918,15 @@ class TestYieldFixup:
         assert isinstance(final_store, ir.Call) and final_store.op.name == ir.get_op("tile.store").name
         assert memory[window(final_store.args[0])] == 5
 
-    def test_divergent_acc_phi_rejects_acc_to_acc_move(self):
-        """YieldFixup must not manufacture an unsupported Acc-to-Acc copy.
-
-        The divergent phi cannot be safely coalesced because one seed is
-        produced before the branch. Reject it before codegen rather than emit a
-        type-correct ``tile.move`` that PTOAS cannot lower for distinct L0C
-        buffers.
-        """
-        with pytest.raises(InternalError, match="cannot reconcile divergent L0C accumulator buffers"):
-            _run_pipeline(_divergent_acc_phi_program())
+    def test_divergent_acc_phi_selects_handles_without_acc_to_acc_move(self):
+        """Selecting independently placed Acc handles needs no payload copy."""
+        after = _run_pipeline(_divergent_acc_phi_program())
+        function = after.get_function("main")
+        assert function is not None and isinstance(function.body, ir.SeqStmts)
+        branch = next(stmt for stmt in function.body.stmts if isinstance(stmt, ir.IfStmt))
+        assert isinstance(branch.return_vars[0].type, ir.TileType)
+        assert branch.return_vars[0].type.memref is None
+        _assert_no_same_space_tile_moves(after)
 
 
 class TestNestedCarryLifetimeCarrier:
@@ -4155,8 +4166,29 @@ class SharedSuffix:
 """
 
         before = passes.init_mem_ref()(pl.parse_program(source))
-        with pytest.raises(InternalError, match="cannot reconcile divergent L0C accumulator buffers"):
-            passes.memory_reuse()(passes.materialize_semantic_aliases()(before))
+        after = passes.memory_reuse()(passes.materialize_semantic_aliases()(before))
+        ranges = _collect_named_tile_memrefs(
+            after, {"accumulated", *[f"seed_{i}" for i in range(chain_length)]}
+        )
+        for i in range(chain_length):
+            assert not ir.MemRef.may_alias(ranges["accumulated"], ranges[f"seed_{i}"])
+
+        class ReferenceChecker(ir.IRVisitor):
+            count = 0
+
+            def visit_if_stmt(self, op):
+                assert len(op.return_vars) == 1
+                assert isinstance(op.return_vars[0].type, ir.TileType)
+                assert op.return_vars[0].type.memref is None
+                self.count += 1
+                super().visit_if_stmt(op)
+
+        checker = ReferenceChecker()
+        function = after.get_function("kernel")
+        assert function is not None
+        checker.visit_stmt(function.body)
+        assert checker.count == chain_length
+        _assert_no_same_space_tile_moves(after)
 
     def test_generic_vec_branch_planning_preserves_writeback_and_old_read(self):
         """Generic Vec reuse preserves the original read and required writeback contracts."""
@@ -4234,14 +4266,13 @@ class SharedSuffix:
         into ``prev``. Coalescing would retarget ``pre`` onto ``prev``'s buffer,
         writing it before the ``if`` and clobbering the accumulator that the else
         branch reads. Branch exclusivity does NOT hold for a pre-if producer, so
-        the coalescer must skip this phi (leaving it to YieldFixup) and keep
-        ``pre`` and ``prev`` on distinct buffers.
+        the coalescer must select the source handles and keep ``pre`` and
+        ``prev`` on distinct buffers.
         """
-        # Branch-locality correctly prevents unsafe coalescing. Because Acc->Acc
-        # tile.move is unsupported, YieldFixup must then fail loudly instead of
-        # emitting invalid IR for this unlowerable control-flow shape.
-        with pytest.raises(InternalError, match="cannot reconcile divergent L0C accumulator buffers"):
-            _run_pipeline(_divergent_acc_phi_program())
+        after = _run_pipeline(_divergent_acc_phi_program())
+        memory = _collect_named_tile_memrefs(after, {"pre", "prev", "acc"})
+        assert not ir.MemRef.may_alias(memory["pre"], memory["prev"])
+        assert _same_base_address(memory["acc"], memory["prev"])
 
     def test_pre_if_accumulator_loop_is_not_treated_as_branch_local(self):
         """A loop result defined before an if cannot justify branch-exclusive reuse."""
@@ -4274,12 +4305,28 @@ class SharedSuffix:
                 result = pl.tile.store(merged, [0, 0], out)
                 return bypass_result, result
 
-        # The pre-if loop result remains live after the if. Treating it as a
-        # branch-local accumulator would retarget the sibling seed onto its
-        # buffer and clobber bypass_result on that path. Decline and fail closed
-        # because the remaining divergent Acc phi has no legal repair move.
-        with pytest.raises(InternalError, match="cannot reconcile divergent L0C accumulator buffers"):
-            _run_pipeline(Before)
+        # The bypass keeps the pre-if loop result live. Select its handle or
+        # the independent sibling seed, preserving the bypass on both paths.
+        after = _run_pipeline(Before)
+        function = after.get_function("kernel")
+        assert function is not None and isinstance(function.body, ir.SeqStmts)
+        loop = next(stmt for stmt in function.body.stmts if isinstance(stmt, ir.ForStmt))
+        branch = next(stmt for stmt in function.body.stmts if isinstance(stmt, ir.IfStmt))
+        assert isinstance(branch.return_vars[0].type, ir.TileType)
+        assert branch.return_vars[0].type.memref is None
+        incoming = ir.get_last_yield_stmt(branch.then_body)
+        assert incoming is not None and incoming.value[0].same_as(loop.return_vars[0])
+        bypass = next(
+            stmt
+            for stmt in function.body.stmts
+            if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint == "bypass_result"
+        )
+        assert isinstance(bypass.value, ir.Call)
+        assert bypass.value.args[0].same_as(loop.return_vars[0])
+        seed = _collect_named_tile_memrefs(after, {"seed"})["seed"]
+        carried_memory = _carry_memref(loop.return_vars[0])
+        assert carried_memory is not None and not ir.MemRef.may_alias(seed, carried_memory)
+        _assert_no_same_space_tile_moves(after)
 
     def test_branch_local_accumulator_loop_preserves_external_seed_after_if(self):
         """A branch-local accumulator loop cannot donate an externally live buffer.
@@ -4318,9 +4365,9 @@ class SharedSuffix:
                 return bypass_result, result
 
         # The original Acc value is independently observed after the update.
-        # Entry isolation now rejects the required unsupported Acc copy before
-        # branch coalescing or YieldFixup can attempt its later repair.
-        with pytest.raises(ValueError, match="independently live loop input without a same-space copy"):
+        # Neither an entry copy nor a selected handle can preserve those bytes
+        # across the native accumulator update.
+        with pytest.raises(ValueError, match=_LOOP_INPUT_CONFLICT):
             _run_pipeline(Before)
 
     def test_direct_accumulator_phi_preserves_reused_input_after_if(self):
@@ -4352,7 +4399,7 @@ class SharedSuffix:
                 result = pl.tile.store(merged, [0, 0], out)
                 return bypass_result, result
 
-        with pytest.raises(InternalError, match="cannot reconcile divergent L0C accumulator buffers"):
+        with pytest.raises(ValueError, match="independently observed older value version"):
             _run_pipeline(Before)
 
     def test_direct_accumulator_phi_preserves_stale_bare_alias_after_if(self):
@@ -4418,7 +4465,7 @@ class SharedSuffix:
                 return super().visit_var(op)
 
         drifted = _DriftBareAlias().visit_program(initialized)
-        with pytest.raises(InternalError, match="cannot reconcile divergent L0C accumulator buffers"):
+        with pytest.raises(ValueError, match="independently observed older value version"):
             passes.memory_reuse()(passes.materialize_semantic_aliases()(drifted))
 
     def test_direct_accumulator_phi_tracks_iter_arg_initializer_after_if(self):
@@ -4453,7 +4500,7 @@ class SharedSuffix:
                 return result
 
         # Preserve the old initializer before an update; Acc cannot make the entry copy.
-        with pytest.raises(ValueError, match="independently live loop input without a same-space copy"):
+        with pytest.raises(ValueError, match=_LOOP_INPUT_CONFLICT):
             _run_pipeline(Before)
 
     def test_direct_accumulator_phi_preserves_metadata_alias_after_if(self):
@@ -4486,7 +4533,7 @@ class SharedSuffix:
                 result = pl.tile.store(merged, [0, 0], out)
                 return bypass_result, result
 
-        with pytest.raises(InternalError, match="cannot reconcile divergent L0C accumulator buffers"):
+        with pytest.raises(ValueError, match="independently observed older value version"):
             _run_pipeline(Before)
 
     def test_accumulator_if_phi_same_base_disjoint_windows_are_coalesced(self):
@@ -5379,8 +5426,19 @@ class Before:
         observed = bounds == "2" or (observe_result and bounds != "0")
         if observed:
             assert not ir.MemRef.may_alias(refs["seed"], refs["replacement"]), after.as_python()
+        elif TileHandleOrigins(after).references_allocation(refs["seed"]):
+            # Reference origins currently retain full-function occupancy even
+            # when this particular forwarding result has no payload consumer.
+            assert not ir.MemRef.may_alias(refs["seed"], refs["replacement"]), after.as_python()
         else:
             assert _same_base_address(refs["seed"], refs["replacement"]), after.as_python()
+        for transfer in _collect_op_calls(after, _TILE_MOVE_OP):
+            source_type, target_type = transfer.args[0].type, transfer.type
+            assert isinstance(source_type, ir.TileType) and isinstance(target_type, ir.TileType)
+            assert (
+                source_type.memory_space != ir.MemorySpace.Mat
+                or target_type.memory_space != ir.MemorySpace.Mat
+            )
 
     @pytest.mark.parametrize("effect", ["write", "read", "read_write"])
     def test_operand_effect_controls_old_payload_observation(self, effect):
@@ -5448,9 +5506,16 @@ class Before:
         refs = _collect_named_tile_memrefs(after, {"seed", "replacement"})
         if trips > 1 and read_handle != "carry":
             assert not ir.MemRef.may_alias(refs["seed"], refs["replacement"]), after.as_python()
+        elif TileHandleOrigins(after).references_allocation(refs["seed"]):
+            # A no-copy carry can select the native replacement allocation;
+            # keeping its seed protected is the documented conservative path.
+            assert not ir.MemRef.may_alias(refs["seed"], refs["replacement"]), after.as_python()
         else:
             assert _same_base_address(refs["seed"], refs["replacement"]), after.as_python()
             _assert_carry_yield_lands_in_its_buffer(after)
+        assert not _collect_op_calls(after, _TILE_MOVE_OP), (
+            "Acc carry selection must not insert payload copies"
+        )
 
     @pytest.mark.parametrize("inner_trips", [1, 2])
     def test_nested_identity_loop_follows_isolated_carry(self, inner_trips):
@@ -5719,15 +5784,15 @@ class Before:
         observed = _carry_memref(original_store.value.args[0])
         assert observed is not None and _same_base_address(observed, seed)
 
-    def test_nested_mat_carry_preserves_old_value_read_after_reload(self):
-        """Reaching an inner For must not bypass its existing old-value liveness check."""
+    def test_nested_mat_carry_rejects_reloading_its_previous_iterations_storage(self):
+        """A distinct initial buffer does not preserve a later carried instance."""
 
         @pl.program
         class Before:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                pool: pl.Tensor[[16, 32], pl.FP16],
+                pool: pl.Tensor[[48, 32], pl.FP16],
                 waves: pl.Scalar[pl.INDEX],
                 out: pl.Out[pl.Tensor[[16, 32], pl.FP16]],
             ) -> pl.Tensor[[16, 32], pl.FP16]:
@@ -5735,18 +5800,20 @@ class Before:
                 for (wave,) in pl.while_(init_values=(0,)):
                     pl.cond(wave < waves)
                     for _i, (carry,) in pl.range(2, init_values=(seed,)):
-                        replacement = pl.tile.load(pool, [0, 0], [16, 32], target_memory=pl.Mem.Mat)
+                        replacement = pl.tile.load(
+                            pool, [(_i + 1) * 16, 0], [16, 32], target_memory=pl.Mem.Mat
+                        )
                         _old = pl.tile.extract(carry, 0, 0, [16, 32], target_memory=pl.Mem.Left)
                         result = pl.yield_(replacement)
                     _used = pl.tile.extract(result, 0, 0, [16, 32], target_memory=pl.Mem.Left)
                     _wave_out = pl.yield_(wave + 1)
                 return out
 
-        after = passes.materialize_semantic_aliases()(passes.init_mem_ref()(Before))
-        refs = _collect_named_tile_memrefs(after, {"seed", "replacement"})
-        assert not ir.MemRef.may_alias(refs["seed"], refs["replacement"]), (
-            "the reload would overwrite the old carry before its extract"
-        )
+        # On the second iteration carry names replacement's previous payload.
+        # Reloading its one physical slot before extracting carry destroys that
+        # old payload even if seed and replacement have independent storage.
+        with pytest.raises(ValueError, match="independently observed older value version"):
+            passes.materialize_semantic_aliases()(passes.init_mem_ref()(Before))
 
     def test_simultaneously_live_nested_mat_carries_remain_distinct(self):
         """Two carried results consumed after the inner For need independent storage."""
@@ -5885,13 +5952,20 @@ class Before:
             _used = pl.tile.store(viewed, [0, 0], out)
         return out
 """)
-        after = passes.materialize_semantic_aliases()(passes.init_mem_ref()(before))
-        refs = _collect_named_tile_memrefs(after, {"initial", "fresh"})
         if bounds == "2":
-            assert not ir.MemRef.may_alias(refs["initial"], refs["fresh"]), after.as_python()
-        else:
-            assert _same_base_address(refs["initial"], refs["fresh"]), after.as_python()
-            _assert_if_phi_arms_write_the_phi_buffer(after)
+            # The accumulating arm mutates initial itself; separating fresh
+            # cannot preserve the original initial read on the next iteration.
+            with pytest.raises(ValueError, match="independently observed older value version"):
+                passes.materialize_semantic_aliases()(passes.init_mem_ref()(before))
+            return
+        after = passes.materialize_semantic_aliases()(passes.init_mem_ref()(before))
+        if bounds == "0, 1, -1":
+            assert not _collect_op_calls(after, ir.get_op("tile.matmul_acc").name)
+            assert len(_collect_op_calls(after, ir.get_op("tile.matmul").name)) == 1
+            return
+        refs = _collect_named_tile_memrefs(after, {"initial", "fresh"})
+        assert _same_base_address(refs["initial"], refs["fresh"]), after.as_python()
+        _assert_if_phi_arms_write_the_phi_buffer(after)
 
     @pytest.mark.parametrize("nested_for", [False, True], ids=["direct_phi", "for_carry_phi"])
     @pytest.mark.parametrize("buffer_ir", [False, True], ids=["legacy_storage", "buffer_ir"])
@@ -5991,30 +6065,20 @@ class Before:
                         return replacements[op.unique_id]
 
                 initialized = _DriftAliasDescriptor().visit_program(initialized)
-            if buffer_ir and not recreated:
-                # Acc has no same-space copy to preserve the independently live
-                # old value: either loop-input isolation or phi legalization
-                # must reject the unsupported transfer before it can clobber it.
-                message = (
-                    "cannot preserve an independently live loop input"
-                    if nested_for
-                    else "divergent Acc branch results to be coalesced"
-                )
-                with pytest.raises(ValueError, match=message):
+            if not recreated:
+                # Recreating only a handle does not recreate the payload: the
+                # accumulating arm destroys the external previous value that
+                # the next outer iteration's snapshot must still observe.
+                with pytest.raises(ValueError, match="independently observed older value version"):
                     passes.materialize_semantic_aliases()(initialized)
                 return
             after = passes.materialize_semantic_aliases()(initialized)
 
         refs = _collect_named_tile_memrefs(after, {"previous", "old_value", "fresh", "accumulated"})
         assert _same_base_address(refs["previous"], refs["old_value"])
-        if recreated:
-            for name in ("fresh", "accumulated"):
-                assert _same_base_address(refs["previous"], refs[name]), after.as_python()
-            _assert_if_phi_arms_write_the_phi_buffer(after)
-        else:
-            assert not ir.MemRef.may_alias(refs["previous"], refs["fresh"]), (
-                f"the fresh branch would clobber next iteration's old-value read:\n{after.as_python()}"
-            )
+        for name in ("fresh", "accumulated"):
+            assert _same_base_address(refs["previous"], refs[name]), after.as_python()
+        _assert_if_phi_arms_write_the_phi_buffer(after)
 
     @pytest.mark.parametrize("read_initial", [False, True], ids=["carry_only", "independent_initial_read"])
     def test_while_carry_tracks_initializer_alias_family(self, read_initial):
@@ -6053,16 +6117,17 @@ class Before:
             _final, _wave_out = pl.yield_(merged, wave + 1)
         return out
 """)
+        if read_initial:
+            # The native accumulator update itself writes initial's bytes,
+            # before the independently named old initial is observed here.
+            with pytest.raises(ValueError, match="independently observed older value version"):
+                passes.materialize_semantic_aliases()(passes.init_mem_ref()(before))
+            return
         after = passes.materialize_semantic_aliases()(passes.init_mem_ref()(before))
         refs = _collect_named_tile_memrefs(after, {"initial", "fresh", "accumulated"})
-        if read_initial:
-            assert not ir.MemRef.may_alias(refs["initial"], refs["fresh"]), (
-                f"the fresh branch would overwrite the independently read initializer:\n{after.as_python()}"
-            )
-        else:
-            for name in ("fresh", "accumulated"):
-                assert _same_base_address(refs["initial"], refs[name]), after.as_python()
-            _assert_if_phi_arms_write_the_phi_buffer(after)
+        for name in ("fresh", "accumulated"):
+            assert _same_base_address(refs["initial"], refs[name]), after.as_python()
+        _assert_if_phi_arms_write_the_phi_buffer(after)
 
 
 class TestStructuralShapeEquality:
@@ -9391,35 +9456,41 @@ class TestAliasingOutputPropagation:
 
         with passes.PassContext(pass_verification_instruments, enable_buffer_ir=buffer_ir):
             after = passes.memory_reuse()(passes.materialize_semantic_aliases()(input_program))
-        _assert_if_phi_arms_write_the_phi_buffer(after)
-        memrefs = _collect_named_tile_memrefs(
-            after, {"seed", "first", "viewed", "renamed", "second", "final_view"}
-        )
-
-        class _AliasWindowChecker(ir.IRVisitor):
-            def visit_assign_stmt(self, stmt):  # type: ignore[override]
-                value = stmt.value
-                if isinstance(value, ir.Var):
-                    source = value
-                elif isinstance(value, ir.Call) and value.op.name in {
-                    ir.get_op("tile.gather_row").name,
-                    ir.get_op("tile.reshape").name,
-                }:
-                    source = value.args[0]
-                else:
-                    return super().visit_assign_stmt(stmt)
-                output_memref, source_memref = _carry_memref(stmt.var), _carry_memref(source)
-                assert output_memref is not None and source_memref is not None
-                assert _same_base_address(output_memref, source_memref), stmt.var.name_hint
-                super().visit_assign_stmt(stmt)
-
-        function = after.get_function("kernel")
-        assert function is not None
-        _AliasWindowChecker().visit_stmt(function.body)
-        if not buffer_ir:
-            for name, memref in memrefs.items():
-                assert _same_base_address(memref, memrefs["seed"]), f"{name} left the written L1 buffer"
-        assert "pl.tile.move(" not in after.as_python(), "phi repair emitted an unlowerable Mat->Mat move"
+        origins = TileHandleOrigins(after)
+        original_values = TileHandleOrigins(input_program).values
+        target = _carry_memref(origins.values["seed"])
+        assert target is not None
+        for name in ("seed", "first", "phi", "viewed", "renamed", "second", "result", "final_view"):
+            value = origins.values[name]
+            origins.assert_window(value, target)
+            origins.assert_descriptor(value, original_values[name])
+        required_inputs = {
+            "first": "seed",
+            "viewed": "phi",
+            "renamed": "viewed",
+            "second": "renamed",
+            "final_view": "result",
+        }
+        for statement in storage_statements(after):
+            if isinstance(statement, ir.IfStmt):
+                assert statement.else_body is not None
+                for arm in (statement.then_body, statement.else_body):
+                    yielded = ir.get_last_yield_stmt(arm)
+                    assert yielded is not None
+                    assert len(yielded.value) == len(statement.return_vars)
+                    for value in yielded.value:
+                        origins.assert_window(value, target)
+            elif isinstance(statement, ir.AssignStmt):
+                if isinstance(statement.value, ir.Call):
+                    assert statement.value.op.name != _TILE_MOVE_OP
+                expected_input = required_inputs.get(statement.var.name_hint)
+                if expected_input is None:
+                    continue
+                source = statement.value.args[0] if isinstance(statement.value, ir.Call) else statement.value
+                assert isinstance(source, (ir.Var, ir.IterArg))
+                assert source.unique_id == origins.values[expected_input].unique_id
+                origins.assert_window(source, target)
+                origins.assert_window(statement.var, target)
 
 
 class TestChainedInPlaceIfPhis:

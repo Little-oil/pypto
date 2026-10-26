@@ -21,8 +21,8 @@ After applying MemRef sharing, the pass also **removes redundant `tile.alloc` st
 [`AllocateMemoryAddr`](38-allocate_memory_addr.md). `MemoryPlanner.DSA_RP`
 skips it so independent buffers remain visible to the DSA-RP solver;
 `MemoryPlanner.PTOAS` skips it because ptoas owns lifetime reuse.
-Semantic loop/in-place aliases and materializable if-edge obligations are
-already established by `MaterializeSemanticAliases` in all three modes;
+Semantic loop/in-place aliases, materializable if-edge obligations and typed
+reference selections are already established by `MaterializeSemanticAliases` in all three modes;
 legacy opaque inputs retain the existing handle/codegen path.
 
 ## Planner boundary
@@ -33,6 +33,18 @@ addresses under capacity and reuse penalties in `AllocateMemoryAddr`. Running
 both would erase alternatives before DSA-RP can evaluate them. Correctness
 facts collected for this pass—lifetime interference, semantic no-alias rules,
 and target hazards—remain hard constraints in the DSA-RP problem.
+
+A graph-proven Tile reference without a MemRef owns no allocation. Placement
+consumes its concrete source owners, never a manufactured result request.
+The shared SSA reference graph preserves aliases, views, if edges and loop
+initializers/backedges without expanding every selector into a candidate list.
+As an initial conservative protection, every participating concrete source
+allocation remains live for the complete function in both PYPTO and DSA_RP;
+source bases are excluded from optional PYPTO reuse. This is allocation-group
+occupancy protection, while logical per-value liveness remains separate. The
+selector itself adds no footprint. PTOAS receives typed handle control flow
+and performs its own alias/lifetime analysis. A missing MemRef on an unproven
+producer remains invalid, rather than silently bypassing placement.
 
 ## API
 
@@ -59,16 +71,19 @@ program_optimized = reuse_pass(program)
 
 1. **Lifetime Analysis**: Consume the common control-flow storage established by
    `MaterializeSemanticAliases`; do not select if destinations again. Result `r`
-   is a logical definition at the merge. Each arm reads its own yield operand on
+   is a logical definition at the merge. For a materialized result, each arm reads its own yield operand on
    its incoming edge; a later read of `r` keeps the result live rather than
-   independently extending both sources. Required aliases retain their allocation
+   independently extending both sources. For a reference result, graph-marked
+   concrete sources instead receive the conservative full-function lifetime;
+   no allocation lifetime is created for the selector. Required aliases retain their allocation
    groups and relative windows. Loop carries and values needed again on a
    backedge remain live through the loop boundary.
 
    The temporary requests created by `InitMemRef` have already been resolved
    through the common per-slot `IfInfo` plan. Mandatory loop/Acc constraints,
    producer retargeting and materializable if-edge transfers precede packing for
-   every planner. Legacy opaque sources retain their handle/codegen path. An
+   every planner. A result normalized to reference mode has no MemRef and
+   retains its SSA incoming edges, aliases and carry relations. Legacy opaque sources retain their handle/codegen path. An
    unused result request does not contribute to peak capacity.
 2. **Interference Check**: Summarize each allocation group in both then-first
    and else-first lexical order. Each interval starts at the earliest logical
@@ -105,8 +120,9 @@ program_optimized = reuse_pass(program)
    Subdivision moves a complete root allocation; it never packs into holes outside an alias/view's accessed window. The candidate and arena roots must therefore have constant, non-negative allocation offsets. A symbolic offset is supported only on a direct internal `tile.slice`, whose runtime address PTO reconstructs from the translated source tile and the slice operands. If a memory space contains another dynamic-offset member, such as a reshape, reinterpret, or transpose view of that slice, subdivision is disabled for the complete space so compacting unrelated roots cannot turn a legacy overflow into wrong code. Constant member offsets are still checked to be non-negative and in bounds; supported symbolic slices keep the exact relative expression `arena_offset + placement + (member_offset - root_offset)`. A dynamic root offset remains ineligible, and pinned/declared allocations remain closed. Lifetime interference, pipeline separation, target hazards, and op no-alias rules still call `can_share`; if any such rule prevents byte overlap, the two root address intervals must be disjoint. `AllocateMemoryAddr` sizes the physical slot from the arena root's complete allocation capacity; every constant subrange was already checked to stay within that capacity. A pure dynamic `tile.slice` MemRef then retains the legacy bare-base address because PTO lowers its actual window as `pto.subview` of the already placed source tile using the slice operands. Downstream reshape folding compares base plus offset and tile signature, while PTO DPS aliasing also compares the extent. Sibling root subranges therefore cannot be mistaken for the same tile merely because their base pointers match.
 4. **Relocate complete storage groups**: Apply the packing offsets to producers,
    if results and required aliases while preserving relative windows and pipeline
-   slots. For/While arguments and returns follow their relocated initializer
-   storage, including nested and zero-trip loops. This changes physical placement,
+   slots. Concrete For/While arguments and returns follow their relocated initializer
+   storage, including nested and zero-trip loops. Reference carries continue
+   selecting handles and do not acquire the initializer's MemRef. This changes physical placement,
    not logical result identity or the incoming source relation.
 5. **Close semantic aliases** (`NormalizeIdentityCopyBuffersMutator`): A forward
    walk propagates current storage to downstream uses:

@@ -335,6 +335,10 @@ class PTOCodegen : public CodegenBase {
    */
   std::string GetExprTypeAnnotation(const ir::ExprPtr& expr);
 
+  /// Render an explicit physical buffer descriptor for region values as well
+  /// as ordinary buffer operations; both paths must agree on the exact type.
+  std::string GetBufferTypeString(const ir::BufferTypePtr& type, const ir::Span& span);
+
   /**
    * @brief Get tile_buf type string for the current assignment result target
    *
@@ -481,6 +485,14 @@ class PTOCodegen : public CodegenBase {
       const std::shared_ptr<const ir::TileType>& tile_type, const std::string& name_hint,
       std::optional<std::pair<std::string, std::string>> mutable_valid_shape = std::nullopt,
       bool defer_valid_shape = false);
+
+  /// Scalar values and selected storage references travel through SCF results.
+  /// Concrete Tile allocations keep the existing in-place control-flow path.
+  std::string GetRegionValueTypeString(const ir::TypePtr& type, const ir::Span& span);
+  void BindRegionValue(const ir::VarPtr& var, const std::string& name);
+  /// Normalize a legacy Tile view to the region's exact descriptor without
+  /// copying its bytes or changing the source handle's runtime valid extents.
+  std::string PrepareRegionYield(const ir::ExprPtr& value, const std::string& name, const ir::VarPtr& result);
 
   /**
    * @brief Resolve and allocate every DPS destination of a multi-output call

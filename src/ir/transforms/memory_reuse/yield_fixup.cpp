@@ -153,6 +153,30 @@ class YieldFixupMutator : public StorageBoundaryMutator {
     // reconciling transfers while keeping unresolved if results provisional.
     // An if-only run must leave loop storage to its later legalization stage.
     aligned = NormalizeIdentityCopyBuffersBeforeYieldFixup(aligned);
+    class TileRegions : public IRVisitor {
+     public:
+      std::set<const Stmt*> regions;
+
+      void VisitStmt(const StmtPtr& statement) override {
+        const bool outer = contains_tile_;
+        contains_tile_ = false;
+        IRVisitor::VisitStmt(statement);
+        if (contains_tile_) regions.insert(statement.get());
+        contains_tile_ = contains_tile_ || outer;
+      }
+
+      void VisitExpr(const ExprPtr& expression) override {
+        if (As<TileType>(expression->GetType())) contains_tile_ = true;
+        // Types suffice for variable occurrences. Do not repeatedly expand
+        // shared IterArg initializer/type chains while indexing statements.
+        if (!AsVarLike(expression)) IRVisitor::VisitExpr(expression);
+      }
+
+     private:
+      bool contains_tile_ = false;
+    } tile_regions;
+    tile_regions.VisitStmt(aligned);
+    tile_regions_ = std::move(tile_regions.regions);
     names_.Collect(aligned, parameters);
     const auto rewritten = VisitStmt(aligned);
     return StorageTransferLegalizer(rewritten, parameters).VisitStmt(rewritten);
@@ -164,10 +188,11 @@ class YieldFixupMutator : public StorageBoundaryMutator {
       : canonical_loop_copies_(canonical_loop_copies), scope_(scope) {}
 
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
-    // Only the full boundary pass repairs loops. Normalize statically dead
-    // Tile bodies before visiting nested regions that cannot execute.
-    if (scope_ == Scope::AllControlFlow && !LoopMayExecute(op, false)) {
-      return IRMutator::VisitStmt_(As<ForStmt>(FixupCanonicalLoop(op)));
+    // Dead Tile bodies require no storage repair, including a nested Acc phi
+    // inside a scalar-only loop during the if-only phase. Tensor-only bodies
+    // retain their dedicated boundary representation.
+    if (!LoopMayExecute(op, false) && tile_regions_.count(op.get())) {
+      return IRMutator::VisitStmt_(As<ForStmt>(PruneDeadTileBody(op)));
     }
     // First recurse into nested control flow
     auto result = IRMutator::VisitStmt_(op);
@@ -190,6 +215,10 @@ class YieldFixupMutator : public StorageBoundaryMutator {
 
     std::vector<CarryCopy> copies;
     for (size_t i = 0; i < yield_stmt->value_.size() && i < for_stmt->iter_args_.size(); ++i) {
+      // A reference carry passes its handle on the backedge. Its initializer
+      // owns storage, but is not a fixed destination for later iterations.
+      const auto argument_type = As<TileType>(for_stmt->iter_args_[i]->GetType());
+      if (argument_type && !argument_type->memref_) continue;
       // AsVarLike, not As<Var>: a nested loop both yields and seeds carries with
       // the enclosing loop's IterArg, whose own ObjectKind As<Var> does not match.
       // Skipping those left the nested carry with no writeback at all.
@@ -274,8 +303,8 @@ class YieldFixupMutator : public StorageBoundaryMutator {
   }
 
   StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
-    if (scope_ == Scope::AllControlFlow && !LoopMayExecute(op, false)) {
-      return IRMutator::VisitStmt_(As<WhileStmt>(FixupCanonicalLoop(op)));
+    if (!LoopMayExecute(op, false) && tile_regions_.count(op.get())) {
+      return IRMutator::VisitStmt_(As<WhileStmt>(PruneDeadTileBody(op)));
     }
     auto result = IRMutator::VisitStmt_(op);
     if (scope_ == Scope::IfResults) return result;
@@ -294,6 +323,15 @@ class YieldFixupMutator : public StorageBoundaryMutator {
   std::vector<StmtPtr> TakePendingAllocs() { return std::move(pending_allocs_); }
 
  private:
+  std::set<const Stmt*> tile_regions_;
+
+  template <typename LoopPtr>
+  static StmtPtr PruneDeadTileBody(const LoopPtr& loop) {
+    auto result = MutableCopy(loop);
+    std::vector<ExprPtr> values(loop->iter_args_.begin(), loop->iter_args_.end());
+    result->body_ = std::make_shared<YieldStmt>(std::move(values), loop->span_);
+    return result;
+  }
   bool canonical_loop_copies_ = false;
   Scope scope_ = Scope::AllControlFlow;
   StorageNameSupply names_;
@@ -634,6 +672,8 @@ class YieldFixupMutator : public StorageBoundaryMutator {
   static std::vector<MemRefPtr> CollectCarryRanges(const ForStmtPtr& for_stmt) {
     std::vector<MemRefPtr> ranges(for_stmt->iter_args_.size());
     for (size_t i = 0; i < for_stmt->iter_args_.size(); ++i) {
+      const auto argument_type = As<TileType>(for_stmt->iter_args_[i]->GetType());
+      if (argument_type && !argument_type->memref_) continue;
       // AsVarLike: a nested loop seeds its carries from the enclosing loop's
       // IterArg, which As<Var> would skip -- and skipping it is exactly how two
       // nested carries seeded from one outer carry would slip past the check below.
@@ -946,6 +986,8 @@ class YieldFixupMutator : public StorageBoundaryMutator {
     std::vector<VarPtr> new_return_vars = for_stmt->return_vars_;
 
     for (size_t i = 0; i < for_stmt->iter_args_.size(); ++i) {
+      const auto argument_type = As<TileType>(for_stmt->iter_args_[i]->GetType());
+      if (argument_type && !argument_type->memref_) continue;
       auto init_var = AsVarLike(for_stmt->iter_args_[i]->initValue_);
       if (!init_var) continue;
       auto init_tile = GetTileTypeWithMemRef(init_var->GetType());
@@ -1097,7 +1139,10 @@ class NormalizeIdentityCopyBuffersMutator : public StorageBoundaryMutator {
     if (found != var_remap_.end()) return found->second;
     auto visited = As<IterArg>(StorageBoundaryMutator::VisitExpr_(op));
     INTERNAL_CHECK_SPAN(visited, op->span_) << "Internal error: IterArg visit must yield an IterArg";
-    if (!AsTensorTypeLike(visited->GetType())) return visited;
+    if (!AsTensorTypeLike(visited->GetType())) {
+      var_remap_[op.get()] = visited;
+      return visited;
+    }
     // GM loop carries are mutable references: codegen binds their handles to
     // the initializer, including on zero-trip loops. A renamed initializer may
     // have moved even when this carry's own type has not changed.
@@ -1241,6 +1286,9 @@ class NormalizeIdentityCopyBuffersMutator : public StorageBoundaryMutator {
 class IfPhiReturnVarCollector : public IRVisitor {
  public:
   std::set<const Var*> phis;
+  // Only statement definitions can introduce a join. Expanding each
+  // IterArg's initializer here repeats shared carry chains.
+  void VisitExpr(const ExprPtr&) override {}
 
   void VisitStmt_(const IfStmtPtr& op) override {
     for (const auto& rv : op->return_vars_) phis.insert(rv.get());

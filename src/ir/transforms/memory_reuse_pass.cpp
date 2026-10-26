@@ -38,6 +38,7 @@
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/reserve_buffer_utils.h"
+#include "pypto/ir/transforms/utils/storage_reference_analysis.h"
 #include "src/ir/transforms/memory_reuse/internal.h"
 
 namespace pypto {
@@ -69,7 +70,7 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   // for all planners. Placement changes allocation locations, not result classes.
 
   // Step 1: Compute lifetimes by walking full IR tree
-  auto analysis_result = AnalyzeAllocationLifetimes(new_body);
+  auto analysis_result = AnalyzeAllocationLifetimes(func);
 
   if (analysis_result.lifetimes.empty()) {
     LOG_DEBUG << "No TileType variables found in function '" << func->name_ << "', skipping memory reuse";
@@ -108,6 +109,12 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   // the packer isolation and the co-liveness check below, handing the author back
   // exactly the coalescing the binding was written to prevent.
   auto pinned_bases = constraint_analysis.declared_allocation_bases;
+  // Runtime-selected handles retain the identity of each concrete origin.
+  // Their conservative lifetimes protect address placement; excluding their
+  // bases here also prevents optional copy coalescing and subrange packing
+  // from introducing an occupant whose bytes would invalidate that handle.
+  const auto references = AnalyzeStorageReferences(new_body, func->params_);
+  pinned_bases.insert(references.source_bases.begin(), references.source_bases.end());
   // Tile parameters borrow caller-owned storage. Body-local aliases and if
   // results must not let the packer move that storage or add new occupants.
   // Keep declaration validation separate: parameters are fixed by the ABI,

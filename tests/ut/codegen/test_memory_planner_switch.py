@@ -1463,7 +1463,7 @@ def test_ptoas_conditional_inplace_vec_updates_reuse_mixed_view_handle():
     assert not any("pto.tmov" in line and line.count("loc=vec") == 2 for line in lines), mlir
 
 
-def test_ptoas_distinct_mat_phi_rejects_copying_an_independently_live_input():
+def test_ptoas_distinct_mat_phi_selects_an_independently_live_input():
     """A differently typed view must not let an else load overwrite a live then input."""
 
     @pl.program
@@ -1494,11 +1494,12 @@ def test_ptoas_distinct_mat_phi_rejects_copying_an_independently_live_input():
 
     # The base is still read after the merge, independently of the selected value.
     # Redirecting the else producer into it would corrupt the first output block.
-    # The old codegen fallback emitted a Mat-to-Mat TMOV, which the hardware
-    # cannot execute. Reject that transfer instead of accepting invalid MLIR or
-    # silently overwriting the independently live input.
-    with pytest.raises(ValueError, match="unsupported tile.move memory-space pair"):
-        _run_pipeline(passes.MemoryPlanner.PTOAS, ConditionalMatLoad, enable_buffer_ir=False)
+    # Select a handle instead of copying payload into a fixed phi allocation.
+    # Both the selected value and the old base remain readable after the merge.
+    optimized, _ = _run_pipeline(passes.MemoryPlanner.PTOAS, ConditionalMatLoad, enable_buffer_ir=False)
+    mlir = _codegen(optimized, emit_tile_addr=False)
+    assert any(" = scf.if " in line and "!pto.tile_buf<" in line for line in mlir.splitlines()), mlir
+    assert not any("pto.tmov" in line and line.count("loc=mat") == 2 for line in mlir.splitlines()), mlir
 
 
 @pytest.mark.parametrize("identity_merge", [False, True])
@@ -1963,6 +1964,52 @@ def _if_window_fixture(memory_space, difference):
     return before, a, b, phi_type, view_type
 
 
+def _assert_reference_if_window_edges(after, a, b, phi_type, view_type):
+    phis, tiles = _collect_tile_phi_storage(after)
+    assert len(phis) == 1
+    result = phis[0][0]
+    result_type = result.type
+    assert isinstance(result_type, ir.TileType) and result_type.memref is None
+    assert result_type.memory_space == phi_type.memory_space
+    assert result_type.get_effective_tile_view() == phi_type.get_effective_tile_view()
+    function = next(iter(after.functions.values()))
+    assert isinstance(function.body, ir.SeqStmts)
+    branch = next(stmt for stmt in function.body.stmts if isinstance(stmt, ir.IfStmt))
+    actual_inputs = {value.name_hint: value for value in function.params}
+    for source, body in zip((a, b), (branch.then_body, branch.else_body), strict=True):
+        assert body is not None
+        edge = ir.get_last_yield_stmt(body)
+        assert edge is not None and len(edge.value) == 1
+        actual = actual_inputs[source.name_hint]
+        assert edge.value[0].same_as(actual)
+        assert isinstance(actual.type, ir.TileType) and isinstance(source.type, ir.TileType)
+        if source.type.memref is None:
+            assert actual.type.memref is None
+        else:
+            assert actual.type.memref is not None
+            _assert_same_tile_window(actual.type.memref, source.type.memref)
+        statements = body.stmts if isinstance(body, ir.SeqStmts) else [body]
+        assert all(isinstance(stmt, ir.YieldStmt) for stmt in statements)
+    definitions = {
+        stmt.var.name_hint: stmt for stmt in function.body.stmts if isinstance(stmt, ir.AssignStmt)
+    }
+    reshape = definitions["reshaped"].value
+    assert isinstance(reshape, ir.Call) and reshape.args[0].same_as(result)
+    assert definitions["alias"].value.same_as(tiles["reshaped"])
+    for name in ("reshaped", "alias"):
+        descriptor = tiles[name].type
+        assert isinstance(descriptor, ir.TileType) and descriptor.memref is None
+        assert descriptor.memory_space == phi_type.memory_space and descriptor.dtype == phi_type.dtype
+        assert len(descriptor.shape) == len(view_type.shape)
+        assert all(
+            ir.structural_equal(actual, expected)
+            for actual, expected in zip(descriptor.shape, view_type.shape, strict=True)
+        )
+        assert descriptor.tile_view == view_type.tile_view
+    returned = function.body.stmts[-1]
+    assert isinstance(returned, ir.ReturnStmt) and returned.value[0].same_as(tiles["alias"])
+
+
 def _assert_if_window_edges(after, a, b, phi_type, view_type, difference):
     assert isinstance(a.type, ir.TileType)
     a_memref = a.type.memref
@@ -1974,7 +2021,9 @@ def _assert_if_window_edges(after, a, b, phi_type, view_type, difference):
     new_phi_type = new_phi.type
     assert isinstance(new_phi_type, ir.TileType)
     result_window = new_phi_type.memref
-    assert result_window is not None
+    if result_window is None:
+        _assert_reference_if_window_edges(after, a, b, phi_type, view_type)
+        return
     assert new_phi_type.memory_space == phi_space
     assert new_phi_type.tile_view == phi_type.tile_view
     if difference == "same_window":
@@ -2087,7 +2136,20 @@ def test_ptoas_if_alias_fixup_only_coalesces_same_tile_window(memory_space, diff
             # This pass checks the target-independent ISA union. Vec -> Mat
             # is A5-only; this fixture does not claim Ascend910 codegen support.
             supported_copy = memory_space in {ir.MemorySpace.Vec, ir.MemorySpace.Acc}
-        if difference != "same_window" and not opaque_result and not supported_copy:
+        reference_selection = memory_space != ir.MemorySpace.Vec and difference in {
+            "offset",
+            "size",
+            "slot",
+            "slot_count",
+            "allocation",
+            "missing_storage",
+        }
+        if (
+            difference != "same_window"
+            and not opaque_result
+            and not supported_copy
+            and not reference_selection
+        ):
             if phi_space == ir.MemorySpace.Acc:
                 error, message = InternalError, "cannot reconcile divergent L0C accumulator buffers"
             elif phi_space in {ir.MemorySpace.LeftScale, ir.MemorySpace.RightScale}:
@@ -2106,6 +2168,10 @@ def test_ptoas_if_alias_fixup_only_coalesces_same_tile_window(memory_space, diff
         return
 
     _assert_if_window_edges(after, a, b, phi_type, view_type, difference)
+    if reference_selection:
+        properties = passes.IRPropertySet()
+        properties.insert(passes.IRProperty.TileStorageLegalized)
+        assert passes.PropertyVerifierRegistry.verify(properties, after) == []
 
 
 @pytest.mark.parametrize("enable_buffer_ir", [False, True])

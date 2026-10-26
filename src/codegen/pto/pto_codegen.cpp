@@ -502,13 +502,25 @@ bool ShouldAliasResultToInPlaceInput(const AssignStmtPtr& stmt) {
   auto call = As<ir::Call>(stmt->value_);
   if (!call || !call->op_) return false;
 
-  auto result_tile_type = ir::GetTileTypeWithMemRef(stmt->var_->GetType());
+  auto result_tile_type = As<TileType>(stmt->var_->GetType());
   if (!result_tile_type) return false;
 
   auto input_tile_type_at = [&](size_t index) -> std::shared_ptr<const TileType> {
     if (index >= call->args_.size()) return nullptr;
-    return ir::GetTileTypeWithMemRef(call->args_[index]->GetType());
+    return As<TileType>(call->args_[index]->GetType());
   };
+
+  if (!result_tile_type->memref_.has_value()) {
+    // Semantic legalization preserves a selected reference on registered
+    // writeback results. It has no single allocation identity to compare;
+    // following the explicit target operand keeps the runtime-selected handle.
+    const auto target = ir::op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size());
+    const auto input = target ? input_tile_type_at(*target)
+                              : (IsInPlaceInput0DpsOp(call->op_) ? input_tile_type_at(0) : nullptr);
+    return input && !input->memref_.has_value() &&
+           ir::TileBufSignature::FromTileType(*result_tile_type) ==
+               ir::TileBufSignature::FromTileType(*input);
+  }
 
   // Legacy arm: shared base memref only, exactly as before.
   if (IsInPlaceInput0DpsOp(call->op_)) {
@@ -1652,7 +1664,9 @@ PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
     }
   }
 
-  auto memref = ir::GetDefinedMemRef(tile_type);
+  // Region references need descriptor/valid operands without owning storage.
+  // Address computation applies only to allocation-backed Tile types.
+  auto memref = tile_type->memref_.value_or(nullptr);
   if (memref && emit_tile_addr_) {
     if (auto const_offset = As<ir::ConstInt>(memref->byte_offset_)) {
       fields.addr_ssa = GetOrEmitConstant(const_offset->value_, const_offset->dtype());
@@ -2442,10 +2456,17 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
         // there is no MemRef to read. Register it before the op codegen runs so
         // GetCurrentResultTileBufTypeString() can emit the `-> type` annotation.
         result_tile_type = tile_type;
-        result_buf = NewNamedTemp(op->var_->name_hint_);
+        if (alias_result_to_in_place_input) {
+          const auto target = ir::op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size());
+          result_buf = GetExprAsCode(call->args_[target.value_or(0)]);
+        } else {
+          result_buf = NewNamedTemp(op->var_->name_hint_);
+        }
         BindVarToMlir(op->var_, result_buf);
         std::string type_str = GetTileBufTypeStringFromTileType(tile_type);
-        if (!type_str.empty()) {
+        if (!type_str.empty() && !alias_result_to_in_place_input) {
+          // A selected writeback keeps the input SSA's exact descriptor. In
+          // particular, a static-valid view must not be retyped as dynamic.
           RegisterTileBufType(result_buf, type_str, tile_type);
         }
       } else if (alias_array_update_to_input) {
@@ -2537,9 +2558,13 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
         RegisterCommCtxFor(op->var_, comm_ctx);
         return;
       }
-    } else if (!emit_tile_addr_ && As<TileType>(op->var_->GetType())) {
-      // Bare tile SSA alias (`lhs = rhs`) under memory_planner=PTOAS. `lhs` and
-      // `rhs` denote the identical tile value, so `lhs` must resolve to `rhs`'s
+    } else if (auto tile = As<TileType>(op->var_->GetType());
+               As<ir::BufferType>(op->var_->GetType()) ||
+               (tile && (!emit_tile_addr_ || !tile->memref_.has_value()))) {
+      // Bare tile aliases under PTOAS, and selected references under every
+      // planner, and explicit Buffer references resolve to the current SSA.
+      // `lhs` and `rhs`
+      // denote the identical tile value, so `lhs` must resolve to `rhs`'s
       // CURRENT SSA binding. This matters when `rhs` is a view (tile.reshape /
       // tile.transpose_view) that re-pointed itself at a typed view SSA of a
       // shared buffer — e.g. the `[N, 1]` col-major reshape of a `[1, N]`
@@ -2550,8 +2575,8 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
       // ptoas rejects for shape mismatch. Following `rhs` binds `lhs` to the
       // `[N, 1]` view SSA so the write-back has matching src/dst shapes — the
       // same shape the `s = pl.mul(...)`-style yield (no bare alias) already
-      // gets. Under PyPTO (emit_tile_addr_) the baked address already aliases
-      // the two allocs, so this is a no-op there and is left untouched.
+      // gets. Concrete addressed Tile aliases keep their established path;
+      // selected references have no allocation or baked address to fall back to.
       const std::string rhs_ssa = LookupVarName(rhs_var);
       if (!rhs_ssa.empty()) {
         BindVarToMlir(op->var_, rhs_ssa);
@@ -2972,6 +2997,9 @@ std::string PTOCodegen::GetViewTileBufTypeStringFromTileType(
 }
 
 std::string PTOCodegen::GetExprTypeAnnotation(const ir::ExprPtr& expr) {
+  if (auto buffer = As<ir::BufferType>(expr->GetType())) {
+    return GetBufferTypeString(buffer, expr->span_);
+  }
   if (auto var = As<ir::Var>(expr)) {
     auto key = GetVarKey(var);
     // Primary lookup: SSA name → tile_buf type (covers root allocs AND view results)
@@ -2986,9 +3014,7 @@ std::string PTOCodegen::GetExprTypeAnnotation(const ir::ExprPtr& expr) {
     // TileType, which is correct for view op results (slice, reshape,
     // fillpad) whose type differs from the root alloc's type.
     if (auto tile_type = As<TileType>(var->GetType())) {
-      if (tile_type->memref_.has_value()) {
-        return GetTileBufTypeStringFromTileType(tile_type);
-      }
+      return GetTileBufTypeStringFromTileType(tile_type);
     }
     // Fallback: var → memref → root alloc type
     auto memref_it = fs_.var_to_memref.find(key);
@@ -3008,7 +3034,7 @@ std::string PTOCodegen::GetExprTypeAnnotation(const ir::ExprPtr& expr) {
         return ssa_it->second;
       }
     }
-    if (auto tile_type = ir::GetTileTypeWithMemRef(iter_arg->GetType())) {
+    if (auto tile_type = As<TileType>(iter_arg->GetType())) {
       return GetTileBufTypeStringFromTileType(tile_type);
     }
     auto memref_it = fs_.var_to_memref.find(key);

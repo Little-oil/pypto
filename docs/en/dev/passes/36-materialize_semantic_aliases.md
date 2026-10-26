@@ -1,14 +1,17 @@
 # MaterializeSemanticAliases Pass
 
-Establishes semantic storage relations and one destination plan for every tile-valued
+Establishes semantic storage relations and one representation plan for every tile-valued
 `IfStmt` result before any memory planner runs.
 
 ## Overview
 
-Loop carries and registered in-place results require shared storage. An if result
+Concrete loop carries and registered in-place results require shared storage. A
+reference carry instead passes a selected handle between iterations. An if result
 instead selects one of two incoming SSA values; that selection does not make the
 two sources mandatory aliases. This pass resolves those relations and materializes
-the required edge transfers. Opportunistic lifetime reuse remains the planner's job.
+the materializable edge transfers. When a fixed destination cannot safely realize
+the selection, compatible results retain reference control flow without payload
+copies. Opportunistic lifetime reuse remains the planner's job.
 
 Run after [`InitMemRef`](35-init_memref.md). All three planners consume the same
 normalized control-flow storage:
@@ -34,7 +37,21 @@ program = passes.materialize_semantic_aliases()(program)
 
 ## Algorithm
 
-1. **Collect mandatory storage constraints.** For/While carries use their
+Before concrete destination planning, normalize SSA storage references. Eligible
+branch-local producers keep the destination path below. Incoming external values,
+or local windows that cannot safely be redirected, may instead retain reference
+results in spaces such as Mat and Acc that lack same-space copies. Vec and other
+spaces with supported same-space copies retain their existing concrete-copy and
+coalescing path. Explicit raw reference SSA remains graph-validated independently
+of that optimization policy. Normalization removes their provisional MemRefs and follows required
+aliases, views and loop boundaries; final unused-allocation cleanup removes the
+abandoned requests. Explicit fixed result bindings remain concrete obligations.
+Native accumulator continuations produced inside an incoming arm retain the
+existing canonical coalescing proof. A registered `matmul_acc` update is a new
+value version of its carry, rather than an arbitrary old-value selection; generic
+reference-version bounds must not replace its branch-aware continuation proof.
+
+1. **Collect mandatory storage constraints.** Concrete For/While carries use their
    initializer's storage, including on zero-trip loops. Preserve registered
    writeback contracts and collect compatible accumulator continuation targets
    before selecting if destinations. Guarded coalescing can redirect a local
@@ -122,8 +139,10 @@ program = passes.materialize_semantic_aliases()(program)
    constrained bytes are rejected. Loop carries retain independent target slots.
    A required result target can be filled by an edge copy after the branch's old
    reads finish, provided no old target observation remains after the merge.
-   Otherwise keep the result independent until the enclosing boundary. Memory
-   spaces without a legal same-space transfer still require direct producer retargeting.
+   Otherwise keep the result independent until the enclosing boundary. A
+   concrete target in a space without legal same-space transfers requires direct
+   producer retargeting. A compatible unconstrained result may instead select
+   the incoming references, with no target allocation or edge transfer.
 6. **Finish if planning before lifetime packing.** Close aliases, validate the
    materializable incoming edges and remove unused requests and allocations.
    Discard the planning snapshot.
@@ -134,8 +153,9 @@ program = passes.materialize_semantic_aliases()(program)
 
 An independent request does not imply an extra physical buffer: common windows
 can be retained, producers can write the chosen destination directly, and unused
-requests disappear before capacity calculation. A separate destination is required
-when independently live values or hardware constraints prevent sharing.
+requests disappear before capacity calculation. If independently live values or
+hardware constraints prevent materialization, reference selection can retain
+their existing allocations without adding a destination.
 
 Destination selection uses three fixed walks over the result slots. The snapshot
 and indexed control-flow analyses use map/index lookups, with O(N log N) work
@@ -149,6 +169,68 @@ whole-allocation handle covers them both. Already relocated values use a
 monotone byte/slot observation index, with fixed-width sparse range trees,
 so incremental planning does not collapse independent windows or scan earlier
 results. No persistent planning table is attached to the public IR.
+
+## Reference results and creation location
+
+For spaces without same-space copies, creation location follows the storage producer, not a variable name. A rename,
+reshape or other required alias created inside an arm still refers to external
+storage when its source was created outside that arm.
+
+| Then / else storage producer | Concrete fast path | Reference path |
+| ---------------------------- | ------------------ | -------------- |
+| Internal / internal | Both eligible producer families write one destination | Select their handles if either family cannot move safely |
+| Internal / external | Retarget the local producer into the external window only when old observations are protected | Select the local and external handles |
+| External / internal | Symmetric borrowing proof | Select the external and local handles |
+| External / external | Retain an already identical complete window | Select distinct existing handles |
+
+```text
+a = load(A) : Tile[..., Mat, MemRef(a_storage)]
+b = load(B) : Tile[..., Mat, MemRef(b_storage)]
+r = if condition: yield a; else: yield b  # Tile[..., Mat], no MemRef
+read(a)
+read(b)
+read(r)
+```
+
+The result owns no allocation and performs no Mat-to-Mat transfer. Legacy PTO
+codegen emits a typed `scf.if` result; final Buffer conversion retains a
+`BufferType` region result. Reference For/While carries likewise pass the handle,
+including entry and backedges, and return the initializer on zero trips. Scalar
+and reference yields remain simultaneous.
+
+When loop-entry isolation would otherwise need an unsupported same-space copy,
+the pass can seed reference normalization on the original concrete carry graph.
+This is a bounded representation choice, rather than an attempted copy followed
+by a retry. Zero-trip entry and later backedges select their existing handles;
+native writes still undergo the shared old-value observation proof.
+
+Each consumer rebuilds the allocation/alias/view/selection/carry graph from SSA
+definitions. Graph traversal marks references and their concrete source bases;
+it does not flatten an ever-growing candidate set at every nested selection.
+The initial protection conservatively keeps every participating concrete source
+live for the complete function under PYPTO and DSA_RP. Only actual owners are
+placed, so a selector contributes no phantom allocation or capacity. PTOAS
+receives the explicit reference control flow and derives its handle aliases.
+
+Caller-provided intermediate Tile parameters without a MemRef and registered
+TPop results can supply existing storage when reached by a proven reference graph.
+Before final PTO emission, the full pipeline must inline such Tile parameters or
+bind them to supported storage. Standalone `tile_buf` function-parameter ABI
+support is outside this change. Native if/for/while validation uses concrete
+allocations defined in the function body.
+
+Selecting a reference does not authorize destroying an independently observed
+old value. Registered writes still require the shared ownership/old-observation
+proof; a remaining requirement to preserve and partially modify a Mat value can
+need an unavailable copy and is diagnosed at that write obligation. Fixed result
+destinations cannot be silently replaced with arbitrary references. Descriptor
+and view support remains subject to the conversion and target contracts.
+
+After destination planning, the value-version guard also checks concrete Acc
+if-result components before edge fixup. Carries connected to those results are
+covered by the same component. Standalone concrete loops retain their precise
+byte/slot and updated-row overwrite proofs. All actual storage references,
+including reference loop carries, retain the reference write guard.
 
 ## Loop payload observations
 
@@ -230,11 +312,12 @@ whole-kernel selection and Buffer-specific storage legalization; unsupported
 kernels remain on Tile IR. The option is preserved by compilation, IR dumping,
 profiling and JIT cache keys.
 
-Every planner receives the common plan and materialized if-edge obligations for
-known storage. Legacy opaque tile sources without MemRefs retain their recorded
+Every planner receives concrete materialized if-edge obligations together with
+graph-proven references that select existing storage. These known references
+require no payload transfer or additional allocation. Legacy opaque tile sources without MemRefs retain their recorded
 incoming SSA edges but defer lowering to the existing handle/codegen path; no
 source coordinates or copies are invented. A selected Buffer function instead
-rejects an input that cannot be materialized. `MemoryReuse` does not repeat
+rejects an unknown input that is neither materialized nor a proven reference. `MemoryReuse` does not repeat
 resolved result selection, and codegen does not choose an alternative allocation
 for those resolved results. Same-descriptor whole-root copies may disappear
 after legal placement makes their windows identical; a retained copy must still

@@ -38,6 +38,7 @@
 #include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/storage_reference_analysis.h"
 #include "pypto/ir/type.h"
 #include "src/ir/transforms/memory_reuse/storage.h"
 
@@ -78,6 +79,8 @@ class LifetimeAnalyzer : public IRVisitor {
     std::map<VarPtr, int> var_last_use;
     std::map<VarPtr, StmtPtr> var_def_stmt;
     std::map<VarPtr, std::pair<int, int>> var_reverse_liveness;
+    int function_end;
+    int reverse_function_end;
   };
 
   Result Analyze(const StmtPtr& func_body, const std::vector<VarPtr>& entry_vars = {}) {
@@ -90,8 +93,14 @@ class LifetimeAnalyzer : public IRVisitor {
     }
     if (func_body) VisitStmt(func_body);
     auto last_use = ComputeEffectiveLastUse();
-    return {std::move(ordered_defs_), std::move(var_def_order_), std::move(last_use),
-            std::move(var_def_stmt_), std::move(var_reverse_liveness_)};
+    const int reverse_end = func_body ? static_cast<int>(reverse_end_order_.at(func_body.get()) + 1) : 0;
+    return {std::move(ordered_defs_),
+            std::move(var_def_order_),
+            std::move(last_use),
+            std::move(var_def_stmt_),
+            std::move(var_reverse_liveness_),
+            current_order_,
+            reverse_end};
   }
 
  protected:
@@ -272,6 +281,7 @@ LifetimeAnalysisResult AnalyzeAllocationLifetimesImpl(const StmtPtr& func_body,
   // Step 1: Walk full IR tree to collect variable defs, uses, and ordering
   LifetimeAnalyzer analyzer;
   auto result = analyzer.Analyze(func_body, entry_vars);
+  const auto references = AnalyzeStorageReferences(func_body, entry_vars);
 
   if (result.ordered_defs.empty()) {
     return {lifetimes, {}};
@@ -357,6 +367,19 @@ LifetimeAnalysisResult AnalyzeAllocationLifetimesImpl(const StmtPtr& func_body,
         << "TileType with MemRef must have memory_space for reuse analysis";
     interval.memory_space = *memory_space;
     interval.size = GetDefinedMemRef(representative_tile_type)->size_;
+    // A selector owns no allocation. Every concrete origin reachable through
+    // its reference graph remains exclusive for the complete function in both
+    // branch orders. This first implementation intentionally spends memory
+    // instead of expanding an origin set at each selector. Extend allocation
+    // occupancy only: per-value liveness below still describes the original
+    // SSA versions, so sequential author bindings and old-value observations
+    // do not acquire artificial conflicts merely by supplying a reference.
+    if (references.source_bases.count(GetDefinedMemRef(representative_tile_type)->base_.get())) {
+      interval.def_point = 0;
+      interval.last_use_point = result.function_end;
+      interval.reverse_def_point = 0;
+      interval.reverse_last_use_point = result.reverse_function_end;
+    }
 
     // A direct dynamic tile.slice is lowered through pto.subview, which rebuilds
     // its runtime address from the source tile and slice operands. Every other

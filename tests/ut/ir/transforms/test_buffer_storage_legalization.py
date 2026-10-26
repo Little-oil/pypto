@@ -16,7 +16,7 @@ import pytest
 from pypto import ir, passes
 from pypto.ir.op import tile as tile_ops
 
-from .buffer_test_utils import statements
+from .buffer_test_utils import TileHandleOrigins, statements
 
 _PLANNERS = [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP, passes.MemoryPlanner.PTOAS]
 _STORAGE_MODES = [
@@ -28,6 +28,10 @@ _STORAGE_MODE_IDS = ["legacy_pypto", "legacy_dsa", "buffer_pypto"]
 _TILE = "pl.Tile[[4, 8], pl.FP32, pl.Mem.Vec]"
 _MOVE = ir.get_op("tile.move").name
 _ALLOC = ir.get_op("tile.alloc").name
+_LOOP_INPUT_CONFLICT = (
+    "independently live loop input without a same-space copy|independently observed older value version"
+    "|readonly caller buffer"
+)
 
 
 def _program(then_body: str, else_body: str, merge: str = "") -> ir.Program:
@@ -1222,7 +1226,7 @@ class AccStorage:
 @pytest.mark.parametrize("planner", _PLANNERS)
 @pytest.mark.parametrize("while_loop", [False, True])
 @pytest.mark.parametrize("memory", ["Mat", "Left", "Right", "Acc"])
-def test_unsupported_same_space_carry_swap_is_diagnosed(planner, while_loop, memory):
+def test_readonly_same_space_carry_swap_selects_existing_handles(planner, while_loop, memory):
     tile = f"pl.Tile[[16, 16], pl.FP16, pl.Mem.{memory}]"
     if memory == "Acc":
         tile = "pl.Tile[[16, 16], pl.FP32, pl.Mem.Acc]"
@@ -1238,7 +1242,7 @@ def test_unsupported_same_space_carry_swap_is_diagnosed(planner, while_loop, mem
     )
     program = pl.parse_program(f"""
 @pl.program
-class UnsupportedSwap:
+class ReadonlySwap:
     @pl.function(type=pl.FunctionType.InCore)
     def kernel(self, gm: pl.Tensor[[16, 16], pl.FP16],
                left: pl.Tile[[16, 16], pl.FP16, pl.Mem.Left],
@@ -1253,8 +1257,25 @@ class UnsupportedSwap:
             r_a, r_b = pl.yield_(b, a)
         return gm
 """)
-    with pytest.raises(ValueError, match="unsupported tile.move memory-space pair"):
-        _legalize(program, planner)
+    after = _legalize(program, planner)
+    storage = _Storage(after)
+    loop = storage.loops[0]
+    first, second = (storage.assigns[name].var for name in ("first", "second"))
+    assert not ir.MemRef.may_alias(_memref(first), _memref(second))
+    for carry, initial in zip(loop.iter_args, (first, second), strict=True):
+        assert isinstance(carry.type, ir.TileType) and carry.type.memref is None
+        assert carry.initValue.same_as(initial)
+    for result in loop.return_vars:
+        assert isinstance(result.type, ir.TileType) and result.type.memref is None
+    backedge = _yield(loop.body).value
+    assert backedge[0].same_as(loop.iter_args[1])
+    assert backedge[1].same_as(loop.iter_args[0])
+    for move in storage.calls(_MOVE):
+        assert isinstance(move.value, ir.Call)
+        source_type, target_type = move.value.args[0].type, move.var.type
+        assert isinstance(source_type, ir.TileType) and isinstance(target_type, ir.TileType)
+        assert source_type.memory_space != target_type.memory_space
+    _verify_storage(after)
 
 
 @pytest.mark.parametrize("planner", _PLANNERS)
@@ -1346,7 +1367,7 @@ class NestedAccumulator:
         return result
 """)
     if not local_seed:
-        with pytest.raises(ValueError, match="independently live loop input without a same-space copy"):
+        with pytest.raises(ValueError, match=_LOOP_INPUT_CONFLICT):
             _legalize(program, planner)
         return
     after = _legalize(program, planner)
@@ -1782,7 +1803,10 @@ def test_row_carry_writeback_masks_only_its_preserved_target_read(
     with passes.PassContext([], memory_planner=planner, enable_buffer_ir=enable_buffer_ir):
         initialized = passes.init_mem_ref()(before)
         if old_observer != "none":
-            with pytest.raises(ValueError, match="independently live loop input without a same-space copy"):
+            with pytest.raises(
+                ValueError,
+                match=f"{_LOOP_INPUT_CONFLICT}|requires its output to be disjoint",
+            ):
                 passes.materialize_semantic_aliases()(initialized)
             return
         after = passes.materialize_semantic_aliases()(initialized)
@@ -2124,23 +2148,44 @@ class NestedMatContinuation:
         return {returned}
 """)
     if old_observer != "sibling_only":
-        with pytest.raises(ValueError, match="unsupported tile.move memory-space pair"):
+        # Neither reference selection nor a canonical destination can preserve
+        # the old contents after this in-place writer without a real copy.
+        with pytest.raises(
+            ValueError,
+            match="independently observed older value version|unsupported tile.move memory-space pair",
+        ):
             _legalize(before, planner, enable_buffer_ir=enable_buffer_ir)
         return
     after = _legalize(before, planner, enable_buffer_ir=enable_buffer_ir)
     storage = _Storage(after)
     assert len(storage.branches) == 4 and not storage.loops
-    _assert_canonical_arms(storage)
+    origins = TileHandleOrigins(after)
+    original_values = TileHandleOrigins(before).values
     target = _memref(storage.assigns["initial"].var)
     writers = storage.calls(ir.get_op("tile.gather_row").name)
     assert len(writers) == 4 and not storage.calls(_MOVE)
+    required_inputs = {
+        "update1": "initial",
+        "update2": "first",
+        "update3": "second",
+        "updated": "selected",
+    }
+    for branch in storage.branches:
+        assert branch.else_body is not None
+        for result in branch.return_vars:
+            origins.assert_window(result, target)
+            origins.assert_descriptor(result, original_values[result.name_hint])
+        for arm in [branch.then_body, branch.else_body]:
+            for value in _yield(arm).value:
+                origins.assert_window(value, target)
     for writer in writers:
         assert isinstance(writer.value, ir.Call)
+        source = writer.value.args[0]
+        assert isinstance(source, (ir.Var, ir.IterArg))
+        assert source.unique_id == origins.values[required_inputs[writer.var.name_hint]].unique_id
         for value in (writer.var, writer.value.args[0]):
-            memory = _memref(value)
-            assert ir.MemRef.same_allocation(memory, target)
-            assert ir.structural_equal(memory.byte_offset_, target.byte_offset_)
-            assert memory.size_ == target.size_ == 512
+            origins.assert_window(value, target)
+    assert target.size_ == 512
     _verify_storage(after)
 
 
@@ -2934,7 +2979,8 @@ def test_required_nested_if_targets_follow_their_rebound_loop_storage_owner(
 
     storage = _Storage(after)
     assert len(storage.loops) == 1 and len(storage.branches) == 3
-    _assert_canonical_arms(storage)
+    origins = TileHandleOrigins(after)
+    original_values = TileHandleOrigins(initialized).values
     loop = storage.loops[0]
     seed = storage.assigns["seed"].var
     seed_window = _memref(seed)
@@ -2947,17 +2993,26 @@ def test_required_nested_if_targets_follow_their_rebound_loop_storage_owner(
         storage.assigns[name].var for name in ("entry_update", "left_update", "right_update", "fallback")
     )
     for value in values:
-        window = _memref(value)
-        assert ir.MemRef.same_allocation(window, seed_window)
-        assert ir.structural_equal(window.byte_offset_, seed_window.byte_offset_)
-        assert window.size_ == seed_window.size_ == 512
-        assert window.slot_count_ == seed_window.slot_count_ == 2
-        assert window.slot_index_ is not None
-        assert ir.structural_equal(window.slot_index_, seed_window.slot_index_)
-        tile = value.type
-        assert isinstance(tile, ir.TileType)
-        assert tile.shape == [16, 16] and tile.dtype == ir.DataType.FP16
-        assert tile.memory_space == ir.MemorySpace.Mat
+        origins.assert_window(value, seed_window)
+        assert isinstance(value, (ir.Var, ir.IterArg))
+        origins.assert_descriptor(value, original_values[value.name_hint])
+    for branch in storage.branches:
+        assert branch.else_body is not None
+        for arm in [branch.then_body, branch.else_body]:
+            for value in _yield(arm).value:
+                origins.assert_window(value, seed_window)
+    for name in ("entry_update", "left_update", "right_update", "fallback"):
+        writer = storage.assigns[name].value
+        assert isinstance(writer, ir.Call)
+        operand = writer.args[0]
+        assert isinstance(operand, (ir.Var, ir.IterArg))
+        expected = seed if name == "entry_update" else loop.iter_args[0]
+        assert operand.unique_id == expected.unique_id
+    assert isinstance(loop.iter_args[0].initValue, (ir.Var, ir.IterArg))
+    assert loop.iter_args[0].initValue.unique_id == origins.values["initial"].unique_id
+    backedge = _yield(loop.body).value[0]
+    assert isinstance(backedge, (ir.Var, ir.IterArg))
+    assert backedge.unique_id == origins.values["selected"].unique_id
     for transfer in storage.calls(_MOVE):
         assert isinstance(transfer.var.type, ir.TileType)
         assert transfer.var.type.memory_space == ir.MemorySpace.Left
@@ -3184,7 +3239,7 @@ def _check_loop_old_windows(before, planner, enable_buffer_ir, memory, overlap, 
     must_isolate = overlap and not exclusive
     with passes.PassContext([], memory_planner=planner, enable_buffer_ir=enable_buffer_ir):
         if must_isolate and memory != "Vec":
-            with pytest.raises(ValueError, match="independently live loop input without a same-space copy"):
+            with pytest.raises(ValueError, match=_LOOP_INPUT_CONFLICT):
                 passes.materialize_semantic_aliases()(before)
             return
         after = passes.materialize_semantic_aliases()(before)

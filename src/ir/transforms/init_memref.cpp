@@ -57,6 +57,7 @@
 #include "pypto/ir/transforms/utils/normalize_stmt_structure.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/simplify.h"
+#include "pypto/ir/transforms/utils/storage_reference_analysis.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 #include "pypto/ir/verifier/verifier.h"
@@ -1066,13 +1067,15 @@ namespace {
  */
 class HasMemRefsVerifier : public IRVisitor {
  public:
-  explicit HasMemRefsVerifier(std::vector<Diagnostic>& diagnostics) : diagnostics_(diagnostics) {}
+  HasMemRefsVerifier(std::vector<Diagnostic>& diagnostics, const FunctionPtr& function)
+      : references_(AnalyzeStorageReferences(function->body_, function->params_).references),
+        diagnostics_(diagnostics) {}
 
   void VisitStmt_(const AssignStmtPtr& op) override {
     if (!op || !op->var_ || !op->var_->GetType()) return;
     auto tile_type = std::dynamic_pointer_cast<const TileType>(op->var_->GetType());
     if (tile_type && !tile_type->memref_.has_value()) {
-      if (IsBufferLessByDesign(op)) {
+      if (references_.count(op->var_.get()) || IsBufferLessByDesign(op)) {
         buffer_less_.insert(op->var_.get());
       } else {
         diagnostics_.emplace_back(
@@ -1084,6 +1087,7 @@ class HasMemRefsVerifier : public IRVisitor {
   }
 
  private:
+  std::set<const Var*> references_;
   // A cross-core tpop result (its data lives in the reserved C2V/V2C slot, not a
   // tile MemRef) and any zero-copy view / plain alias chained off such a result
   // legitimately carry no MemRef. Shares the rule with the MemRef-creating mutator
@@ -1106,7 +1110,7 @@ class HasMemRefsPropertyVerifierImpl : public PropertyVerifier {
     if (!program) return;
     for (const auto& [gv, func] : program->functions_) {
       if (!func || !func->body_) continue;
-      HasMemRefsVerifier verifier(diagnostics);
+      HasMemRefsVerifier verifier(diagnostics, func);
       verifier.VisitStmt(func->body_);
     }
   }

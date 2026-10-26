@@ -12,6 +12,7 @@
 import ast
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 from pypto.ir.printer import python_print
@@ -60,6 +61,14 @@ ITERATOR_TO_KIND = {
     "unroll": ir.ForKind.Unroll,
     "pipeline": ir.ForKind.Pipeline,
 }
+
+
+@dataclass(frozen=True)
+class _LoopInitializer:
+    value: ir.Expr
+    # Resolve recorded types inside the loop scope: validity can name another
+    # scalar carry, including a scalar declared after this Tile slot.
+    type_node: ast.expr | None = None
 
 
 class ControlFlowParser:
@@ -205,7 +214,9 @@ class ControlFlowParser:
             hint="Use: for i in pl.range(n) or for i, (var1,) in pl.range(n, init_values=(...,))",
         )
 
-    def setup_iter_args(self, loop: Any, iter_args_node: ast.AST, init_values: list[ir.Expr]) -> None:
+    def setup_iter_args(
+        self, loop: Any, iter_args_node: ast.AST, init_values: list[_LoopInitializer]
+    ) -> None:
         """Set up iter_args and return_vars for Pattern A loops."""
         if not isinstance(iter_args_node, ast.Tuple):
             raise ParserSyntaxError(
@@ -221,15 +232,56 @@ class ControlFlowParser:
                 hint=f"Provide exactly {len(init_values)} iteration variable(s) to match init_values",
             )
 
-        for i, iter_arg_node in enumerate(iter_args_node.elts):
+        self._setup_loop_iter_args(loop, iter_args_node, init_values)
+
+    def _setup_loop_iter_args(
+        self, loop: Any, iter_args_node: ast.Tuple, init_values: list[_LoopInitializer]
+    ) -> None:
+        names: list[ast.Name] = []
+        for iter_arg_node in iter_args_node.elts:
             if not isinstance(iter_arg_node, ast.Name):
                 raise ParserSyntaxError(
                     "Iter arg must be a simple name",
                     span=self.services.span_tracker.get_span(iter_arg_node),
                     hint="Use simple variable names for iteration variables",
                 )
-            iter_arg_var = loop.iter_arg(iter_arg_node.id, init_values[i])
-            self.services.scope_manager.define_var(iter_arg_node.id, iter_arg_var, allow_redef=True)
+            names.append(iter_arg_node)
+        if not any(initial.type_node is not None for initial in init_values):
+            for name, initial in zip(names, init_values, strict=True):
+                argument = loop.iter_arg(name.id, initial.value)
+                self.services.scope_manager.define_var(name.id, argument, allow_redef=True)
+            return
+
+        # Restore scalar bindings first so a Tile descriptor can refer to any
+        # scalar carry. Register the completed arguments in their original
+        # order; the initializer remains the exact pre-loop SSA expression.
+        arguments: list[ir.IterArg | None] = [None] * len(init_values)
+        for scalar in (True, False):
+            for index, (name, initial) in enumerate(zip(names, init_values, strict=True)):
+                if isinstance(initial.value.type, ir.ScalarType) != scalar:
+                    continue
+                recorded_type = initial.value.type
+                if initial.type_node is not None:
+                    resolved = self.services.type_resolver.resolve_type(initial.type_node)
+                    recorded_type = ir.TupleType(resolved) if isinstance(resolved, list) else resolved
+                argument = ir.IterArg(
+                    name.id, recorded_type, initial.value, self.services.span_tracker.get_span(name)
+                )
+                arguments[index] = argument
+                self.services.scope_manager.define_var(name.id, argument, allow_redef=True)
+        for argument in arguments:
+            assert argument is not None
+            loop._dump_iter_arg(argument)
+
+    def _parse_loop_initializer(self, node: ast.expr) -> _LoopInitializer:
+        if not _is_dump_call(node, "loop_init"):
+            return _LoopInitializer(self.callbacks.expression(node))
+        if len(node.args) != 2 or node.keywords:
+            raise ParserSyntaxError(
+                "_dump.loop_init requires an initializer and a carry type",
+                span=self.services.span_tracker.get_span(node),
+            )
+        return _LoopInitializer(self.callbacks.expression(node.args[0]), node.args[1])
 
     def parse_for_loop(self, stmt: ast.For) -> None:  # noqa: PLR0912
         """Parse for loop with pl.range(), pl.parallel(), pl.unroll(), or pl.while_().
@@ -418,7 +470,7 @@ class ControlFlowParser:
         """Parse a single keyword argument from a range-like iterator call."""
         if keyword.arg == "init_values":
             if isinstance(keyword.value, (ast.List, ast.Tuple)):
-                result["init_values"] = [self.callbacks.expression(elt) for elt in keyword.value.elts]
+                result["init_values"] = [self._parse_loop_initializer(elt) for elt in keyword.value.elts]
             else:
                 raise ParserSyntaxError(
                     "init_values must be a list or tuple",
@@ -534,14 +586,14 @@ class ControlFlowParser:
                 hint="Use: pl.while_(init_values=(...,)) with pl.cond(condition) as first statement in body",
             )
 
-    def parse_while_init_values(self, while_call: ast.Call) -> list[ir.Expr]:
+    def parse_while_init_values(self, while_call: ast.Call) -> list[_LoopInitializer]:
         """Parse init_values from pl.while_() keyword arguments."""
-        init_values: list[ir.Expr] = []
+        init_values: list[_LoopInitializer] = []
         for keyword in while_call.keywords:
             if keyword.arg == "init_values":
                 if isinstance(keyword.value, (ast.List, ast.Tuple)):
                     for elt in keyword.value.elts:
-                        init_values.append(self.callbacks.expression(elt))
+                        init_values.append(self._parse_loop_initializer(elt))
                 else:
                     raise ParserSyntaxError(
                         "init_values must be a tuple or list",
@@ -623,7 +675,7 @@ class ControlFlowParser:
                 hint="Add pl.cond(condition) as first statement",
             )
 
-    def validate_while_target(self, stmt: ast.For, init_values: list[ir.Expr]) -> ast.Tuple:
+    def validate_while_target(self, stmt: ast.For, init_values: list[_LoopInitializer]) -> ast.Tuple:
         """Validate and return pl.while_() target tuple."""
         if not isinstance(stmt.target, ast.Tuple):
             raise ParserSyntaxError(
@@ -643,17 +695,11 @@ class ControlFlowParser:
 
         return iter_args_node
 
-    def setup_while_iter_args(self, loop: Any, iter_args_node: ast.Tuple, init_values: list[ir.Expr]) -> None:
+    def setup_while_iter_args(
+        self, loop: Any, iter_args_node: ast.Tuple, init_values: list[_LoopInitializer]
+    ) -> None:
         """Set up iter_args for pl.while_() loop."""
-        for i, iter_arg_node in enumerate(iter_args_node.elts):
-            if not isinstance(iter_arg_node, ast.Name):
-                raise ParserSyntaxError(
-                    "Iter arg must be a simple name",
-                    span=self.services.span_tracker.get_span(iter_arg_node),
-                    hint="Use simple variable names for iteration variables",
-                )
-            iter_arg_var = loop.iter_arg(iter_arg_node.id, init_values[i])
-            self.services.scope_manager.define_var(iter_arg_node.id, iter_arg_var, allow_redef=True)
+        self._setup_loop_iter_args(loop, iter_args_node, init_values)
 
     def parse_while_body_statements(self, stmt: ast.For) -> list[str]:
         """Parse body statements for pl.while_() loop, return yielded vars."""

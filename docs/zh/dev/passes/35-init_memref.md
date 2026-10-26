@@ -54,11 +54,25 @@ program_with_memrefs = init_pass(program)
    - **View 操作**（如 `tile.reshape`）：输出与输入 tile 共享 MemRef
    - **复用输入操作**（如 `tile.matmul_acc`、`tile.gemv_acc`）：输出与指定输入共享 MemRef（由 `output_reuses_input_arg` 注册表属性指定）
    - **ForStmt/WhileStmt return_vars**：与对应入口 carry 共享 MemRef，也覆盖零次循环
-   - **IfStmt return_vars**：按自身布局建立独立、尚未放置的请求，目标存储由后续公共计划选择
+   - **IfStmt return_vars**：按自身布局建立独立的临时请求，后续公共计划选择具体目标，或选择已有存储的引用
    - **用户绑定的 tile**：保留作者指定的 buffer，而不是新建一块分配
 6. **收集非 DDR MemRef**：从 TileType 变量中收集不在 DDR 中的唯一 MemRef 对象
 7. **创建 alloc 语句**：为每个非 DDR MemRef 创建 `tile.alloc(memspace, -1, size, id)`；base 属于声明式分配时带上 `pinned=True`
 8. **前置 alloc**：将 alloc 语句插入到函数体顶层 `SeqStmts` 的开头
+
+### 临时结果请求与存储引用
+
+未绑定 if 结果的请求不意味着必须将两条输入边复制到另一块缓冲区。
+`MaterializeSemanticAliases` 先尝试公共窗口或安全的 producer 目标。无法以此实现
+值选择时，可以将结果保留为不带 MemRef 的带类型存储引用；其别名、视图和引用型
+循环 carry 沿 SSA 定义图传播。自动引用规范化针对 Mat、Acc 等不支持同空间复制的
+存储空间；Vec 保留已有的具体复制与合并路径，避免不必要地减少生命周期复用。
+仅实际存储 owner 保留分配；临时结果请求在放置前
+移除，不计入容量。显式结果绑定仍是约束，不能任意替换成所选地址。
+
+例如，选择两个独立存活的 Mat load 不需要第三块 Mat 分配或不受支持的 Mat→Mat
+传输。结果选择已有句柄，两个 load 各自保留 owner。后续存储验证区分这种由引用图
+证明的引用，与仅因尚未规划而缺失存储的 producer。
 
 ### 构建地址前化简常量输入
 

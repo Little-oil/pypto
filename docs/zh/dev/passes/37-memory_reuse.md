@@ -20,7 +20,7 @@
 [`AllocateMemoryAddr`](38-allocate_memory_addr.md) 之前运行。
 `MemoryPlanner.DSA_RP` 会跳过它，以便 DSA-RP 求解器仍能看到独立 buffer；
 `MemoryPlanner.PTOAS` 也会跳过它，因为生命周期复用由 ptoas 负责。三种模式中的
-循环/原地语义别名和能够物化的 if 边义务均已由 `MaterializeSemanticAliases` 建立；
+循环/原地语义别名、能够物化的 if 边义务及带类型的引用选择均已由 `MaterializeSemanticAliases` 建立；
 legacy opaque 输入保留已有句柄/代码生成路径。
 
 ## 规划器边界
@@ -29,6 +29,14 @@ legacy opaque 输入保留已有句柄/代码生成路径。
 身份，并在 `AllocateMemoryAddr` 中结合容量与复用惩罚联合选择地址。二者同时运行
 会在 DSA-RP 评估之前删除候选方案。生命周期干涉、语义 no-alias 规则与目标
 hazard 等正确性事实，在 DSA-RP 问题中仍然是硬约束。
+
+由引用图证明、不带 MemRef 的 Tile 引用不拥有分配。放置只消费其具体源 owner，
+不会虚构一个结果请求。共享 SSA 引用图保留别名、视图、if 输入边和循环入口/回边，
+不把每个 selector 展开成候选列表。初始保护策略让所有参与选择的具体源分配在
+PYPTO 和 DSA_RP 下保守地占用整个函数生命周期，并排除源 base 的可选 PYPTO 复用。
+这是分配组的占用保护，逻辑值存活分析仍独立保留；selector 自身不增加容量。PTOAS 接收
+带类型句柄控制流，并自行分析别名和生命周期。未获证明的 producer 缺失 MemRef
+仍属非法，不能借此绕开放置。
 
 ## API
 
@@ -54,13 +62,15 @@ program_optimized = reuse_pass(program)
 ## 算法
 
 1. **生命周期分析**：消费 `MaterializeSemanticAliases` 已建立的公共控制流存储，
-   不再选择 if 目标。结果 `r` 是合并点上的逻辑定义；每个分支只在自己的输入边
-   读取 yield 操作数。后续读取 `r` 保持结果存活，不再分别延长两个源的生命周期。
+   不再选择 if 目标。结果 `r` 是合并点上的逻辑定义。对于已物化结果，每个分支只在自己的输入边
+   读取 yield 操作数；后续读取 `r` 保持结果存活，不再分别延长两个源的生命周期。
+   对于引用结果，图标记的具体源则保守地存活整个函数，selector 不创建分配生命周期。
    必需别名保留分配组及相对窗口。循环 carry 和下一次迭代仍需要的值保持存活至
    循环边界。
 
    `InitMemRef` 创建的临时请求已经由逐槽 `IfInfo` 公共计划解析。所有规划器都在
    装箱前处理强制 loop/Acc 约束、producer 重定向及能够物化的 if 边传输。
+   规范化为引用的结果不带 MemRef，保留 SSA 输入边、别名和 carry 关系。
    Legacy opaque 源保留已有句柄/代码生成路径。未使用的结果请求不计入峰值容量。
 2. **干涉检查**：分别按 then 优先和 else 优先的词法顺序，汇总每个分配组的区间。
    区间从所有必需别名中最早的逻辑定义开始，到最晚的读取结束，也涵盖循环回边需求。
@@ -86,8 +96,9 @@ program_optimized = reuse_pass(program)
 
    子区间复用移动的是完整 root allocation；它不会利用 alias/view 未访问的内部空洞。候选 root 与 arena root 的 allocation offset 因此仍须是静态非负值。只有直接内部 `tile.slice` 才支持动态 offset，因为 PTO 能使用已经重定位的 source tile 与 slice 操作数重建其运行时地址。如果某个 memory space 中存在其他动态 offset 成员，例如动态 slice 之后的 reshape、reinterpret 或 transpose view，则整个 space 都禁用子区间回退，避免压缩无关 root 后把原本的 legacy overflow 变成错误代码。常量成员 offset 继续检查非负且不越过 root；受支持的动态 slice 原样保留相对表达式 `arena_offset + placement + (member_offset - root_offset)`。动态 root offset 仍不具备资格，声明式/pinned allocation 也保持封闭。生命周期干涉、pipeline 分离、目标 hazard 与算子 no-alias 规则仍由 `can_share` 判断；任何规则只要禁止字节重叠，两个 root 地址区间就必须分离。`AllocateMemoryAddr` 使用 arena root 的完整 allocation capacity 计算物理槽大小；所有常量子区间在 placement 阶段已经验证不会越过该容量。纯动态 `tile.slice` 的 MemRef 随后沿用旧行为记录 bare-base 地址，实际窗口由 PTO 使用 source tile 和 slice 操作数生成 `pto.subview`。后续 reshape fold 比较 base、offset 与 tile signature，PTO DPS alias 还会比较 extent。因此不会只因 base pointer 相同就把同一 arena 的兄弟 root 子区间误认为同一个 tile。
 4. **整体重定位存储组**：把装箱偏移应用到 producer、if 结果和必需别名，
-   保留相对窗口及流水线槽位。For/While 参数和返回值跟随已重定位的 initializer
-   存储，也涵盖嵌套及零次循环。本步骤改变物理放置，不改变逻辑结果身份或输入源关系。
+   保留相对窗口及流水线槽位。具体 For/While 参数和返回值跟随已重定位的 initializer
+   存储，也涵盖嵌套及零次循环。引用 carry 继续选择句柄，不继承 initializer 的 MemRef。
+   本步骤改变物理放置，不改变逻辑结果身份或输入源关系。
 5. **闭合语义别名**（`NormalizeIdentityCopyBuffersMutator`）：单次前向遍历将当前
    存储传播到下游使用：
 

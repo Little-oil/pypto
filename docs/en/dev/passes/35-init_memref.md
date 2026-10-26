@@ -54,11 +54,31 @@ program_with_memrefs = init_pass(program)
    - **View ops** (e.g. `tile.reshape`): output shares MemRef with the input tile
    - **Reuse-input ops** (e.g. `tile.matmul_acc`, `tile.gemv_acc`): output shares MemRef with the specified input (via `output_reuses_input_arg` registry attribute)
    - **ForStmt/WhileStmt return_vars**: share the corresponding entry carry's MemRef, including on zero-trip loops
-   - **IfStmt return_vars**: receive independent unplaced requests from their own layout; common result planning chooses storage later
+   - **IfStmt return_vars**: receive independent provisional requests from their own layout; common result planning later chooses a concrete destination or a reference selecting existing storage
    - **Declared allocations**: the tile keeps the allocation the author declared instead of getting a fresh one
 6. **Collect non-DDR MemRefs**: Gather unique MemRef objects from TileType variables that are not in DDR
 7. **Create alloc statements**: For each non-DDR MemRef, create `tile.alloc(memspace, -1, size, id)` — with `pinned=True` when the base was declared by the author
 8. **Prepend allocs**: Insert alloc statements at the beginning of the function body's top-level `SeqStmts`
+
+### Provisional result requests and storage references
+
+An unbound if result's request is not a requirement to copy both incoming
+values into another buffer. `MaterializeSemanticAliases` first tries a common
+window or safe producer destination. If that cannot implement a value selection,
+it may retain the result as a typed storage reference without a MemRef. Its
+aliases, views and reference loop carries follow the SSA definition graph.
+Automatic reference normalization targets spaces without a supported same-space
+copy, such as Mat and Acc. Vec keeps its existing concrete-copy and coalescing
+path, avoiding an unnecessary loss of lifetime reuse.
+Only actual storage owners keep allocations; the provisional result request is
+removed before placement and contributes no capacity. Explicit result bindings
+remain constraints and cannot be replaced with an arbitrary selected address.
+
+For example, selecting two independently live Mat loads does not require a
+third Mat allocation or an unsupported Mat-to-Mat transfer. The result selects
+one existing handle, while each load retains its own owner. The subsequent
+storage verifier distinguishes these graph-proven references from an unplanned
+producer that merely lacks storage.
 
 ### Constant inputs before address construction
 

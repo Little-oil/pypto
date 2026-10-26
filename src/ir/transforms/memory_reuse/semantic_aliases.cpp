@@ -55,6 +55,7 @@
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/storage_access_index.h"
+#include "pypto/ir/transforms/utils/storage_reference_analysis.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "src/ir/transforms/memory_reuse/internal.h"
@@ -950,6 +951,7 @@ class LoopInputIsolation : public IRVisitor {
   std::map<const IterArg*, VarPtr> initializers;
   std::map<const Stmt*, std::vector<StmtPtr>> entries;
   std::vector<StmtPtr> allocations;
+  std::set<VarPtr> reference_carries;
 
   /// Collect one immutable snapshot of actual writes and possible carry
   /// writebacks. The same proof drives isolation and result mutability; merely
@@ -980,6 +982,7 @@ class LoopInputIsolation : public IRVisitor {
     const auto collect = [&](const auto& loop) {
       if (!LoopMayExecute(loop, false)) return;
       for (const auto& argument : loop->iter_args_) {
+        if (!GetTileTypeWithMemRef(argument->GetType())) continue;
         const auto initial = AsVarLike(argument->initValue_);
         if (!initial) continue;
         ForEachStorageWindow(initial, [&](const MemRefPtr& window) {
@@ -1142,13 +1145,24 @@ class LoopInputIsolation : public IRVisitor {
           else_yield && i < else_yield->value_.size() ? AsVarLike(else_yield->value_[i]) : nullptr;
       const auto lhs_tile = lhs ? GetTileTypeWithMemRef(lhs->GetType()) : nullptr;
       const auto rhs_tile = rhs ? GetTileTypeWithMemRef(rhs->GetType()) : nullptr;
-      const bool common = lhs_tile && rhs_tile && ValueOrigin(lhs) == ValueOrigin(rhs) &&
-                          SameKnownTileMemorySpace(tile, lhs_tile) &&
-                          SameKnownTileMemorySpace(tile, rhs_tile) &&
-                          SamePhysicalWindow(StorageWindow(lhs), StorageWindow(rhs));
+      const bool same_value = lhs_tile && rhs_tile && ValueOrigin(lhs) == ValueOrigin(rhs) &&
+                              SameKnownTileMemorySpace(tile, lhs_tile) &&
+                              SameKnownTileMemorySpace(tile, rhs_tile);
+      // This is a value-version projection for effect queries, not a physical
+      // result binding. Pure renames/views retain their origin; native writers
+      // start fresh origins and cannot make an updated/unchanged join a no-op.
+      if (same_value && (!fixed || SamePhysicalWindow(target, StorageWindow(lhs)))) {
+        const auto origin = ValueOrigin(lhs);
+        value_origins_[result.get()] = origin;
+        const auto lhs_definition = definitions_.find(lhs.get());
+        const auto rhs_definition = definitions_.find(rhs.get());
+        definitions_[result.get()] =
+            std::min(lhs_definition == definitions_.end() ? 0 : lhs_definition->second,
+                     rhs_definition == definitions_.end() ? 0 : rhs_definition->second);
+      }
+      const bool common = same_value && SamePhysicalWindow(StorageWindow(lhs), StorageWindow(rhs));
       if (common && (!fixed || SamePhysicalWindow(target, StorageWindow(lhs)))) {
         storage_windows_[result.get()] = StorageWindow(lhs);
-        value_origins_[result.get()] = ValueOrigin(lhs);
       }
       if (fixed) {
         for (const auto& yield : {then_yield, else_yield}) {
@@ -1386,12 +1400,17 @@ class LoopInputIsolation : public IRVisitor {
     std::set<size_t> isolate;
     std::vector<StorageAccessIndex::Event> carry_windows;
     for (size_t i = 0; i < loop->iter_args_.size(); ++i) {
+      if (!GetTileTypeWithMemRef(loop->iter_args_[i]->GetType())) continue;
       ForEachStorageWindow(loop->iter_args_[i]->initValue_,
                            [&](const MemRefPtr& window) { carry_windows.push_back({window, i + 1, 1}); });
     }
     StorageAccessIndex other_carries;
     other_carries.Build(carry_windows);
     for (size_t i = 0; i < loop->iter_args_.size(); ++i) {
+      // A reference carry changes its handle on the backedge. It has no
+      // destination window to isolate or to copy into; actual native writes
+      // through that handle are checked by storage-reference validation.
+      if (!GetTileTypeWithMemRef(loop->iter_args_[i]->GetType())) continue;
       const auto& initial = loop->iter_args_[i]->initValue_;
       auto tile = GetTileTypeWithMemRef(initial->GetType());
       if (!tile) continue;
@@ -1428,6 +1447,16 @@ class LoopInputIsolation : public IRVisitor {
       CHECK_SPAN(source, loop->span_) << "Buffer IR loop initializers must be storage variables";
       const auto tile = GetTileTypeWithMemRef(source->GetType());
       const auto memory = tile->GetMemorySpace();
+      if (memory && !IsTileMoveEverSupported(*memory, *memory)) {
+        // Entry isolation need not copy a read-only initializer into a mutable
+        // destination. A carry can instead select its initializer at entry and
+        // independently produced storage on each backedge. Actual writes
+        // through this handle still require the shared old-version proof;
+        // turning the binding into a reference cannot authorize clobbering an
+        // independently observed initializer or previous carried version.
+        reference_carries.insert(argument);
+        continue;
+      }
       CHECK_SPAN(memory && IsTileMoveEverSupported(*memory, *memory), loop->span_)
           << "Buffer IR cannot preserve an independently live loop input without a same-space copy; "
              "produce an independent initial tile for this carry";
@@ -1501,6 +1530,12 @@ class TopDownRetargeter {
     auto protection = CollectBranchStorageProtection(function, func_body);
     immovable_branch_bases_ = std::move(protection.immovable_bases);
     no_mutable_alias_branch_bases_ = std::move(protection.no_mutable_alias_bases);
+    // A reference may still read any incoming allocation after this selection.
+    // Keep its actual owners stable while planning other branch destinations;
+    // this is protection, not mandatory coalescing of the source allocations.
+    const auto references = AnalyzeStorageReferences(func_body, function->params_);
+    reference_source_bases_ = references.source_bases;
+    immovable_branch_bases_.insert(references.source_bases.begin(), references.source_bases.end());
     std::vector<StorageAccessIndex::Event> readonly_caller_windows;
     for (size_t i = 0; i < function->params_.size(); ++i) {
       const auto& parameter = function->params_[i];
@@ -1510,7 +1545,9 @@ class TopDownRetargeter {
       }
       // A Ptr ABI parameter can name a directly supplied result window. Its
       // binding is caller-owned, just like the storage of a Tile parameter.
-      if (As<PtrType>(parameter->GetType())) pinned_branch_bases_.insert(parameter.get());
+      if (As<PtrType>(parameter->GetType())) {
+        pinned_branch_bases_.insert(parameter.get());
+      }
       if (auto tile = GetTileTypeWithMemRef(parameter->GetType())) {
         const auto* base = GetDefinedMemRef(tile)->base_.get();
         pinned_branch_bases_.insert(base);
@@ -1827,6 +1864,7 @@ class TopDownRetargeter {
   std::set<const Var*> owned_branch_bases_;
   std::set<const Var*> immovable_branch_bases_;
   std::set<const Var*> no_mutable_alias_branch_bases_;
+  std::set<const Var*> reference_source_bases_;
   std::vector<size_t> branch_loop_headers_;
   std::unique_ptr<BufferViewAnalysis> input_views_;
   uint64_t branch_storage_counter_ = 0;
@@ -2956,6 +2994,10 @@ class TopDownRetargeter {
 
     for (size_t i = 0; i < if_stmt->return_vars_.size(); ++i) {
       if (i >= then_yield->value_.size() || i >= else_yield->value_.size()) continue;
+      // A selected handle is already a complete representation plan. Native
+      // accumulator coalescing must not resurrect its abandoned destination
+      // or overwrite one of the independent selected source allocations.
+      if (!GetTileTypeWithMemRef(if_stmt->return_vars_[i]->GetType())) continue;
       auto then_var = AsVarLike(then_yield->value_[i]);
       auto else_var = AsVarLike(else_yield->value_[i]);
       if (!then_var || !else_var) continue;
@@ -3110,6 +3152,7 @@ class TopDownRetargeter {
   /// Attempts to rewrite `var`'s MemRef to `target` by walking its producer chain.
   /// Returns true if var already has target MemRef or a rewrite was planned.
   bool TryRetargetVar(const VarPtr& var, const MemRefPtr& target, std::optional<MemorySpace> target_memory) {
+    if (As<TileType>(var->GetType()) && !GetTileTypeWithMemRef(var->GetType())) return false;
     if (blocked_branch_results_.count(var.get()) || !CanReplayTarget(var, target)) return false;
     if (SamePhysicalWindow(CurrentMemRef(var), target)) return true;  // already aligned
     if (auto source = CurrentMemRef(var);
@@ -3253,6 +3296,15 @@ class TopDownRetargeter {
       if (!TryRetargetVar(input_var, target, target_memory)) return false;
       PlanRewrite(var, target, target_memory);
       return true;
+    }
+    // Existing selected owners can retain native required aliases on their
+    // current windows. A new producer cannot become an additional occupant of
+    // such a window: the handle may still select its original value later.
+    // Apply this at the actual producer, not at forwarding If/loop wrappers,
+    // whose existing common-window and old-observer proofs remain authoritative.
+    if (reference_source_bases_.count(target->base_.get()) &&
+        !SamePhysicalWindow(CurrentMemRef(var), target)) {
+      return false;
     }
     if (HasKwarg(*call, "target_memory") && !TargetMemoryKwargMatches(*call, target_memory)) {
       return false;
@@ -3591,6 +3643,15 @@ class RetypeApplier : public IRMutator {
         initializers_(std::move(initializers)),
         entries_(std::move(entries)) {}
 
+  std::set<const Var*> RemapReferenceCarries(const std::set<VarPtr>& carries) const {
+    std::set<const Var*> result;
+    for (const auto& carry : carries) {
+      const auto found = var_substitution_.find(carry);
+      result.insert(found == var_substitution_.end() ? carry.get() : found->second.get());
+    }
+    return result;
+  }
+
   ExprPtr VisitExpr_(const VarPtr& op) override {
     auto it = var_substitution_.find(op);
     if (it != var_substitution_.end()) return it->second;
@@ -3800,7 +3861,13 @@ FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func) {
   // Graph body is orchestration too, so it is skipped for the same reason.
   if (IsOrchestrationLike(func->func_type_)) return func;
 
-  StmtPtr new_body = func->body_;
+  // Resolve required aliases before classifying independent incoming storage.
+  // InitMemRef may leave a rename/view with a provisional allocation request;
+  // that request must not turn a readonly same-window carry into a selector.
+  StmtPtr new_body = NormalizeIdentityCopyBuffersBeforeYieldFixup(func->body_);
+  new_body = RetypeApplier({}).VisitStmt(new_body);
+  new_body = NormalizeStorageReferences(new_body, func->params_);
+  ValidateStorageReferenceWrites(new_body, func->params_, func->param_directions_);
   const auto* ctx = PassContext::Current();
   if (ctx != nullptr && ctx->GetEnableBufferIR()) {
     auto current_function = MutableCopy(func);
@@ -3816,13 +3883,27 @@ FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func) {
   new_body = RetypeApplier({}).VisitStmt(new_body);
   LoopInputIsolation isolation;
   isolation.Plan(new_body, func->params_, func->param_directions_);
+  std::set<const Var*> reference_carries;
   if (!isolation.initializers.empty()) {
+    // Consume entries while loop statement identities still match the frozen
+    // isolation plan. A selected carry in the same loop must not rebuild that
+    // loop before its independent copyable carries receive their entry copies.
     RetypeApplier applier(std::move(isolation.rewrites), std::move(isolation.initializers),
                           std::move(isolation.entries));
     new_body = applier.VisitStmt(new_body);
+    reference_carries = applier.RemapReferenceCarries(isolation.reference_carries);
     new_body = InsertAllocsIntoBody(new_body, isolation.allocations);
-    new_body = NormalizeIdentityCopyBuffersBeforeYieldFixup(new_body);
+  } else {
+    for (const auto& carry : isolation.reference_carries) reference_carries.insert(carry.get());
   }
+  if (!reference_carries.empty()) {
+    // Keep concrete bindings until the shared graph has recognized every
+    // inherited alias. Clearing a carry first would make its native writeback's
+    // inherited window look like an explicit result destination.
+    new_body = NormalizeStorageReferences(new_body, func->params_, reference_carries);
+    ValidateStorageReferenceWrites(new_body, func->params_, func->param_directions_);
+  }
+  new_body = NormalizeIdentityCopyBuffersBeforeYieldFixup(new_body);
   new_body = RetypeApplier({}).VisitStmt(new_body);
   // Logical result identities and both incoming edges are planned together.
   // Required loop/Acc targets and optional reuse share one SSA snapshot and
@@ -3833,6 +3914,11 @@ FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func) {
   if (!rewrites.empty()) new_body = RetypeApplier(std::move(rewrites)).VisitStmt(new_body);
   new_body = InsertAllocsIntoBody(new_body, allocations);
   new_body = RetypeApplier({}).VisitStmt(new_body);
+  // Native Acc updates still have value-version obligations when their joins
+  // remain concrete. Check them after destination planning, before an illegal
+  // Acc-to-Acc edge repair can obscure the independently observed old value.
+  ValidateStorageReferenceWrites(new_body, func->params_, func->param_directions_,
+                                 /*include_concrete_acc_regions=*/true);
 
   // Tile PYPTO still reconciles loop writebacks after packing. If edges must
   // already be complete so every planner sees their actual reads and writes.
@@ -3841,6 +3927,9 @@ FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func) {
   new_body = FixupYields(new_body, func->params_, /*canonical_loop_copies=*/true,
                          /*if_results_only=*/!all_boundaries);
   new_body = NormalizeIdentityCopyBuffers(new_body);
+  // Fixed destinations can introduce transfers during boundary repair. Check
+  // their writes too; the pre-planning proof alone cannot cover new effects.
+  ValidateStorageReferenceWrites(new_body, func->params_, func->param_directions_);
   new_body = RemoveUnusedAllocStatements(new_body, memref_collectors::CollectUsedBasePtrs(new_body));
 
   if (new_body == func->body_) return func;
