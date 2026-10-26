@@ -1850,6 +1850,87 @@ class TestVecExtractPlacement:
         ir.assert_structural_equal(_run_pass(Before), Expected)
 
 
+class TestDeclaredWriteEffects:
+    """Declared argument writes prevent snapshots before the view's consumer."""
+
+    def test_scalar_write_precedes_partial_column_materialization(self):
+        """tile.write declares ReadWrite without a writeback or scratch hint."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                value: pl.Scalar[pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                column = pl.tile.slice(local, [16, 1], [0, 0], valid_shape=[8, 1])
+                pl.tile.write(local, [0, 0], value)
+                scaled = pl.tile.muls(column, 0.5)
+                stored = pl.store(scaled, [0, 0], out)
+                return stored
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                value: pl.Scalar[pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                pl.tile.write(local, [0, 0], value)
+                raw = pl.tile.extract(local, 0, 0, shape=[16, 1], target_memory=pl.Mem.Vec)
+                dense = pl.tile.set_validshape(raw, 8, 1)
+                scaled = pl.tile.muls(dense, 0.5)
+                stored = pl.store(scaled, [0, 0], out)
+                return stored
+
+        ir.assert_structural_equal(_run_pass(Before), Expected)
+
+    def test_scalar_write_through_parent_alias_precedes_unaligned_copy(self):
+        """The parent's plain alias writes the storage of its existing view."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                value: pl.Scalar[pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                parent_alias = local
+                column = pl.tile.slice(local, [16, 1], [0, 1])
+                pl.tile.write(parent_alias, [0, 1], value)
+                scaled = pl.tile.muls(column, 0.5)
+                stored = pl.store(scaled, [0, 0], out)
+                return stored
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                value: pl.Scalar[pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                parent_alias = local
+                pl.tile.write(parent_alias, [0, 1], value)
+                dense = pl.tile.extract(local, 0, 1, shape=[16, 1], target_memory=pl.Mem.Vec)
+                scaled = pl.tile.muls(dense, 0.5)
+                stored = pl.store(scaled, [0, 0], out)
+                return stored
+
+        ir.assert_structural_equal(_run_pass(Before), Expected)
+
+
 class TestPlannedExtractSourceRemapping:
     """Extract plans must use definitions retyped during the actual rewrite."""
 

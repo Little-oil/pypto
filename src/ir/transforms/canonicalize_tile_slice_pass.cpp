@@ -849,10 +849,10 @@ bool IsReadOnlyVecComputeOperand(const CallPtr& call, size_t index) {
 /// any Var sharing its storage.  Storage sharing is an equivalence relation
 /// built with union-find over the edges that bind a Var to existing storage —
 /// a plain alias, an output that inherits its source buffer (views, in-place
-/// ops), and loop / if merges.  A write is a declared writeback operand, a
-/// declared hardware scratch or absolute-indexed destination, or any tile
-/// operand of a call the registry cannot describe.  Whole-function rather than
-/// between-site analysis keeps the sweep O(N α(N)); it can only decline a
+/// ops), and loop / if merges. A write is a call-specific Write/ReadWrite
+/// argument effect, a declared writeback, workspace or absolute-indexed
+/// destination, or any tile operand of a call the registry cannot describe.
+/// Whole-function rather than between-site analysis keeps the sweep O(N α(N)); it can only decline a
 /// placement, never admit a wrong one.
 class SliceStorageAnalysis : public IRVisitor {
  public:
@@ -959,7 +959,12 @@ class SliceStorageAnalysis : public IRVisitor {
     const auto& entry = registry.GetEntry(call->op_->name_);
     for (size_t i = 0; i < call->args_.size(); ++i) {
       auto kind = entry.GetLaneInvariantArgKind(i);
-      if (kind.has_value() && *kind != LaneInvariantArg::IndexAddressedSource) MarkWritten(call->args_[i]);
+      // Mutation need not reuse the result's buffer: tile.write and kwarg-
+      // dependent effects also invalidate an earlier snapshot of this storage.
+      if (ArgEffectWrites(entry.GetArgEffect(i, call->kwargs_)) || entry.IsWorkspaceArg(i) ||
+          (kind.has_value() && *kind != LaneInvariantArg::IndexAddressedSource)) {
+        MarkWritten(call->args_[i]);
+      }
     }
     if (result && !call->args_.empty() && op_predicates::OutputInheritsSourceBuffer(call->op_->name_)) {
       const size_t source_index = writeback.value_or(0);

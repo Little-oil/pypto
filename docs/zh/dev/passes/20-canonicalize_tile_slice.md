@@ -57,7 +57,7 @@ program_canon = passes.canonicalize_tile_slice()(program)
 
 2. **规划定义处 extract (Plan definition-site extracts)**（仅 Vec slice） —— 同时满足以下两点时，slice 通过把其自身定义替换为 `tile.extract(base, off_row, off_col, slice_shape, target_memory=Vec)` 来实例化：
    - 按下面的消费者规则，某个消费者会实例化它（一个惰性 textract 不是恒等拷贝的 `tile.col_expand_*` 操作数，或地址无法证明对齐的普通 call 操作数、别名、循环初始值或 yield）；并且
-   - function 中没有任何地方可能写入它的存储。存储共享是用 union-find 在普通别名、继承源缓冲区的输出（视图与原地算子，从 registry 读取）以及循环 / if 合并上构建的等价类。写入指声明的回写操作数（`set_output_reuses_input`）、声明的 scratch 或按绝对索引寻址的目的地（`set_lane_invariant_arg`），或未注册 call 的任意操作数。
+   - function 中没有任何地方可能写入它的存储。存储共享是用 union-find 在普通别名、继承源缓冲区的输出（视图与原地算子，从 registry 读取）以及循环 / if 合并上构建的等价类。写入包括结合当前 call 的 kwargs 求得的参数 `Write`/`ReadWrite` 效果、声明的回写操作数（`set_output_reuses_input`）、显式 workspace 参数、声明的 scratch 或按绝对索引寻址的目的地（`set_lane_invariant_arg`），以及未注册 call 的任意操作数。因此，即使 `tile.write` 没有结果回写，它对父 tile 的修改也会让拷贝保留在消费者处，位于修改之后。
 
    此后对该 slice 的所有引用都读取这个 extract，下面的消费者规则因此不再匹配它。若从父 tile 提取会扩大有效范围，则对新拷贝执行 `tile.set_validshape`，恢复原窗口推导出的有效范围。slice 按程序顺序规划：已规划 slice 的链式 slice 会被重定基到该拷贝上（base = 拷贝，偏移从链式 slice 自身的偏移重新开始），因为它是一块新的稠密缓冲区——其对齐按这块缓冲区重新计算，而不是原来的根。
 
