@@ -2761,6 +2761,48 @@ class TestTileMatMulOps:
         assert _const_values(result.shape) == [16, 32]
         assert _valid_of(result) == [16, 32]
 
+    @pytest.mark.parametrize("phase", [ir.AccPhase.Unspecified, ir.AccPhase.Partial, ir.AccPhase.Final])
+    @pytest.mark.parametrize(
+        ("acc_valid", "lhs_valid", "rhs_valid", "matches_product"),
+        [
+            ((16, 32), (8, 16), (16, 32), False),
+            ((16, 32), (16, 16), (16, 24), False),
+            ((8, 24), (8, 16), (16, 24), True),
+        ],
+        ids=["wider_rows", "wider_columns", "equal_valid_padded_physical"],
+    )
+    def test_final_matmul_acc_requires_matching_product_valid_shape(
+        self, phase, acc_valid, lhs_valid, rhs_valid, matches_product
+    ):
+        """Final stores cannot wait for untouched accumulator blocks to be set."""
+        span = ir.Span.unknown()
+        acc = ir.Var(
+            "acc",
+            ir.TileType([16, 32], DataType.FP32, tile_view=ir.TileView(valid_shape=acc_valid)),
+            span,
+        )
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType([16, 16], DataType.FP16, tile_view=ir.TileView(valid_shape=lhs_valid)),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType([16, 32], DataType.FP16, tile_view=ir.TileView(valid_shape=rhs_valid)),
+            span,
+        )
+        if phase == ir.AccPhase.Final and not matches_product:
+            with pytest.raises(
+                ValueError,
+                match="AccPhase.Final requires the product valid shape to match the accumulator valid shape",
+            ):
+                tile.matmul_acc(acc, lhs, rhs, acc_phase=phase)
+        else:
+            result_type = tile.matmul_acc(acc, lhs, rhs, acc_phase=phase).type
+            assert isinstance(result_type, ir.TileType)
+            assert _valid_of(result_type) == list(acc_valid)
+            assert _const_values(result_type.shape) == [16, 32]
+
     @pytest.mark.parametrize(
         ("acc_valid", "lhs_valid", "rhs_valid", "message"),
         [
@@ -2880,6 +2922,67 @@ class TestTileMatMulOps:
 
         ir_str = str(Program)
         assert "tile.matmul_acc" in ir_str
+
+    @pytest.mark.parametrize("phase", [ir.AccPhase.Unspecified, ir.AccPhase.Partial, ir.AccPhase.Final])
+    @pytest.mark.parametrize("accumulate", [False, True], ids=["base", "acc"])
+    def test_matmul_phase_preserves_span_and_legacy_init_cond(self, phase, accumulate):
+        """The new keyword must not displace IR spans or DSL init_cond operands."""
+        span = ir.Span("matmul_phase_compat.py", 7, 3, 7, 21)
+        lhs = ir.Var("lhs", ir.TileType([16, 16], DataType.FP32), span)
+        rhs = ir.Var("rhs", ir.TileType([16, 16], DataType.FP32), span)
+        acc = ir.Var("acc", ir.TileType([16, 16], DataType.FP32), span)
+        predicate = ir.ConstBool(True, span)
+        if accumulate:
+            call = tile.matmul_acc(acc, lhs, rhs, span, init_cond=predicate, acc_phase=phase)
+            dsl_call = pl.tile.matmul_acc(
+                pl.Tile(expr=acc), pl.Tile(expr=lhs), pl.Tile(expr=rhs), True, acc_phase=phase
+            ).unwrap()
+            assert isinstance(dsl_call, ir.Call)
+            assert len(call.args) == 4
+            assert isinstance(call.args[3], ir.ConstBool) and call.args[3].value
+            assert len(dsl_call.args) == 4
+            assert isinstance(dsl_call.args[3], ir.ConstInt) and dsl_call.args[3].value == 1
+            assert dsl_call.args[3].dtype == DataType.BOOL
+            default_call = tile.matmul_acc(acc, lhs, rhs)
+        else:
+            call = tile.matmul(lhs, rhs, span, acc_phase=phase)
+            dsl_call = pl.tile.matmul(pl.Tile(expr=lhs), pl.Tile(expr=rhs), acc_phase=phase).unwrap()
+            assert isinstance(dsl_call, ir.Call)
+            default_call = tile.matmul(lhs, rhs)
+        expected = {} if phase == ir.AccPhase.Unspecified else {"acc_phase": int(phase)}
+        assert dict(call.kwargs) == dict(dsl_call.kwargs) == expected
+        assert dict(default_call.kwargs) == {}
+        assert call.span.filename == "matmul_phase_compat.py"
+
+    @pytest.mark.parametrize("accumulate", [False, True], ids=["base", "acc"])
+    @pytest.mark.parametrize("phase", [1, 99, "final"])
+    def test_matmul_rejects_invalid_acc_phase(self, accumulate, phase):
+        span = ir.Span.unknown()
+        lhs = ir.Var("lhs", ir.TileType([16, 16], DataType.FP32), span)
+        rhs = ir.Var("rhs", ir.TileType([16, 16], DataType.FP32), span)
+        acc = ir.Var("acc", ir.TileType([16, 16], DataType.FP32), span)
+        with pytest.raises(ValueError, match="acc_phase|invalid literal for int"):
+            if accumulate:
+                tile.matmul_acc(acc, lhs, rhs, acc_phase=cast(Any, phase))
+            else:
+                tile.matmul(lhs, rhs, acc_phase=cast(Any, phase))
+
+    def test_matmul_acc_phase_is_keyword_only(self):
+        for wrapper in (pl.tile.matmul, pl.tile.matmul_acc, tile.matmul, tile.matmul_acc):
+            assert inspect.signature(wrapper).parameters["acc_phase"].kind is inspect.Parameter.KEYWORD_ONLY
+
+    @pytest.mark.parametrize("accumulate", [False, True], ids=["base", "acc"])
+    @pytest.mark.parametrize("phase", ["final", 3.0], ids=["string", "double"])
+    def test_raw_matmul_phase_requires_an_integer_even_with_open_kwargs(self, accumulate, phase):
+        """Native construction bypasses Python coercion; phase still has a fixed type."""
+        span = ir.Span.unknown()
+        lhs = ir.Var("lhs", ir.TileType([16, 16], DataType.FP32), span)
+        rhs = ir.Var("rhs", ir.TileType([16, 16], DataType.FP32), span)
+        acc = ir.Var("acc", ir.TileType([16, 16], DataType.FP32), span)
+        op_name = "tile.matmul_acc" if accumulate else "tile.matmul"
+        args = [acc, lhs, rhs] if accumulate else [lhs, rhs]
+        with pytest.raises(TypeError, match="Invalid type for kwarg key: acc_phase, expected int"):
+            ir.create_op_call(op_name, args, {"acc_phase": phase}, span)
 
     def test_tile_matmul_bias(self):
         """Test tile.matmul_bias operator - matrix multiplication with bias add."""

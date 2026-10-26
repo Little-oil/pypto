@@ -292,20 +292,33 @@ static std::string MakeNaryCodegenPTO(const std::string& pto_op_name, size_t ari
   return "";
 }
 
-static std::string GemvAccPhaseAttr(const CallPtr& op) {
+static std::string AccPhaseAttr(const CallPtr& op) {
   const int acc_phase = op->GetKwarg<int>("acc_phase", static_cast<int>(ir::AccPhase::kUnspecified));
   INTERNAL_CHECK_SPAN(ir::IsValidAccPhase(acc_phase), op->span_)
-      << "GEMV acc_phase must encode AccPhase::kUnspecified, kPartial, or kFinal, got " << acc_phase;
+      << op->op_->name_ << " acc_phase must encode AccPhase::kUnspecified, kPartial, or kFinal, got "
+      << acc_phase;
   if (acc_phase == static_cast<int>(ir::AccPhase::kUnspecified)) return "";
   return " {accPhase = #pto<acc_phase " + ir::AccPhaseToPTOString(static_cast<ir::AccPhase>(acc_phase)) +
          ">}";
 }
 
-static std::string MakeGemvCodegenPTO(const std::string& pto_op_name, size_t arity, const CallPtr& op,
-                                      codegen::CodegenBase& codegen_base) {
+static std::string MatmulAttrs(const CallPtr& op, codegen::PTOCodegen& codegen) {
+  auto attrs = (ir::IsOp(op, "tile.matmul") || ir::IsOp(op, "tile.matmul_acc"))
+                   ? codegen::FormatMatmulTf32Attr(op, codegen.GetBackendHandler()->GetPtoTargetArch())
+                   : "";
+  const auto phase = AccPhaseAttr(op);
+  if (attrs.empty()) return phase;
+  if (phase.empty()) return attrs;
+  // Both formatters return one attribute dictionary; combine their entries.
+  attrs.pop_back();
+  return attrs + ", " + phase.substr(2);
+}
+
+static std::string MakePhasedMatmulCodegenPTO(const std::string& pto_op_name, size_t arity, const CallPtr& op,
+                                              codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
   CheckArity(op, pto_op_name, arity);
-  codegen.Emit(pto_op_name + " " + GenerateInsOutsClause(op, codegen) + GemvAccPhaseAttr(op));
+  codegen.Emit(pto_op_name + " " + GenerateInsOutsClause(op, codegen) + MatmulAttrs(op, codegen));
   return "";
 }
 
@@ -929,9 +942,9 @@ static const SimpleOpEntry kSimpleOps[] = {
     // Padding operations
     {"tile.fillpad",         "pto.tfillpad",         1},
     // Matrix multiplication operations (PipeType::M → CUBE/AIC core)
-    {"tile.matmul",          "pto.tmatmul",          2},
     {"tile.matmul_mx",       "pto.tmatmul.mx",       4},
     {"tile.matmul_mx_bias",  "pto.tmatmul.mx.bias",  5},
+    // tile.matmul has phase-aware custom codegen.
     // tile.matmul_acc / tile.gemv_acc / tile.matmul_mx_acc have custom codegen
     // (in-place accumulation: ptoas requires ins(acc) == outs).
     {"tile.matmul_bias",     "pto.tmatmul.bias",     3},
@@ -1293,139 +1306,4 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
       std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
       std::string lhs_type = codegen.GetExprTypeAnnotation(op->args_[1]);
       std::string rhs_type = codegen.GetExprTypeAnnotation(op->args_[2]);
-      const std::string attrs =
-          ir::IsOp(op, "tile.matmul_acc")
-              ? codegen::FormatMatmulTf32Attr(op, codegen.GetBackendHandler()->GetPtoTargetArch())
-              : GemvAccPhaseAttr(op);
-
-      // ins() carries the accumulator only on the accumulating form; the
-      // initializing form reads lhs/rhs alone and writes dst from scratch.
-      auto build = [&](bool initializing) {
-        std::vector<std::string> operands = {lhs, rhs};
-        std::vector<std::string> types = {lhs_type, rhs_type};
-        if (!initializing) {
-          operands.insert(operands.begin(), dst);
-          types.insert(types.begin(), dst_type);
-        }
-        std::ostringstream inst;
-        inst << (initializing ? init_pto_op : pto_op) << " ins(";
-        for (size_t i = 0; i < operands.size(); ++i) {
-          if (i > 0) inst << ", ";
-          inst << operands[i];
-        }
-        // Type annotations must be all present or all absent: the `: t0, t1, ...`
-        // clause is positional, so emitting a filtered subset would bind the
-        // remaining types to the wrong operands. Mirrors make_mx_acc_codegen.
-        const bool any_type_present =
-            std::any_of(types.begin(), types.end(), [](const std::string& t) { return !t.empty(); });
-        const bool all_types_present =
-            std::all_of(types.begin(), types.end(), [](const std::string& t) { return !t.empty(); });
-        INTERNAL_CHECK(!any_type_present || all_types_present)
-            << "Internal error: " << (initializing ? init_pto_op : pto_op)
-            << " operand type annotations must all be present or all absent, got a partial set";
-        if (all_types_present) {
-          inst << " : ";
-          for (size_t i = 0; i < types.size(); ++i) {
-            if (i > 0) inst << ", ";
-            inst << types[i];
-          }
-        }
-        inst << ") outs(" << dst;
-        if (!dst_type.empty()) inst << " : " << dst_type;
-        inst << ")" << attrs;
-        return inst.str();
-      };
-
-      if (op->args_.size() == 3) {
-        codegen.Emit(build(/*initializing=*/false));
-        return "";
-      }
-
-      // A literal predicate picks one arm outright; only a runtime one branches.
-      // A DSL `init_cond=True/False` and a predicate Simplify decided (e.g. a
-      // replica's `ko + k*step == 0` after LowerPipelineLoops) both arrive as a
-      // ConstBool; a BOOL-typed ConstInt is still accepted for IR built directly
-      // through the bindings.  Missing either one leaves an `scf.if` on a
-      // compile-time constant, doubling the emitted MADs.
-      if (auto init_const = As<ir::ConstInt>(op->args_[3])) {
-        codegen.Emit(build(/*initializing=*/init_const->value_ != 0));
-        return "";
-      }
-      if (auto init_bool = As<ir::ConstBool>(op->args_[3])) {
-        codegen.Emit(build(/*initializing=*/init_bool->value_));
-        return "";
-      }
-
-      // Resolve the condition before opening the region so any instruction its
-      // evaluation emits lands outside (and so dominates) both arms.
-      std::string cond = codegen.GetExprAsCode(op->args_[3]);
-      codegen.EmitStructural("scf.if " + cond + " {");
-      codegen.IncreaseIndent();
-      codegen.Emit(build(/*initializing=*/true));
-      codegen.DecreaseIndent();
-      codegen.EmitStructural("} else {");
-      codegen.IncreaseIndent();
-      codegen.Emit(build(/*initializing=*/false));
-      codegen.DecreaseIndent();
-      codegen.EmitStructural("}");
-      return "";
-    };
-  };
-
-  // MX in-place acc (5 operands): same c_in==dst contract as make_acc_codegen,
-  // kept separate so the non-MX 3-arg helper stays untouched.
-  auto make_mx_acc_codegen = [](const std::string& pto_op) {
-    return [pto_op](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
-      auto& codegen = AsPto(codegen_base);
-      INTERNAL_CHECK_SPAN(op->args_.size() == 5, op->span_)
-          << pto_op << " requires 5 arguments: acc, lhs, lhs_scale, rhs, rhs_scale, but got "
-          << op->args_.size();
-
-      std::string dst = codegen.GetCurrentResultTarget();
-      INTERNAL_CHECK(!dst.empty()) << "Internal error: " << pto_op
-                                   << " Acc SSA must resolve (in-place c_in==dst)";
-      std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
-
-      std::ostringstream acc_inst;
-      acc_inst << pto_op << " ins(" << dst;
-      std::vector<std::string> operand_types = {dst_type};
-      for (size_t i = 1; i < op->args_.size(); ++i) {
-        acc_inst << ", " << codegen.GetExprAsCode(op->args_[i]);
-        operand_types.push_back(codegen.GetExprTypeAnnotation(op->args_[i]));
-      }
-      // Type annotations must be all present or all absent; a partial set
-      // would desync the `: t0, t1, ...` clause from operand positions.
-      const bool any_type_present = std::any_of(operand_types.begin(), operand_types.end(),
-                                                [](const std::string& t) { return !t.empty(); });
-      const bool all_types_present = std::all_of(operand_types.begin(), operand_types.end(),
-                                                 [](const std::string& t) { return !t.empty(); });
-      INTERNAL_CHECK(!any_type_present || all_types_present)
-          << "Internal error: " << pto_op
-          << " operand type annotations must all be present or all absent, got a partial set";
-      if (all_types_present) {
-        acc_inst << " : ";
-        for (size_t i = 0; i < operand_types.size(); ++i) {
-          if (i > 0) acc_inst << ", ";
-          acc_inst << operand_types[i];
-        }
-      }
-      acc_inst << ") outs(" << dst;
-      if (!dst_type.empty()) acc_inst << " : " << dst_type;
-      acc_inst << ")";
-      codegen.Emit(acc_inst.str());
-      return "";
-    };
-  };
-
-  reg("tile.matmul_acc", make_acc_codegen("pto.tmatmul.acc", "pto.tmatmul"));
-  reg("tile.gemv", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
-    return MakeGemvCodegenPTO("pto.tgemv", 2, op, codegen);
-  });
-  reg("tile.gemv_acc", make_acc_codegen("pto.tgemv.acc", "pto.tgemv"));
-  reg("tile.matmul_mx_acc", make_mx_acc_codegen("pto.tmatmul.mx.acc"));
-  reg("tile.gemv_bias", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
-    return MakeGemvCodegenPTO("pto.tgemv.bias", 3, op, codegen);
-  });
-}
-}  // namespace backend
-}  // namespace pypto
+      const std::string attrs = MatmulAttrs(op, codegen);

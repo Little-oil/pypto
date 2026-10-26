@@ -307,5 +307,488 @@ def test_default_pipeline_rejects_mismatch_after_inline_functions():
         backend.reset_for_testing()
 
 
+def _matmul_program(*, producer_phase=pl.AccPhase.Final, store_phase=pl.STPhase.Final):
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            a: pl.Tensor[[64, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ):
+            lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.MemorySpace.Mat)
+            rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            result = pl.tile.matmul(lhs, rhs, acc_phase=producer_phase)
+            result_alias = result
+            out = pl.store(result_alias, [0, 0], out, st_phase=store_phase)
+
+    return Prog
+
+
+def _matmul_acc_program(*, producer_phase=pl.AccPhase.Final, store_phase=pl.STPhase.Final):
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            a: pl.Tensor[[64, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ):
+            lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.MemorySpace.Mat)
+            rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            acc = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+            result = pl.tile.matmul_acc(acc, lhs, rhs, acc_phase=producer_phase)
+            out = pl.store(result, [0, 0], out, st_phase=store_phase)
+
+    return Prog
+
+
+@pytest.mark.parametrize("make_program", [_matmul_program, _matmul_acc_program])
+def test_matmul_final_pair_and_partial_plain_store_are_accepted(make_program):
+    assert _verify(make_program()) == []
+    assert _verify(make_program(producer_phase=pl.AccPhase.Partial, store_phase=pl.STPhase.Unspecified)) == []
+
+
+@pytest.mark.parametrize("make_program", [_matmul_program, _matmul_acc_program])
+@pytest.mark.parametrize("producer_phase", [pl.AccPhase.Unspecified, pl.AccPhase.Partial])
+def test_matmul_final_store_requires_final_producer(make_program, producer_phase):
+    diagnostics = _verify(make_program(producer_phase=producer_phase))
+    assert len(diagnostics) == 1
+    assert "unit flag that was never set" in diagnostics[0].message
+
+
+@pytest.mark.parametrize("make_program", [_matmul_program, _matmul_acc_program])
+def test_matmul_final_producer_requires_final_store(make_program):
+    diagnostics = _verify(make_program(store_phase=pl.STPhase.Unspecified))
+    assert len(diagnostics) == 1
+    assert "Use st_phase=pl.STPhase.Final" in diagnostics[0].message
+
+
+def test_matmul_final_value_cannot_be_drained_twice():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            a: pl.Tensor[[64, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ):
+            lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.MemorySpace.Mat)
+            rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            result = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final)
+            out = pl.store(result, [0, 0], out, st_phase=pl.STPhase.Final)
+            out = pl.store(result, [0, 0], out, st_phase=pl.STPhase.Final)
+
+    diagnostics = _verify(Prog)
+    assert len(diagnostics) == 1
+    assert "does not have a live matching" in diagnostics[0].message
+
+
+def test_matmul_pair_cannot_cross_a_conditional_store():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            a: pl.Tensor[[64, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            cond: pl.Scalar[pl.INDEX],
+        ):
+            lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.MemorySpace.Mat)
+            rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            result = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final)
+            if cond > 0:
+                out = pl.store(result, [0, 0], out, st_phase=pl.STPhase.Final)
+
+    diagnostics = _verify(Prog)
+    assert any("before entering an if statement" in d.message for d in diagnostics)
+
+
+def test_matmul_balanced_pairs_inside_loop_and_branch_are_accepted():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            a: pl.Tensor[[64, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            cond: pl.Scalar[pl.INDEX],
+        ):
+            for i in pl.range(3):
+                if i < cond:
+                    lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.MemorySpace.Mat)
+                    rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+                    result = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final)
+                    out = pl.store(result, [0, 0], out, st_phase=pl.STPhase.Final)
+
+    assert _verify(Prog) == []
+
+
+@pytest.mark.parametrize("drain_first", [False, True])
+def test_matmul_acc_must_not_modify_a_final_value_before_its_store(drain_first):
+    # Both programs have a balanced Final/store count. Only the ordering tells
+    # whether the in-place accumulator update waits on an uncleared unit flag.
+    @pl.program
+    class BeforeDrain:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            a: pl.Tensor[[64, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ):
+            lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.MemorySpace.Mat)
+            rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            result = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final)
+            alias = result
+            pl.tile.matmul_acc(alias, lhs, rhs, acc_phase=pl.AccPhase.Partial)
+            out = pl.store(result, [0, 0], out, st_phase=pl.STPhase.Final)
+
+    @pl.program
+    class AfterDrain:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            a: pl.Tensor[[64, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ):
+            lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.MemorySpace.Mat)
+            rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            result = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final)
+            out = pl.store(result, [0, 0], out, st_phase=pl.STPhase.Final)
+            pl.tile.matmul_acc(result, lhs, rhs, acc_phase=pl.AccPhase.Partial)
+
+    diagnostics = _verify(AfterDrain if drain_first else BeforeDrain)
+    if drain_first:
+        assert diagnostics == []
+    else:
+        assert len(diagnostics) == 1
+        assert "undrained final accumulator producer" in diagnostics[0].message
+
+
+def test_view_cannot_hide_modification_of_an_undrained_final_accumulator():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            a: pl.Tensor[[64, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+        ):
+            lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.MemorySpace.Mat)
+            rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            result = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final)
+            # This full-window slice aliases result's physical Acc. Draining
+            # the old SSA value later cannot make this intervening update safe.
+            view = pl.tile.slice(result, [64, 128], [0, 0])
+            pl.tile.matmul_acc(view, lhs, rhs, acc_phase=pl.AccPhase.Partial)
+            out = pl.store(result, [0, 0], out, st_phase=pl.STPhase.Final)
+
+    diagnostics = _verify(Prog)
+    assert len(diagnostics) == 1
+    assert "input to 'tile.slice'" in diagnostics[0].message
+    assert "undrained final accumulator producer" in diagnostics[0].message
+
+
+@pytest.mark.parametrize("alias_expr", ["seed", "pl.tile.slice(seed, [64, 128], [0, 0])"])
+@pytest.mark.parametrize("drain_first", [False, True])
+def test_alias_created_before_inplace_final_cannot_bypass_drain(alias_expr, drain_first):
+    """The earlier SSA name still addresses the storage written by Final."""
+    drain = "out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)"
+    update = "pl.tile.matmul_acc(earlier, lhs, rhs, acc_phase=pl.AccPhase.Partial)"
+    statements = [drain, update] if drain_first else [update, drain]
+    tail = "\n".join(f"        {statement}" for statement in statements)
+    program = pl.parse_program(f"""
+@pl.program
+class EarlierAlias:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        seed = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        earlier = {alias_expr}
+        final = pl.tile.matmul_acc(seed, lhs, rhs, acc_phase=pl.AccPhase.Final)
+{tail}
+""")
+    diagnostics = _verify(program)
+    if drain_first:
+        assert diagnostics == []
+    else:
+        assert len(diagnostics) == 1
+        assert "undrained final accumulator producer" in diagnostics[0].message
+
+
+def test_original_acc_input_cannot_be_used_before_final_drain():
+    program = pl.parse_program("""
+@pl.program
+class OriginalInput:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        seed = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        final = pl.tile.matmul_acc(seed, lhs, rhs, acc_phase=pl.AccPhase.Final)
+        pl.tile.matmul_acc(seed, lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
+""")
+    diagnostics = _verify(program)
+    assert len(diagnostics) == 1
+    assert "undrained final accumulator producer" in diagnostics[0].message
+
+
+def test_original_acc_input_cannot_be_plain_stored_before_final_drain():
+    program = pl.parse_program("""
+@pl.program
+class OriginalStore:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        seed = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        final = pl.tile.matmul_acc(seed, lhs, rhs, acc_phase=pl.AccPhase.Final)
+        out = pl.store(seed, [0, 0], out)
+        out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
+""")
+    diagnostics = _verify(program)
+    assert len(diagnostics) == 1
+    assert "input to 'tile.store'" in diagnostics[0].message
+
+
+def test_storage_alias_does_not_replace_exact_final_result_for_store():
+    program = pl.parse_program("""
+@pl.program
+class WrongValue:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        seed = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        final = pl.tile.matmul_acc(seed, lhs, rhs, acc_phase=pl.AccPhase.Final)
+        out = pl.store(seed, [0, 0], out, st_phase=pl.STPhase.Final)
+""")
+    diagnostics = _verify(program)
+    assert any("must consume the exact SSA value" in d.message for d in diagnostics)
+    assert any("must be consumed exactly once" in d.message for d in diagnostics)
+
+
+def test_fresh_rebinding_is_distinct_from_older_final_storage():
+    program = pl.parse_program("""
+@pl.program
+class FreshRebind:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        seed = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        final = pl.tile.matmul_acc(seed, lhs, rhs, acc_phase=pl.AccPhase.Final)
+        seed = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        pl.tile.matmul_acc(seed, lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
+""")
+    assert _verify(program) == []
+
+
+def test_loop_carried_accumulator_preserves_earlier_alias_provenance():
+    program = pl.parse_program("""
+@pl.program
+class LoopAlias:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        seed = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        earlier = seed
+        for step, (carried,) in pl.range(2, init_values=(seed,)):
+            next_acc = pl.tile.matmul_acc(carried, lhs, rhs, acc_phase=pl.AccPhase.Partial)
+            reduced = pl.yield_(next_acc)
+        final = pl.tile.matmul_acc(reduced, lhs, rhs, acc_phase=pl.AccPhase.Final)
+        pl.tile.matmul_acc(earlier, lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
+""")
+    diagnostics = _verify(program)
+    assert len(diagnostics) == 1
+    assert "undrained final accumulator producer" in diagnostics[0].message
+
+
+def test_branch_result_retains_possible_input_storage_aliases():
+    program = pl.parse_program("""
+@pl.program
+class BranchAlias:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]], choose_first: pl.Scalar[pl.BOOL]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        seed0 = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        seed1 = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        if choose_first:
+            selected = pl.yield_(seed0)
+        else:
+            selected = pl.yield_(seed1)
+        final = pl.tile.matmul_acc(selected, lhs, rhs, acc_phase=pl.AccPhase.Final)
+        pl.tile.matmul_acc(seed0, lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
+""")
+    diagnostics = _verify(program)
+    assert len(diagnostics) == 1
+    assert "undrained final accumulator producer" in diagnostics[0].message
+
+
+def test_loop_yields_account_for_aliasing_on_later_iterations():
+    # The two carries are initially distinct. The first yield makes them alias,
+    # so checking only the first iteration would accept a later wait-before-clear.
+    program = pl.parse_program("""
+@pl.program
+class LaterIterationAlias:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        seed0 = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        seed1 = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        for step, (first, second) in pl.range(2, init_values=(seed0, seed1)):
+            final = pl.tile.matmul_acc(first, lhs, rhs, acc_phase=pl.AccPhase.Final)
+            pl.tile.matmul_acc(second, lhs, rhs, acc_phase=pl.AccPhase.Partial)
+            out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
+            next_first, next_second = pl.yield_(second, second)
+""")
+    diagnostics = _verify(program)
+    assert len(diagnostics) == 1
+    assert "undrained final accumulator producer" in diagnostics[0].message
+
+
+@pytest.mark.parametrize(
+    "aliases",
+    [
+        "pair = (seed, seed)\n        earlier = pair[0]",
+        "pair = (seed, (seed, seed))\n        forwarded = pair\n"
+        "        nested = forwarded[1]\n        earlier = nested[0]",
+    ],
+    ids=["tuple", "nested_tuple_alias"],
+)
+@pytest.mark.parametrize("drain_first", [False, True])
+def test_tuple_projection_created_before_final_retains_storage(aliases, drain_first):
+    drain = "out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)"
+    update = "pl.tile.matmul_acc(earlier, lhs, rhs, acc_phase=pl.AccPhase.Partial)"
+    statements = [drain, update] if drain_first else [update, drain]
+    tail = "\n".join(f"        {statement}" for statement in statements)
+    program = pl.parse_program(f"""
+@pl.program
+class TupleAlias:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        seed = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        {aliases}
+        final = pl.tile.matmul_acc(seed, lhs, rhs, acc_phase=pl.AccPhase.Final)
+{tail}
+""")
+    diagnostics = _verify(program)
+    if drain_first:
+        assert diagnostics == []
+    else:
+        assert len(diagnostics) == 1
+        assert "undrained final accumulator producer" in diagnostics[0].message
+
+
+@pytest.mark.parametrize("final_phase", [False, True])
+def test_unresolved_tile_tuple_carry_is_rejected_only_with_final_protocol(final_phase):
+    phase = "Final" if final_phase else "Partial"
+    store_phase = "Final" if final_phase else "Unspecified"
+    program = pl.parse_program(f"""
+@pl.program
+class TupleCarry:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        seed = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        pair = (seed, seed)
+        for step, (carried,) in pl.range(2, init_values=(pair,)):
+            result_pair = pl.yield_(carried)
+        earlier = result_pair[0]
+        final = pl.tile.matmul_acc(seed, lhs, rhs, acc_phase=pl.AccPhase.{phase})
+        pl.tile.matmul_acc(earlier, lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.{store_phase})
+""")
+    diagnostics = _verify(program)
+    if final_phase:
+        assert len(diagnostics) == 1
+        assert "unresolved tile-bearing tuple provenance" in diagnostics[0].message
+        assert "Unpack the tiles" in diagnostics[0].message
+    else:
+        assert diagnostics == []
+
+
+def test_scalar_tuple_carry_does_not_restrict_final_accumulator_protocol():
+    program = pl.parse_program("""
+@pl.program
+class ScalarTupleCarry:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        pair = (1, 2)
+        for step, (carried,) in pl.range(2, init_values=(pair,)):
+            result_pair = pl.yield_(carried)
+        final = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final)
+        out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
+""")
+    assert _verify(program) == []
+
+
+def test_registered_fresh_multioutput_tuple_does_not_restrict_final_protocol():
+    """Fresh builtin outputs cannot alias an unrelated Cube accumulator."""
+    program = pl.parse_program("""
+@pl.program
+class FreshTupleOutputs:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               q: pl.Tensor[[64, 128], pl.FP16], out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        qvec = pl.load(q, [0, 0], [64, 128], target_memory=pl.Mem.Vec)
+        quantized, scales = pl.tile.quant_mx(qvec, group_axis=1)
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        final = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final)
+        out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
+""")
+    assert _verify(program) == []
+
+
+def test_tuple_projection_cannot_replace_exact_final_value_for_store():
+    program = pl.parse_program("""
+@pl.program
+class FinalTupleProjection:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        final = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final)
+        pair = (final, final)
+        out = pl.store(pair[0], [0, 0], out, st_phase=pl.STPhase.Final)
+""")
+    diagnostics = _verify(program)
+    assert any("must consume the exact SSA value" in d.message for d in diagnostics)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

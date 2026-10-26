@@ -194,6 +194,70 @@ def test_runtime_predicate_branches_over_both_forms():
     )
 
 
+@pytest.mark.parametrize("phase", [pl.AccPhase.Unspecified, pl.AccPhase.Partial, pl.AccPhase.Final])
+@pytest.mark.parametrize("init_cond", [None, True, False], ids=["accumulate", "initialize", "keep"])
+def test_matmul_acc_literal_init_cond_preserves_phase(phase, init_cond):
+    """Folding init_cond must keep the phase on the selected MAD instruction."""
+    store_phase = pl.STPhase.Final if phase == pl.AccPhase.Final else pl.STPhase.Unspecified
+
+    @pl.program
+    class PhasedInitCond:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            lhs: pl.Tensor[[16, 16], pl.FP32],
+            rhs: pl.Tensor[[16, 16], pl.FP32],
+            output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            a = pl.load(lhs, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            b = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            acc = pl.tile.create([16, 16], pl.FP32, target_memory=pl.Mem.Acc)
+            result = pl.tile.matmul_acc(acc, a, b, init_cond=init_cond, acc_phase=phase)
+            return pl.store(result, [0, 0], output, st_phase=store_phase)
+
+    mlir = _generate_default_mlir(PhasedInitCond)
+    matmul_lines = [line for line in mlir.splitlines() if "pto.tmatmul" in line]
+    assert len(matmul_lines) == 1, mlir
+    assert ("pto.tmatmul.acc" in matmul_lines[0]) == (init_cond is not True)
+    assert "scf.if" not in mlir, mlir
+    if phase == pl.AccPhase.Unspecified:
+        assert "accPhase" not in matmul_lines[0]
+    else:
+        assert f"#pto<acc_phase {phase.name.lower()}>" in matmul_lines[0]
+    assert ("#pto<st_phase final>" in mlir) == (phase == pl.AccPhase.Final)
+
+
+@pytest.mark.parametrize("phase", [pl.AccPhase.Partial, pl.AccPhase.Final])
+def test_matmul_acc_runtime_init_cond_preserves_phase_on_both_arms(phase):
+    """Both runtime branches execute the same producer-side unit-flag protocol."""
+    store_phase = pl.STPhase.Final if phase == pl.AccPhase.Final else pl.STPhase.Unspecified
+
+    @pl.program
+    class PhasedRuntimeInitCond:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            lhs: pl.Tensor[[16, 16], pl.FP32],
+            rhs: pl.Tensor[[16, 16], pl.FP32],
+            output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            reset: pl.Scalar[pl.BOOL],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            a = pl.load(lhs, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            b = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
+            acc = pl.tile.create([16, 16], pl.FP32, target_memory=pl.Mem.Acc)
+            result = pl.tile.matmul_acc(acc, a, b, reset, acc_phase=phase)
+            return pl.store(result, [0, 0], output, st_phase=store_phase)
+
+    mlir = _generate_default_mlir(PhasedRuntimeInitCond)
+    matmul_lines = [line for line in mlir.splitlines() if "pto.tmatmul" in line]
+    assert len(matmul_lines) == 2, mlir
+    assert any("pto.tmatmul ins(" in line for line in matmul_lines)
+    assert any("pto.tmatmul.acc ins(" in line for line in matmul_lines)
+    assert all(f"#pto<acc_phase {phase.name.lower()}>" in line for line in matmul_lines)
+    assert "scf.if" in mlir and "= scf.if" not in mlir, mlir
+    assert ("#pto<st_phase final>" in mlir) == (phase == pl.AccPhase.Final)
+
+
 def test_non_boolean_init_cond_is_rejected():
     with pytest.raises(InvalidOperationError, match="init_cond to have dtype BOOL"):
 
