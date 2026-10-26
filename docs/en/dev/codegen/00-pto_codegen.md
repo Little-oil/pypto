@@ -217,6 +217,13 @@ shape without copying the parent's stride or start offset. Backend codegen also 
   so use `tile.fillpad` on the slice result if zero/min/max padding is
   required.
 
+Non-contiguous slice windows have no usable lazy-extract destination, so codegen
+omits their unused private tile declaration and retains the subview SSA. This
+also permits narrow views whose own flat allocation would violate the 32-byte
+granularity. Plain aliases of the same typed MemRef window follow that view SSA
+to preserve its parent stride. Contiguous or unknown windows retain the existing
+allocation used by lazy materialization.
+
 For `tile.assemble`, the leading `pto.tmov target → dst` is only emitted
 when buffer reuse did not collapse `target` and the destination buffer; in
 that case it preserves any data outside the insertion window. ND (`row_major`,

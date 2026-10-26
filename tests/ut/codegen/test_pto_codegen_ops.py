@@ -2371,6 +2371,52 @@ class TestTileSliceCodegen:
         assert "sizes [16, 16]" in line, f"sizes attribute must be [16, 16], got:\n{line}"
         assert "rows=16, cols=16" in line, f"result tile_buf must carry rows=16, cols=16, got:\n{line}"
 
+    @pytest.mark.ptoas_compile
+    @pytest.mark.parametrize("dtype", [pl.FP32, pl.INT32])
+    @pytest.mark.parametrize("use_alias", [False, True], ids=["direct", "plain-alias"])
+    def test_aligned_vec_column_subview_compiles_without_private_allocation(self, tmp_path, dtype, use_alias):
+        """An aligned column is a view of its parent's physical row stride.
+
+        Its inherited row-major [16, 1] config is legal as a subview, but an
+        independent allocation of that shape has a four-byte contiguous axis
+        and violates the ISA's 32-byte allocation granularity.
+        """
+
+        @pl.program
+        class AlignedColumn:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 8], dtype],
+                dst: pl.Out[pl.Tensor[[16, 1], dtype]],
+            ) -> pl.Tensor[[16, 1], dtype]:
+                local = pl.load(src, [0, 0], [16, 8])
+                column = pl.tile.slice(local, [16, 1], [0, 0])
+                return pl.store(column, [0, 0], dst)
+
+        @pl.program
+        class AlignedColumnAlias:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 8], dtype],
+                dst: pl.Out[pl.Tensor[[16, 1], dtype]],
+            ) -> pl.Tensor[[16, 1], dtype]:
+                local = pl.load(src, [0, 0], [16, 8])
+                column = pl.tile.slice(local, [16, 1], [0, 0])
+                alias = column
+                return pl.store(alias, [0, 0], dst)
+
+        mlir = self._generate_mlir(AlignedColumnAlias if use_alias else AlignedColumn)
+        assert "pto.subview " in mlir, mlir
+        assert "pto.textract " not in mlir and "pto.tmov " not in mlir, mlir
+        if find_ptoas_binary() is None:
+            pytest.skip("PTOAS is not available")
+        cpp = pto_backend._compile_pto_module(mlir, "kernel", str(tmp_path))
+        # The source is the only allocation; the column only supplies a view.
+        assert mlir.count("pto.alloc_tile ") == 1, mlir
+        assert "TSTORE(" in cpp, cpp
+
     def test_unaligned_vec_column_slice_into_muls_uses_aligned_extract(self):
         """Regression for #1789: an FP32 column subview at offset 1 starts four
         bytes past its source allocation and must not feed ``pto.tmuls``

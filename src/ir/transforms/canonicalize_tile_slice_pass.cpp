@@ -1065,10 +1065,15 @@ class CanonicalizeMutator : public IRMutator {
     if (op && op->var_) {
       auto planned = definition_site_extracts_.find(op->var_.get());
       if (planned != definition_site_extracts_.end()) {
+        // Planning precedes SSA/type rewrites. Earlier materialized slices can
+        // retype aliases or loop carries used by this extract, so substitute
+        // those definitions before returning the planned assignment.
+        auto rewritten = As<AssignStmt>(IRMutator::VisitStmt_(planned->second));
+        rewritten = BindResultType(planned->second, rewritten);
         // Every later reference to the slice now reads the extract. SSA puts
         // the definition before its uses, so the remap is in place in time.
-        var_remap_[op->var_.get()] = planned->second->var_;
-        return planned->second;
+        var_remap_[op->var_.get()] = rewritten->var_;
+        return rewritten;
       }
     }
     auto base = IRMutator::VisitStmt_(op);

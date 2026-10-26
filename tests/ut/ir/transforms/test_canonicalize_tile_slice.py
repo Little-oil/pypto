@@ -1714,6 +1714,87 @@ class TestVecExtractPlacement:
         ir.assert_structural_equal(_run_pass(Before), Expected)
 
 
+class TestPlannedExtractSourceRemapping:
+    """Extract plans must use definitions retyped during the actual rewrite."""
+
+    def test_planned_extract_uses_retyped_alias(self):
+        """The second plan cannot retain the alias's original SSA identity.
+
+        Materializing head changes its borrowed row-major column to a dense
+        column-major tile, so the alias is replaced with a newly typed Var.
+        The later preplanned extract must read that replacement.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                out: pl.Out[pl.Tensor[[8, 1], pl.FP32]],
+            ) -> pl.Tensor[[8, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                head = pl.tile.slice(local, [16, 1], [0, 1])
+                alias = head
+                tail = pl.tile.slice(alias, [8, 1], [1, 0])
+                stored = pl.store(tail, [0, 0], out)
+                return stored
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                out: pl.Out[pl.Tensor[[8, 1], pl.FP32]],
+            ) -> pl.Tensor[[8, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                head_ext = pl.tile.extract(local, 0, 1, shape=[16, 1], target_memory=pl.Mem.Vec)
+                alias = head_ext
+                tail_ext = pl.tile.extract(alias, 1, 0, shape=[8, 1], target_memory=pl.Mem.Vec)
+                stored = pl.store(tail_ext, [0, 0], out)
+                return stored
+
+        ir.assert_structural_equal(_run_pass(Before), Expected)
+
+    def test_planned_extract_uses_retyped_loop_argument(self):
+        """A plan inside a loop must read the carry rebuilt from its extract init."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                out: pl.Out[pl.Tensor[[8, 1], pl.FP32]],
+            ) -> pl.Tensor[[8, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                head = pl.tile.slice(local, [16, 1], [0, 1])
+                for _i, (carried, output) in pl.range(2, init_values=(head, out)):
+                    tail = pl.tile.slice(carried, [8, 1], [1, 0])
+                    stored = pl.store(tail, [0, 0], output)
+                    _final_head, result = pl.yield_(carried, stored)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 8], pl.FP32],
+                out: pl.Out[pl.Tensor[[8, 1], pl.FP32]],
+            ) -> pl.Tensor[[8, 1], pl.FP32]:
+                local = pl.tile.load(x, [0, 0], [16, 8], target_memory=pl.Mem.Vec)
+                head_ext = pl.tile.extract(local, 0, 1, shape=[16, 1], target_memory=pl.Mem.Vec)
+                for _i, (carried, output) in pl.range(2, init_values=(head_ext, out)):
+                    tail_ext = pl.tile.extract(carried, 1, 0, shape=[8, 1], target_memory=pl.Mem.Vec)
+                    stored = pl.store(tail_ext, [0, 0], output)
+                    _final_head, result = pl.yield_(carried, stored)
+                return result
+
+        ir.assert_structural_equal(_run_pass(Before), Expected)
+
+
 class TestNoOp:
     """Cases the pass must leave untouched."""
 

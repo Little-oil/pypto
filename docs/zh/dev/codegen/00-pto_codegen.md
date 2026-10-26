@@ -203,6 +203,11 @@ print(pto_code)
 - `pad` 必须为 `PadValue::null`——`pto.subview` 是视图而不是 fillpad；如果
   需要 zero/min/max 填充，请在切出来的子 tile 上再调用 `tile.fillpad`。
 
+非连续切片无法使用延迟 extract 的目标缓冲，因此 codegen 省略其无用的私有
+tile 声明，保留 subview SSA。这也允许独立分配时不满足 32 字节粒度的窄视图。
+共享同一内存窗口且类型签名一致的普通别名直接沿用该视图 SSA，保留父 Tile 的
+步长。连续或无法证明的窗口仍保留延迟物化所需的原有分配。
+
 对 `tile.assemble`，前置的 `pto.tmov target → dst` 仅在缓冲复用未把
 `target` 与目标缓冲合并时才会发出，用于保留写入窗口外的数据。ND（`row_major`、
 `none_box`）布局下的 FP32、FP16 和 BF16 Vec-to-Vec 复制使用
