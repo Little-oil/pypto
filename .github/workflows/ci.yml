@@ -1065,9 +1065,6 @@ jobs:
         # under the base interpreter, which cannot see the venv-installed pypto.
         run: |
           source activate.sh
-          # Use an empty search root so codegen-only never picks a host PATH
-          # assembler for its JIT fingerprint. This job performs no assembly.
-          export PTOAS_ROOT="$RUNNER_TEMP/pypto-codegen-only/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           python -m pytest tests/st/codegen -v --codegen-only \
             --ignore=tests/st/codegen/torch/test_torch_codegen_paged_attention.py
 
