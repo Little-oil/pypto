@@ -56,6 +56,7 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/phase.h"
 #include "pypto/ir/program.h"
@@ -83,14 +84,17 @@ using StorageId = size_t;
 ///
 /// Complete this index before checking tokens: loop init/yield/return values
 /// may alias on a later iteration even when their initial values are distinct.
-/// Control-region rebindings are conservatively merged rather than copying a
-/// whole environment per branch. Union by rank bounds work by O(N log N),
-/// including deeply nested control flow; ordinary straight-line fresh values
-/// stay distinct.
+/// Loop-carried storage identities and possible branch sources use separate
+/// union-by-rank forests. A choice connects its candidates without identifying
+/// the candidates with each other; concrete Acc buffers stay independently
+/// usable. Both forests have O(N log N) total work and O(N) space.
 class AccumulatorStorageLineage : public IRVisitor {
  public:
   void Build(const StmtPtr& body) { VisitStmt(body); }
   bool HasUnresolvedTupleProvenance() const { return unresolved_tuple_; }
+
+  StorageId AliasGroup(StorageId storage) { return Find(group_parents_, storage); }
+  bool IsAmbiguous(StorageId storage) { return ambiguous_[Find(parents_, storage)]; }
 
   std::optional<StorageId> Argument(const CallPtr& call, size_t index) {
     const auto found = calls_.find(call.get());
@@ -127,8 +131,8 @@ class AccumulatorStorageLineage : public IRVisitor {
         continue;
       }
       auto storage = i < then_values.size() ? then_values[i] : std::nullopt;
-      if (i < else_values.size()) storage = Merge(storage, else_values[i]);
-      if (!statement->else_body_) storage = Merge(storage, Value(statement->return_vars_[i]));
+      if (i < else_values.size()) storage = Choice(storage, else_values[i]);
+      if (!statement->else_body_) storage = Choice(storage, Value(statement->return_vars_[i]));
       Bind(statement->return_vars_[i], storage);
     }
   }
@@ -151,7 +155,7 @@ class AccumulatorStorageLineage : public IRVisitor {
       if (yields_.empty()) continue;
       auto& values = yields_.back();
       if (values.size() <= i) values.resize(i + 1);
-      values[i] = Merge(values[i], storage);
+      values[i] = Choice(values[i], storage);
     }
   }
 
@@ -167,37 +171,40 @@ class AccumulatorStorageLineage : public IRVisitor {
   struct TupleStorage {
     std::vector<std::shared_ptr<const TupleStorage>> elements;
     std::optional<StorageId> storage;
-    bool contains_tiles = false;
+    bool may_contain_accumulator = false;
   };
   using TupleStoragePtr = std::shared_ptr<const TupleStorage>;
 
-  bool ContainsTile(const TypePtr& type) {
-    const auto cached = tile_types_.find(type.get());
-    if (cached != tile_types_.end()) return cached->second;
-    bool contains = As<TileType>(type) != nullptr;
+  bool MayContainAccumulator(const TypePtr& type) {
+    const auto cached = accumulator_types_.find(type.get());
+    if (cached != accumulator_types_.end()) return cached->second;
+    const auto tile = As<TileType>(type);
+    // Known Mat/Vec/operand tiles cannot alias an Acc buffer. An unresolved
+    // memory space remains conservative until memory inference establishes it.
+    bool contains = tile && (!tile->GetMemorySpace() || tile->GetMemorySpace() == MemorySpace::Acc);
     if (const auto tuple = As<TupleType>(type)) {
-      for (const auto& element : tuple->types_) contains |= ContainsTile(element);
+      for (const auto& element : tuple->types_) contains |= MayContainAccumulator(element);
     }
-    tile_types_.emplace(type.get(), contains);
+    accumulator_types_.emplace(type.get(), contains);
     return contains;
   }
 
-  void MarkUnresolvedTuple(const TypePtr& type) { unresolved_tuple_ |= ContainsTile(type); }
+  void MarkUnresolvedTuple(const TypePtr& type) { unresolved_tuple_ |= MayContainAccumulator(type); }
 
   TupleStoragePtr UnknownTuple(const TypePtr& type) {
     MarkUnresolvedTuple(type);
-    return std::make_shared<TupleStorage>(TupleStorage{{}, std::nullopt, ContainsTile(type)});
+    return std::make_shared<TupleStorage>(TupleStorage{{}, std::nullopt, MayContainAccumulator(type)});
   }
 
   TupleStoragePtr FreshTuple(const TypePtr& type) {
     TupleStorage value;
     if (As<TileType>(type)) {
       value.storage = Fresh();
-      value.contains_tiles = true;
+      value.may_contain_accumulator = MayContainAccumulator(type);
     } else if (const auto tuple = As<TupleType>(type)) {
       for (const auto& element : tuple->types_) {
         auto child = FreshTuple(element);
-        value.contains_tiles |= child->contains_tiles;
+        value.may_contain_accumulator |= child->may_contain_accumulator;
         value.elements.push_back(std::move(child));
       }
     }
@@ -207,7 +214,7 @@ class AccumulatorStorageLineage : public IRVisitor {
   void BindTuple(const VarPtr& var, const TupleStoragePtr& tuple) {
     const auto old = tuple_variables_.find(var.get());
     if (!yields_.empty() && old != tuple_variables_.end() && old->second != tuple &&
-        (old->second->contains_tiles || tuple->contains_tiles)) {
+        (old->second->may_contain_accumulator || tuple->may_contain_accumulator)) {
       // Joining different tuple trees would require a separate tuple CFG
       // analysis. Reject this case only if a Final protocol is actually used.
       unresolved_tuple_ = true;
@@ -240,9 +247,10 @@ class AccumulatorStorageLineage : public IRVisitor {
           provenance = Tuple(element);
         } else {
           const auto storage = Value(element);
-          provenance = std::make_shared<TupleStorage>(TupleStorage{{}, storage, storage.has_value()});
+          provenance = std::make_shared<TupleStorage>(
+              TupleStorage{{}, storage, MayContainAccumulator(element->GetType())});
         }
-        result.contains_tiles |= provenance->contains_tiles;
+        result.may_contain_accumulator |= provenance->may_contain_accumulator;
         result.elements.push_back(std::move(provenance));
       }
       return std::make_shared<TupleStorage>(std::move(result));
@@ -272,17 +280,49 @@ class AccumulatorStorageLineage : public IRVisitor {
     const auto id = parents_.size();
     parents_.push_back(id);
     ranks_.push_back(0);
+    group_parents_.push_back(id);
+    group_ranks_.push_back(0);
+    ambiguous_.push_back(false);
+    return id;
+  }
+
+  static StorageId Find(std::vector<StorageId>& parents, StorageId id) {
+    while (parents[id] != id) {
+      parents[id] = parents[parents[id]];
+      id = parents[id];
+    }
     return id;
   }
 
   std::optional<StorageId> Root(std::optional<StorageId> storage) {
-    if (!storage) return std::nullopt;
-    auto id = *storage;
-    while (parents_[id] != id) {
-      parents_[id] = parents_[parents_[id]];
-      id = parents_[id];
-    }
-    return id;
+    return storage ? std::make_optional(Find(parents_, *storage)) : std::nullopt;
+  }
+
+  static StorageId Unite(std::vector<StorageId>& parents, std::vector<size_t>& ranks, StorageId lhs,
+                         StorageId rhs) {
+    lhs = Find(parents, lhs);
+    rhs = Find(parents, rhs);
+    if (lhs == rhs) return lhs;
+    if (ranks[lhs] < ranks[rhs]) std::swap(lhs, rhs);
+    parents[rhs] = lhs;
+    if (ranks[lhs] == ranks[rhs]) ++ranks[lhs];
+    return lhs;
+  }
+
+  void ConnectChoices(StorageId lhs, StorageId rhs) {
+    static_cast<void>(Unite(group_parents_, group_ranks_, lhs, rhs));
+  }
+
+  std::optional<StorageId> Choice(std::optional<StorageId> lhs, std::optional<StorageId> rhs) {
+    lhs = Root(lhs);
+    rhs = Root(rhs);
+    if (!lhs) return rhs;
+    if (!rhs || lhs == rhs) return lhs;
+    const auto choice = Fresh();
+    ambiguous_[choice] = true;
+    ConnectChoices(choice, *lhs);
+    ConnectChoices(choice, *rhs);
+    return choice;
   }
 
   std::optional<StorageId> Merge(std::optional<StorageId> lhs, std::optional<StorageId> rhs) {
@@ -290,18 +330,21 @@ class AccumulatorStorageLineage : public IRVisitor {
     rhs = Root(rhs);
     if (!lhs) return rhs;
     if (!rhs || lhs == rhs) return lhs;
-    if (ranks_[*lhs] < ranks_[*rhs]) std::swap(lhs, rhs);
-    parents_[*rhs] = *lhs;
-    if (ranks_[*lhs] == ranks_[*rhs]) ++ranks_[*lhs];
-    return lhs;
+    // Loop carries can name the yielded storage on a later iteration. Update
+    // earlier call operands through the identity forest before token checking.
+    ConnectChoices(*lhs, *rhs);
+    const bool ambiguous = ambiguous_[*lhs] || ambiguous_[*rhs];
+    const auto root = Unite(parents_, ranks_, *lhs, *rhs);
+    ambiguous_[root] = ambiguous;
+    return root;
   }
 
   void Bind(const VarPtr& var, std::optional<StorageId> storage) {
     if (!var || !As<TileType>(var->GetType()) || !storage) return;
     const auto old = variables_.find(var.get());
-    // In pre-SSA control flow either binding may reach a subsequent use. Merge
-    // that ambiguity conservatively; a straight-line fresh rebind stays fresh.
-    if (!yields_.empty() && old != variables_.end()) storage = Merge(old->second, storage);
+    // A rebind changes this name's candidates without changing earlier aliases
+    // of either source. Loop init/yield identities are joined separately.
+    if (!yields_.empty() && old != variables_.end()) storage = Choice(old->second, storage);
     if (storage.has_value()) {
       variables_[var.get()] = *storage;
     } else {
@@ -351,9 +394,9 @@ class AccumulatorStorageLineage : public IRVisitor {
         // A shared expression can occur more than once in hand-built IR.
         // Conservatively retain every operand/storage interpretation.
         for (size_t i = 0; i < storage.args.size(); ++i) {
-          position->second.args[i] = Merge(position->second.args[i], storage.args[i]);
+          position->second.args[i] = Choice(position->second.args[i], storage.args[i]);
         }
-        position->second.result = Merge(position->second.result, storage.result);
+        position->second.result = Choice(position->second.result, storage.result);
       }
       return position->second.result;
     }
@@ -391,12 +434,15 @@ class AccumulatorStorageLineage : public IRVisitor {
 
   std::vector<StorageId> parents_;
   std::vector<size_t> ranks_;
+  std::vector<StorageId> group_parents_;
+  std::vector<size_t> group_ranks_;
+  std::vector<bool> ambiguous_;
   std::unordered_map<const Var*, StorageId> variables_;
   std::unordered_map<const Call*, CallStorage> calls_;
   std::vector<std::vector<std::optional<StorageId>>> yields_;
   std::unordered_map<const Var*, TupleStoragePtr> tuple_variables_;
   std::unordered_map<const Call*, TupleStoragePtr> call_tuples_;
-  std::unordered_map<const Type*, bool> tile_types_;
+  std::unordered_map<const Type*, bool> accumulator_types_;
   bool unresolved_tuple_ = false;
 };
 
@@ -432,7 +478,7 @@ class AccStorePhaseVisitor : public IRVisitor {
       : diagnostics_(diagnostics), func_name_(std::move(func_name)) {}
 
   void Run(const StmtPtr& body) {
-    if (body) storage_.Build(body);
+    body_ = body;
     if (body) VisitStmt(body);
     FlushPending("before leaving function '" + func_name_ + "'");
   }
@@ -574,6 +620,14 @@ class AccStorePhaseVisitor : public IRVisitor {
       return std::nullopt;
     }
 
+    const bool is_final = IsFinalAccumulatorProducer(call);
+    if (is_final && !storage_built_) {
+      // Build the whole index once, including aliases before this producer and
+      // later loop yields. Unphased functions never allocate this analysis.
+      storage_.Build(body_);
+      storage_built_ = true;
+    }
+
     for (size_t i = 0; i < call->args_.size(); ++i) {
       static_cast<void>(ProcessValue(call->args_[i]));
       // Only a bare alias may carry an undrained Final value to its store.
@@ -582,14 +636,15 @@ class AccStorePhaseVisitor : public IRVisitor {
       // only the supported accumulating op names would miss that alias escape.
       CheckUndrainedStorage(call, storage_.Argument(call, i));
     }
-    if (!IsFinalAccumulatorProducer(call)) return std::nullopt;
+    if (!is_final) return std::nullopt;
 
     if (storage_.HasUnresolvedTupleProvenance() && !tuple_provenance_reported_) {
       tuple_provenance_reported_ = true;
       diagnostics_.emplace_back(
           DiagnosticSeverity::Error, "AccStorePhaseValid", /*error_code=*/7,
           "Final accumulator protocol in function '" + func_name_ +
-              "' has unresolved tile-bearing tuple provenance across a control-flow join, loop carry, "
+              "' has unresolved tile-bearing tuple provenance that may contain Acc storage across a "
+              "control-flow join, loop carry, "
               "or opaque tuple value. Unpack the tiles into separate aliases or tile iter_args so "
               "the compiler can verify that every accumulator is drained before storage reuse.",
           call->span_);
@@ -599,7 +654,15 @@ class AccStorePhaseVisitor : public IRVisitor {
     const auto storage = storage_.Result(call);
     producers_.push_back(FinalProducer{call->op_->name_, call->span_, storage});
     pending_.insert(token);
-    if (storage) pending_storage_[*storage].insert(token);
+    if (storage) {
+      auto& pending = pending_storage_[storage_.AliasGroup(*storage)];
+      pending.all.insert(token);
+      if (storage_.IsAmbiguous(*storage)) {
+        pending.ambiguous.insert(token);
+      } else {
+        pending.concrete[*storage].insert(token);
+      }
+    }
     return token;
   }
 
@@ -609,9 +672,17 @@ class AccStorePhaseVisitor : public IRVisitor {
 
   void CheckUndrainedStorage(const CallPtr& call, std::optional<StorageId> storage) {
     if (!storage) return;
-    const auto pending = pending_storage_.find(*storage);
+    const auto pending = pending_storage_.find(storage_.AliasGroup(*storage));
     if (pending == pending_storage_.end()) return;
-    if (!unsafe_use_reported_.insert(*pending->second.begin()).second) return;
+    const auto& aliases = pending->second;
+    const auto concrete = aliases.concrete.find(*storage);
+    const auto* tokens = &aliases.ambiguous;
+    if (storage_.IsAmbiguous(*storage)) {
+      tokens = &aliases.all;
+    } else if (concrete != aliases.concrete.end()) {
+      tokens = &concrete->second;
+    }
+    if (tokens->empty() || !unsafe_use_reported_.insert(*tokens->begin()).second) return;
     // Diagnose the first unsafe use; aliases of that use must not create a
     // cascade. Keep the obligation live so a later missing drain is still seen.
     diagnostics_.emplace_back(
@@ -628,11 +699,21 @@ class AccStorePhaseVisitor : public IRVisitor {
   bool ConsumePending(TokenId token) {
     if (pending_.erase(token) == 0) return false;
     if (const auto storage = producers_[token].storage) {
-      const auto pending = pending_storage_.find(*storage);
+      const auto pending = pending_storage_.find(storage_.AliasGroup(*storage));
       INTERNAL_CHECK_SPAN(pending != pending_storage_.end(), producers_[token].span)
           << "Internal error: live Final token has no pending storage entry";
-      pending->second.erase(token);
-      if (pending->second.empty()) pending_storage_.erase(pending);
+      auto& aliases = pending->second;
+      aliases.all.erase(token);
+      if (storage_.IsAmbiguous(*storage)) {
+        aliases.ambiguous.erase(token);
+      } else {
+        auto concrete = aliases.concrete.find(*storage);
+        INTERNAL_CHECK_SPAN(concrete != aliases.concrete.end(), producers_[token].span)
+            << "Internal error: concrete Final token has no storage entry";
+        concrete->second.erase(token);
+        if (concrete->second.empty()) aliases.concrete.erase(concrete);
+      }
+      if (aliases.all.empty()) pending_storage_.erase(pending);
     }
     return true;
   }
@@ -738,11 +819,18 @@ class AccStorePhaseVisitor : public IRVisitor {
   std::set<TokenId> pending_;
   std::set<TokenId> reported_;
   std::unordered_map<const Var*, TokenId> var_tokens_;
+  StmtPtr body_;
+  bool storage_built_ = false;
   AccumulatorStorageLineage storage_;
-  // Conservative lineage can merge several fresh producers in a region. Each
-  // exact-value drain removes only its own token; another live Final must keep
-  // the storage guarded. Entries are removed only when their token set is empty.
-  std::unordered_map<StorageId, std::set<TokenId>> pending_storage_;
+  struct PendingStorage {
+    // An ambiguous access checks the whole candidate group. A concrete access
+    // checks its own storage plus ambiguous producers, preserving independence
+    // of concrete Acc buffers that merely participate in the same selection.
+    std::set<TokenId> all;
+    std::set<TokenId> ambiguous;
+    std::unordered_map<StorageId, std::set<TokenId>> concrete;
+  };
+  std::unordered_map<StorageId, PendingStorage> pending_storage_;
   std::set<TokenId> unsafe_use_reported_;
   bool tuple_provenance_reported_ = false;
 };

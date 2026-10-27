@@ -844,5 +844,136 @@ class MergedFinalTokens:
         assert "undrained final accumulator producer" in diagnostics[0].message
 
 
+@pytest.mark.parametrize("producer", ["matmul", "gemv"])
+@pytest.mark.parametrize("chained_choice", [False, True])
+@pytest.mark.parametrize("access", ["independent", "selected_consumer", "selected_producer"])
+def test_branch_choices_preserve_independent_accumulators(producer, chained_choice, access):
+    # A selection may refer to either source; it does not make the two source
+    # allocations alias. Reads/writes through the selection still need a guard.
+    rows, dtype = (64, "BF16") if producer == "matmul" else (1, "FP32")
+    extra = (
+        """
+        if choose_first:
+            selected_again = pl.yield_(selected)
+        else:
+            selected_again = pl.yield_(seed1)
+        selected = selected_again
+"""
+        if chained_choice
+        else ""
+    )
+    acc = f"pl.tile.{producer}_acc"
+    if access == "independent":
+        body = f"""
+        final0 = {acc}(seed0, lhs, rhs, acc_phase=pl.AccPhase.Final)
+        final1 = {acc}(seed1, lhs, rhs, acc_phase=pl.AccPhase.Final)
+        out = pl.store(final0, [0, 0], out, st_phase=pl.STPhase.Final)
+        out = pl.store(final1, [0, 0], out, st_phase=pl.STPhase.Final)
+"""
+    else:
+        final_source = "selected" if access == "selected_producer" else "seed0"
+        consumer_source = "seed0" if access == "selected_producer" else "selected"
+        body = f"""
+        final = {acc}({final_source}, lhs, rhs, acc_phase=pl.AccPhase.Final)
+        {acc}({consumer_source}, lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
+"""
+    program = pl.parse_program(f"""
+@pl.program
+class IndependentChoices:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[{rows}, 128], pl.{dtype}], b: pl.Tensor[[128, 128], pl.{dtype}],
+               out: pl.Out[pl.Tensor[[{rows}, 128], pl.FP32]],
+               tmp: pl.Out[pl.Tensor[[{rows}, 128], pl.FP32]], choose_first: pl.Scalar[pl.BOOL]):
+        lhs = pl.load(a, [0, 0], [{rows}, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        seed0 = pl.tile.{producer}(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        seed1 = pl.tile.{producer}(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        if choose_first:
+            selected = pl.yield_(seed0)
+        else:
+            selected = pl.yield_(seed1)
+{extra}
+        tmp = pl.store(selected, [0, 0], tmp)
+{body}
+""")
+    diagnostics = _verify(program)
+    if access == "independent":
+        assert diagnostics == []
+    else:
+        assert len(diagnostics) == 1
+        assert "undrained final accumulator producer" in diagnostics[0].message
+
+
+@pytest.mark.parametrize("space", ["Mat", "Vec", "Acc", None])
+@pytest.mark.parametrize("tuple_flow", ["loop", "rebind"])
+@pytest.mark.parametrize("final_phase", [False, True])
+def test_unrelated_tuple_provenance_only_restricts_possible_acc_storage(space, tuple_flow, final_phase):
+    # Known non-Acc tiles cannot share the producer's unit flags. Acc tuple
+    # control provenance remains conservative, and default kernels stay legal.
+    flow = (
+        """
+        for step, (carried,) in pl.range(2, init_values=(pair,)):
+            ignored = pl.yield_(carried)
+"""
+        if tuple_flow == "loop"
+        else """
+        if choose_first:
+            pair = (unrelated, (unrelated, 1))
+"""
+    )
+    phase = "Final" if final_phase else "Unspecified"
+    allocation = (
+        f"pl.tile.create([16, 16], pl.FP32, target_memory=pl.Mem.{space})" if space else "unknown_space"
+    )
+    program = pl.parse_program(f"""
+@pl.program
+class UnrelatedTuple:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]], choose_first: pl.Scalar[pl.BOOL],
+               unknown_space: pl.Tile[[16, 16], pl.FP32]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        unrelated = {allocation}
+        pair = (unrelated, (unrelated, 1))
+{flow}
+        final = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.{phase})
+        out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.{phase})
+""")
+    diagnostics = _verify(program)
+    if final_phase and space in ("Acc", None):
+        assert len(diagnostics) == 1
+        assert "unresolved tile-bearing tuple provenance" in diagnostics[0].message
+    else:
+        assert diagnostics == []
+
+
+@pytest.mark.parametrize(
+    "producer_phase, store_phase",
+    [("Unspecified", "Unspecified"), ("Unspecified", "Final"), ("Final", "Final")],
+)
+def test_lazy_storage_index_keeps_nested_producer_and_orphan_store_checks(producer_phase, store_phase):
+    # The first Final may be nested in a store argument. Without any Final
+    # producer, the verifier must still reject a store waiting on an unset flag.
+    program = pl.parse_program(f"""
+@pl.program
+class NestedFirstProducer:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        out = pl.store(pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.{producer_phase}),
+                       [0, 0], out, st_phase=pl.STPhase.{store_phase})
+""")
+    diagnostics = _verify(program)
+    if producer_phase == "Unspecified" and store_phase == "Final":
+        assert len(diagnostics) == 1
+        assert "must consume the exact SSA value" in diagnostics[0].message
+    else:
+        assert diagnostics == []
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

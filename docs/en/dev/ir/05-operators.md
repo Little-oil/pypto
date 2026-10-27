@@ -534,10 +534,14 @@ Explicit phases do not remove other automatically inserted synchronization.
 
 Storage checks follow registered in-place operations and views, including
 aliases made before a Final update and straight-line tuple forwarding or
-nested tuple projections. Tile-bearing tuple values with unresolved provenance
-across a branch join, loop carry, or opaque tuple result are rejected when the
-function uses a Final protocol. Unpack those tiles into separate aliases or
-tile loop arguments; scalar tuples and unphased functions are unaffected.
+nested tuple projections. A branch selection retains its possible sources
+without identifying independent source accumulators with each other. Tuple
+values with unresolved provenance across a branch join, loop carry, or opaque
+result are rejected when they may contain Acc storage (including unresolved
+memory spaces) and the function uses a Final protocol. Unpack those tiles into
+separate aliases or tile loop arguments. Known non-Acc tile tuples, scalar
+tuples and unphased functions are unaffected. Storage analysis is built only
+when a Final producer is encountered; unmatched Final stores are always checked.
 
 ## Python Usage
 
