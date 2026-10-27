@@ -125,7 +125,7 @@ def _planner_pto(program, planner: passes.MemoryPlanner) -> str:
     func = next(f for f in optimized.functions.values() if f.name == "kernel")
     return codegen.PTOCodegen().generate(
         _ir.Program([func], "kernel", optimized.span),
-        emit_tile_addr=planner == passes.MemoryPlanner.PYPTO,
+        emit_tile_addr=planner != passes.MemoryPlanner.PTOAS,
     )
 
 
@@ -133,6 +133,53 @@ def _sole_line(mlir: str, needle: str) -> str:
     lines = [ln for ln in mlir.splitlines() if needle in ln]
     assert len(lines) == 1, f"expected exactly one {needle!r} line, got {lines}:\n{mlir}"
     return lines[0]
+
+
+@pytest.mark.parametrize("planner", list(passes.MemoryPlanner))
+def test_native_if_yields_view_with_its_actual_descriptor_type(tmp_path: Path, planner):
+    """A view between two handle selections must keep SSA type and validity."""
+    if find_ptoas_binary() is None:
+        pytest.skip("PTOAS is not available")
+
+    @pl.program
+    class NativeViewSelection:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            pool: pl.Tensor[[48, 32], pl.FP16],
+            weight: pl.Tensor[[32, 16], pl.FP16],
+            flag: pl.Scalar[pl.INT32],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            a = pl.load(pool, [0, 0], [16, 32], target_memory=pl.Mem.Mat)
+            b = pl.load(pool, [16, 0], [16, 32], target_memory=pl.Mem.Mat)
+            c = pl.load(pool, [32, 0], [16, 32], target_memory=pl.Mem.Mat)
+            if flag > 0:
+                selected = pl.yield_(a)
+            else:
+                selected = pl.yield_(b)
+            viewed = pl.tile.reshape(selected, [16, 32])
+            if flag > 1:
+                final = pl.yield_(viewed)
+            else:
+                final = pl.yield_(c)
+            left = pl.move(final, target_memory=pl.Mem.Left)
+            rhs = pl.load(weight, [0, 0], [32, 16], target_memory=pl.Mem.Mat)
+            right = pl.move(rhs, target_memory=pl.Mem.Right)
+            product = pl.tile.matmul(left, right)
+            return pl.store(product, [0, 0], out)
+
+    mlir = _planner_pto(NativeViewSelection, planner)
+    assert len(re.findall(r"scf\.if .* -> \(!pto\.tile_buf<", mlir)) == 2
+    assert "pto.set_validshape %if_yield" not in mlir
+    for line in mlir.splitlines():
+        if "pto.tmov" in line:
+            assert len(re.findall(r"loc\s*=\s*mat(?:,|>)", line)) < 2, line
+    source, output = tmp_path / "native_view_phi.pto", tmp_path / "native_view_phi.cpp"
+    source.write_text(mlir)
+    level = "level2" if planner == passes.MemoryPlanner.PTOAS else "level3"
+    _run_ptoas(str(source), str(output), ["--pto-arch=a2", f"--pto-level={level}"])
+    assert output.is_file()
 
 
 def _first_group(pattern: str, text: str) -> str:

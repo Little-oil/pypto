@@ -13,6 +13,7 @@
 #define SRC_IR_TRANSFORMS_MEMORY_REUSE_INTERNAL_H_
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <set>
 #include <utility>
@@ -33,6 +34,10 @@ namespace memory_reuse {
 // Shared by alias analysis and yield repair: unknown bounds conservatively
 // may execute; after_first asks whether another iteration may run.
 bool LoopMayExecute(const StmtPtr& statement, bool after_first);
+
+// Reuse retargeting's logical-version and dual-branch reachability facts in
+// the packer. The closure owns the indexed analysis for this function only.
+std::function<bool(const VarPtr&, const VarPtr&)> BuildReferenceInterference(const StmtPtr& body);
 
 // Private stage boundaries. The pass entry orders packing and writeback repair;
 // semantic_aliases.cpp also uses writeback repair for planners that skip reuse.

@@ -1080,13 +1080,13 @@ class ForLoopBuilder(_ReturnVarsAccessor):
     ) -> ir.IterArg:
         """Add iteration argument (loop-carried value).
 
-        The type is automatically inferred from the init_value expression. If an explicit
-        type is provided, it is used to validate that the inferred type matches.
+        The type is automatically inferred from init_value. An explicit compatible
+        type preserves the carry's own storage descriptor independently of init_value.
 
         Args:
             name: Iteration argument name
             init_value: Initial value (int, float, or Expr)
-            type: Optional type for validation. If provided, must match the inferred type.
+            type: Optional descriptor with the same semantic type as init_value.
             span: Optional explicit span. If None, captured from call site.
 
         Returns:
@@ -1114,7 +1114,7 @@ class ForLoopBuilder(_ReturnVarsAccessor):
                 f"  Inferred type: {inferred_type}\n"
                 f"  Provided type: {type}"
             )
-        final_type = inferred_type
+        final_type = type if type is not None else inferred_type
 
         iter_arg = ir.IterArg(name, final_type, init_expr, actual_span)
         self._builder._builder.add_iter_arg(iter_arg)
@@ -1213,13 +1213,13 @@ class WhileLoopBuilder(_ReturnVarsAccessor):
     ) -> ir.IterArg:
         """Add iteration argument (loop-carried value).
 
-        The type is automatically inferred from the init_value expression. If an explicit
-        type is provided, it is used to validate that the inferred type matches.
+        The type is automatically inferred from init_value. An explicit compatible
+        type preserves the carry's own storage descriptor independently of init_value.
 
         Args:
             name: Iteration argument name
             init_value: Initial value (int, float, or Expr)
-            type: Optional type for validation. If provided, must match the inferred type.
+            type: Optional descriptor with the same semantic type as init_value.
             span: Optional explicit span. If None, captured from call site.
 
         Returns:
@@ -1247,7 +1247,7 @@ class WhileLoopBuilder(_ReturnVarsAccessor):
                 f"  Inferred type: {inferred_type}\n"
                 f"  Provided type: {type}"
             )
-        final_type = inferred_type
+        final_type = type if type is not None else inferred_type
 
         iter_arg = ir.IterArg(name, final_type, init_expr, actual_span)
         self._builder._builder.add_while_iter_arg(iter_arg)

@@ -497,18 +497,25 @@ bool ShouldAliasResultToInPlaceInput(const AssignStmtPtr& stmt) {
   auto call = As<ir::Call>(stmt->value_);
   if (!call || !call->op_) return false;
 
-  auto result_tile_type = ir::GetTileTypeWithMemRef(stmt->var_->GetType());
+  auto result_tile_type = As<TileType>(stmt->var_->GetType());
   if (!result_tile_type) return false;
 
   auto input_tile_type_at = [&](size_t index) -> std::shared_ptr<const TileType> {
     if (index >= call->args_.size()) return nullptr;
-    return ir::GetTileTypeWithMemRef(call->args_[index]->GetType());
+    return As<TileType>(call->args_[index]->GetType());
   };
+
+  if (!result_tile_type->memref_) {
+    const auto reused = ir::op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size());
+    // A declared writeback follows its selected input reference. Descriptor
+    // differences are adapted separately; they do not grant fresh storage.
+    return reused && input_tile_type_at(*reused) != nullptr;
+  }
 
   // Legacy arm: shared base memref only, exactly as before.
   if (IsInPlaceInput0DpsOp(call->op_)) {
     auto input_tile_type = input_tile_type_at(0);
-    if (!input_tile_type) return false;
+    if (!input_tile_type || !input_tile_type->memref_ || !result_tile_type->memref_) return false;
     auto result_memref = ir::GetDefinedMemRef(result_tile_type);
     auto input_memref = ir::GetDefinedMemRef(input_tile_type);
     return result_memref && input_memref && result_memref->base_.get() == input_memref->base_.get();
@@ -518,7 +525,8 @@ bool ShouldAliasResultToInPlaceInput(const AssignStmtPtr& stmt) {
   if (!declared.has_value()) return false;
   auto input_tile_type = input_tile_type_at(*declared);
   if (!input_tile_type) return false;
-  return ShareOneMemRefWindow(result_tile_type, input_tile_type) &&
+  return ((!result_tile_type->memref_ && !input_tile_type->memref_) ||
+          ShareOneMemRefWindow(result_tile_type, input_tile_type)) &&
          ir::TileBufSignature::FromTileType(*result_tile_type) ==
              ir::TileBufSignature::FromTileType(*input_tile_type);
 }
@@ -1647,7 +1655,8 @@ PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
     }
   }
 
-  auto memref = ir::GetDefinedMemRef(tile_type);
+  // Logical references also use these validity fields, without an address.
+  auto memref = tile_type->memref_.value_or(nullptr);
   if (memref && emit_tile_addr_) {
     if (auto const_offset = As<ir::ConstInt>(memref->byte_offset_)) {
       fields.addr_ssa = GetOrEmitConstant(const_offset->value_, const_offset->dtype());
@@ -1665,6 +1674,15 @@ PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
 void PTOCodegen::PlanMultiBufferRegions(const FunctionPtr& func) {
   fs_.multi_buffer_regions.clear();
   fs_.multi_buffer_region_order.clear();
+  if (auto body = As<ir::SeqStmts>(func->body_)) {
+    for (const auto& statement : body->stmts_) {
+      auto assign = As<ir::AssignStmt>(statement);
+      auto call = assign ? As<ir::Call>(assign->value_) : nullptr;
+      if (ir::IsOp(call, "tile.alloc") && call->GetAttr<bool>("reference_slots", false)) {
+        fs_.reference_slot_bases.insert(assign->var_.get());
+      }
+    }
+  }
 
   // PyPTO planner (ptoas --pto-level=level3): a level3 region needs an explicit
   // `addr` base, and the region emitted below carries none, so that planner keeps
@@ -1709,6 +1727,7 @@ void PTOCodegen::PlanMultiBufferRegions(const FunctionPtr& func) {
   // make the outcome depend on discovery order.
   for (const auto& [tile_var, tile_type] : fs_.tile_var_allocs) {
     auto memref = ir::GetDefinedMemRef(tile_type);
+    if (fs_.reference_slot_bases.count(memref->base_.get())) continue;
     if (memref->slot_count_ <= 1) continue;
     const ir::Var* base = memref->base_.get();
     auto [it, fresh] = candidates.try_emplace(base);
@@ -1895,6 +1914,7 @@ void PTOCodegen::EmitAllocTileForVar(const ir::VarPtr& tile_var,
   INTERNAL_CHECK_SPAN(mlir_it != fs_.var_to_mlir.end(), tile_var->span_)
       << "Tile var " << tile_var->name_hint_ << " not found in fs_.var_to_mlir";
   std::string tile_buf = mlir_it->second;
+  if (TryEmitReferenceSlot(tile_var, tile_type)) return;
 
   // In PTOAS mode several vars may share one handle (in-place aliasing); emit
   // the alloc_tile only once per handle so the shared buffer has a single def.
@@ -1925,6 +1945,149 @@ void PTOCodegen::EmitAllocTileForVar(const ir::VarPtr& tile_var,
 
   RegisterTileBufType(tile_buf, fields.type_str, tile_type);
   RegisterMutableTileName(tile_buf);
+}
+
+bool PTOCodegen::TryEmitReferenceSlot(const ir::VarPtr& value, const ir::TileTypePtr& type) {
+  if (fs_.reference_slot_bases.empty() || !type->memref_) return false;
+  const auto memory = ir::GetDefinedMemRef(type);
+  if (fs_.reference_slot_bases.count(memory->base_.get()) == 0) return false;
+  INTERNAL_CHECK_SPAN(memory->slot_index_.has_value(), value->span_)
+      << "Reference pool requires a slot index";
+  auto& handles = fs_.reference_slot_handles[memory->base_.get()];
+  if (handles.empty()) {
+    // The NoAccess anchor is emitted first, with slot zero and its constant
+    // placed base. Each physical bank remains explicit to PTOAS planning;
+    // native loop carries select references to these banks.
+    auto offset = As<ir::ConstInt>(memory->byte_offset_);
+    auto slot = As<ir::ConstInt>(*memory->slot_index_);
+    INTERNAL_CHECK_SPAN(slot && slot->value_ == 0 && (!emit_tile_addr_ || offset), value->span_)
+        << "Reference pool anchor must declare its constant base";
+    for (uint64_t i = 0; i < memory->slot_count_; ++i) {
+      auto placed = std::make_shared<ir::MemRef>(
+          memory->base_, (offset ? offset->value_ : 0) + static_cast<int64_t>(i * memory->size_),
+          memory->size_, value->span_);
+      auto slot_type = As<ir::TileType>(ir::CloneTypeWithMemRef(type, placed, type->GetMemorySpace()));
+      auto fields = ComputeAllocTileFields(slot_type);
+      auto name = AllocNewTileBuf(fields.type_str, value->name_hint_ + "_bank_" + std::to_string(i),
+                                  fields.addr_ssa, fields.valid_row_ssa, fields.valid_col_ssa);
+      RegisterTileBufType(name, fields.type_str, slot_type);
+      handles.push_back(name);
+    }
+  }
+  const auto bank_type = fs_.ssa_to_tile_type.at(handles.front());
+  std::string selected;
+  if (auto slot = As<ir::ConstInt>(*memory->slot_index_)) {
+    INTERNAL_CHECK_SPAN(slot->value_ >= 0 && static_cast<uint64_t>(slot->value_) < handles.size(),
+                        value->span_)
+        << "Reference slot is outside its allocation";
+    selected = handles[static_cast<size_t>(slot->value_)];
+  } else {
+    auto index = GetExprAsCode(*memory->slot_index_);
+    selected = handles.back();
+    const auto descriptor = GetSSATileBufType(handles.front());
+    for (size_t i = 0; i + 1 < handles.size(); ++i) {
+      auto condition =
+          EmitArithCmpi("eq", index, GetOrEmitConstant(static_cast<int64_t>(i), DataType::INDEX), "index");
+      auto name = NewTemp();
+      Emit(name + " = arith.select " + condition + ", " + handles[i] + ", " + selected + " : " + descriptor);
+      RegisterTileBufType(name, descriptor, bank_type);
+      selected = name;
+    }
+  }
+  if (!(ir::TileBufSignature::FromTileType(*bank_type) == ir::TileBufSignature::FromTileType(*type))) {
+    // The anchor describes the complete physical bank. A real producer can
+    // have narrower/runtime validity; initialize its own handle without
+    // mutating any descriptor retained by an incoming reference.
+    auto logical = As<ir::TileType>(ir::CloneTypeWithMemRef(type, std::nullopt));
+    const auto fields = ComputeAllocTileFields(logical);
+    auto address = GetTileAddress(selected);
+    auto descriptor = NewNamedTemp("producer_view");
+    Emit(descriptor + " = pto.alloc_tile addr = " + address + " valid_row = " + fields.valid_row_ssa +
+         " valid_col = " + fields.valid_col_ssa + " : " + fields.type_str);
+    RegisterTileViewName(descriptor, selected);
+    selected = descriptor;
+  }
+  BindVarToMlir(value, selected);
+  RegisterTileBufType(selected, GetTileBufTypeStringFromTileType(type), type);
+  return true;
+}
+
+std::string PTOCodegen::GetTileAddress(const std::string& value) {
+  const auto found = fs_.ssa_to_tile_type.find(value);
+  INTERNAL_CHECK(found != fs_.ssa_to_tile_type.end()) << "Missing Tile descriptor for " << value;
+  const auto& tile = found->second;
+  INTERNAL_CHECK(tile->GetMemorySpace()) << "Tile address requires a known memory space";
+  const auto pointer_type =
+      "!pto.ptr<" + GetTypeString(tile->dtype_) + ", " + MemorySpaceToMLIR(*tile->GetMemorySpace()) + ">";
+  auto pointer = NewTemp();
+  Emit(pointer + " = pto.tile_buf_addr " + value + " : " + GetSSATileBufType(value) + " -> " + pointer_type);
+  auto address = NewTemp();
+  Emit(address + " = pto.castptr " + pointer + " : " + pointer_type + " -> i64");
+  return address;
+}
+
+std::string PTOCodegen::EmitStorageVersionIndex(const ir::CallPtr& call) {
+  const auto anchor_type = As<ir::TileType>(call->args_.at(0)->GetType());
+  INTERNAL_CHECK(anchor_type && anchor_type->memref_) << "Version selection requires an allocation anchor";
+  const auto base = ir::GetDefinedMemRef(anchor_type)->base_;
+  const auto references = As<ir::MakeTuple>(call->args_.at(1));
+  auto bank = fs_.reference_slot_handles.find(base.get());
+  INTERNAL_CHECK(references && bank != fs_.reference_slot_handles.end() &&
+                 bank->second.size() > references->elements_.size())
+      << "An allocation needs more instances than protected incoming references";
+  const auto& handles = bank->second;
+  std::vector<std::string> protected_addresses, addresses;
+  for (const auto& reference : references->elements_) {
+    protected_addresses.push_back(GetTileAddress(GetExprAsCode(reference)));
+  }
+  for (const auto& handle : handles) addresses.push_back(GetTileAddress(handle));
+  const auto bytes = ir::GetDefinedMemRef(fs_.ssa_to_tile_type.at(handles.front()))->size_;
+  auto extent = GetOrEmitConstant(static_cast<int64_t>(bytes), DataType::INT64);
+  auto zero = GetOrEmitConstant(int64_t{0}, DataType::INDEX);
+  auto one = GetOrEmitConstant(int64_t{1}, DataType::INDEX);
+  auto count = GetOrEmitConstant(static_cast<int64_t>(handles.size()), DataType::INDEX);
+  auto index = NewNamedTemp("allocation_instance");
+  auto previous = NewTemp();
+  auto result = NewTemp();
+  // This is a pure selection from a fixed allocation, with no mutable free list
+  // or reference counters. M incoming handles can exclude at most M instances.
+  // Keep emitted IR linear in M; the bounded scalar loop does O(M^2) comparisons.
+  EmitStructural(result + " = scf.for " + index + " = " + zero + " to " + count + " step " + one +
+                 " iter_args(" + previous + " = " + zero + ") -> (index) {");
+  IncreaseIndent();
+  auto address = addresses.front();
+  for (size_t i = 1; i < addresses.size(); ++i) {
+    auto is_index =
+        EmitArithCmpi("eq", index, GetOrEmitConstant(static_cast<int64_t>(i), DataType::INDEX), "index");
+    auto selected = NewTemp();
+    Emit(selected + " = arith.select " + is_index + ", " + addresses[i] + ", " + address + " : i64");
+    address = selected;
+  }
+  auto end = NewTemp();
+  Emit(end + " = arith.addi " + address + ", " + extent + " : i64");
+  std::string available;
+  for (const auto& protected_address : protected_addresses) {
+    // A view can start inside an instance. Exclude its containing byte range,
+    // not just an exactly equal descriptor address.
+    auto before = EmitArithCmpi("ult", protected_address, address, "i64");
+    auto after = EmitArithCmpi("uge", protected_address, end, "i64");
+    auto outside = NewTemp();
+    Emit(outside + " = arith.ori " + before + ", " + after + " : i1");
+    if (available.empty()) {
+      available = outside;
+    } else {
+      auto both = NewTemp();
+      Emit(both + " = arith.andi " + available + ", " + outside + " : i1");
+      available = both;
+    }
+  }
+  INTERNAL_CHECK(!available.empty()) << "Version selection requires a protected reference";
+  auto selected = NewTemp();
+  Emit(selected + " = arith.select " + available + ", " + index + ", " + previous + " : index");
+  Emit("scf.yield " + selected + " : index");
+  DecreaseIndent();
+  EmitStructural("}");
+  return result;
 }
 
 // ========================================================================
@@ -2138,15 +2301,16 @@ bool PTOCodegen::IsMutableTileName(const std::string& ssa_name) const {
   return fs_.mutable_tile_names.count(ssa_name) > 0;
 }
 
-std::string PTOCodegen::EnsureTileView(
-    const std::string& source, const std::string& source_type,
-    const std::shared_ptr<const ir::TileType>& tile_type, const std::string& name_hint,
-    std::optional<std::pair<std::string, std::string>> mutable_valid_shape) {
+std::string PTOCodegen::EnsureTileView(const std::string& source, const std::string& source_type,
+                                       const std::shared_ptr<const ir::TileType>& tile_type,
+                                       const std::string& name_hint,
+                                       std::optional<std::pair<std::string, std::string>> mutable_valid_shape,
+                                       bool snapshot) {
   const std::string view_type = mutable_valid_shape ? GetTileBufTypeStringFromTileType(tile_type)
                                                     : GetViewTileBufTypeStringFromTileType(tile_type);
   // Equal dynamic types can still have independent live validity. Never reuse
   // the source when initializing a mutable alias (e.g. fillpad's output).
-  if (!mutable_valid_shape && source_type == view_type) return source;
+  if (!snapshot && !mutable_valid_shape && source_type == view_type) return source;
   const std::string view = NewNamedTemp(name_hint);
   RegisterTileBufType(view, view_type, tile_type);
   RegisterTileViewName(view, source);
@@ -2397,10 +2561,13 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
         // there is no MemRef to read. Register it before the op codegen runs so
         // GetCurrentResultTileBufTypeString() can emit the `-> type` annotation.
         result_tile_type = tile_type;
-        result_buf = NewNamedTemp(op->var_->name_hint_);
+        const auto reused = ir::op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size());
+        result_buf = alias_result_to_in_place_input
+                         ? PrepareControlFlowValue(GetExprAsCode(call->args_[reused.value_or(0)]), tile_type)
+                         : NewNamedTemp(op->var_->name_hint_);
         BindVarToMlir(op->var_, result_buf);
         std::string type_str = GetTileBufTypeStringFromTileType(tile_type);
-        if (!type_str.empty()) {
+        if (!alias_result_to_in_place_input && !type_str.empty()) {
           RegisterTileBufType(result_buf, type_str, tile_type);
         }
       } else if (alias_array_update_to_input) {
@@ -2492,21 +2659,11 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
         RegisterCommCtxFor(op->var_, comm_ctx);
         return;
       }
-    } else if (!emit_tile_addr_ && As<TileType>(op->var_->GetType())) {
-      // Bare tile SSA alias (`lhs = rhs`) under memory_planner=PTOAS. `lhs` and
-      // `rhs` denote the identical tile value, so `lhs` must resolve to `rhs`'s
-      // CURRENT SSA binding. This matters when `rhs` is a view (tile.reshape /
-      // tile.transpose_view) that re-pointed itself at a typed view SSA of a
-      // shared buffer — e.g. the `[N, 1]` col-major reshape of a `[1, N]`
-      // row-major op result, which shares the op result's MemRef. `lhs` was
-      // pre-bound (GenerateFunction) to that shared handle, whose SSA is typed
-      // `[1, N]`; keeping it makes a later yield of `lhs` (an `m = m_new`
-      // online-softmax carry) emit a `[1, N] -> [N, 1]` write-back tmov that
-      // ptoas rejects for shape mismatch. Following `rhs` binds `lhs` to the
-      // `[N, 1]` view SSA so the write-back has matching src/dst shapes — the
-      // same shape the `s = pl.mul(...)`-style yield (no bare alias) already
-      // gets. Under PyPTO (emit_tile_addr_) the baked address already aliases
-      // the two allocs, so this is a no-op there and is left untouched.
+    } else if (auto tile = As<TileType>(op->var_->GetType()); tile && (!emit_tile_addr_ || !tile->memref_)) {
+      // Forward the actual handle for native references and for PTOAS-owned
+      // storage. In particular, a `[N, 1]` view must not fall back to its shared
+      // allocation's `[1, N]` handle. Addressed, fixed-MemRef aliases retain the
+      // existing allocation path; logical references have no such address.
       const std::string rhs_ssa = LookupVarName(rhs_var);
       if (!rhs_ssa.empty()) {
         BindVarToMlir(op->var_, rhs_ssa);

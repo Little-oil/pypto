@@ -51,6 +51,7 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
+#include "pypto/ir/transforms/utils/buffer_ir_selection.h"
 #include "pypto/ir/transforms/utils/l0c_footprint.h"
 #include "pypto/ir/transforms/utils/memref_collectors.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
@@ -83,6 +84,10 @@ bool ProducesBufferLessTile(const ExprPtr& value, const SourceBufferLess& source
     if (op_predicates::IsBufferAliasingViewOp(call->op_->name_) && !call->args_.empty()) {
       auto in = AsVarLike(call->args_[0]);
       return in && source_buffer_less(in.get());
+    }
+    if (auto reused = op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size())) {
+      auto input = AsVarLike(call->args_[*reused]);
+      return input && source_buffer_less(input.get());
     }
     return false;
   }
@@ -739,6 +744,17 @@ class InitMemRefMutator : public IRMutator {
     // First visit the value (RHS)
     auto new_value = VisitExpr(op->value_);
 
+    // A reference result does not acquire independent storage. Preserve the
+    // author's binding error before the non-owning forwarding fast path.
+    if (auto call = As<Call>(op->value_)) {
+      CHECK_SPAN(!op_predicates::OutputInheritsSourceBuffer(call->op_->name_) ||
+                     !HasUserBinding(op->var_->GetType()),
+                 op->var_->span_)
+          << "Tile '" << op->var_->name_hint_ << "' is produced by '" << call->op_->name_
+          << "', which lands in its source tile's allocation, so it cannot be given one of its own. "
+             "Bind the source tile instead.";
+    }
+
     // A tile that owns no general-pool buffer — a cross-core tpop result (its
     // data lives in the reserved C2V/V2C slot, addressed via the pipe), or a
     // zero-copy view / plain alias chained off one — stays MemRef-less, so
@@ -758,12 +774,6 @@ class InitMemRefMutator : public IRMutator {
       // A view / in-place result physically IS its source's buffer, so binding
       // it to a different one cannot be honored. Say so instead of silently
       // dropping the binding — the user asked for something impossible.
-      CHECK_SPAN(!op_predicates::OutputInheritsSourceBuffer(call->op_->name_) ||
-                     !HasUserBinding(op->var_->GetType()),
-                 op->var_->span_)
-          << "Tile '" << op->var_->name_hint_ << "' is produced by '" << call->op_->name_
-          << "', which lands in its source tile's allocation, so it cannot be given one of its own. "
-             "Bind the source tile instead.";
 
       // Handle view operations: output should share MemRef with input tile.
       // A pure metadata view (slice/reshape/...) inherits its input's buffer.  A
@@ -818,7 +828,7 @@ class InitMemRefMutator : public IRMutator {
     // Tile alias: a = b where b is a tile Var — share b's MemRef.
     // Without this, the alias gets a fresh MemRef that is never written to,
     // breaking IfStmt return_vars that inherit the alias's empty MemRef.
-    if (auto value_var = As<Var>(new_value)) {
+    if (auto value_var = AsVarLike(new_value)) {
       if (As<TileType>(op->var_->GetType())) {
         auto result = ShareMemRefFrom(value_var, op, new_value);
         if (result) return result;
@@ -921,19 +931,19 @@ class InitMemRefMutator : public IRMutator {
     auto else_yield = new_if->else_body_.has_value() ? FindYieldStmt(new_if->else_body_.value()) : nullptr;
     if (!then_yield && !else_yield) return result;
 
+    // Retargeting and accumulator coalescing still need the provisional
+    // destination. MaterializeSemanticAliases classifies native references
+    // only after those storage contracts have been resolved.
     auto get_yield_var = [&](size_t i) -> VarPtr {
-      VarPtr var = nullptr;
-      if (then_yield && i < then_yield->value_.size()) var = As<Var>(then_yield->value_[i]);
-      if (!var && else_yield && i < else_yield->value_.size()) var = As<Var>(else_yield->value_[i]);
-      return var;
+      if (then_yield && i < then_yield->value_.size()) return AsVarLike(then_yield->value_[i]);
+      if (else_yield && i < else_yield->value_.size()) return AsVarLike(else_yield->value_[i]);
+      return nullptr;
     };
     auto [patched, changed] = PatchReturnVarsFromYield(new_if->return_vars_, op->return_vars_, get_yield_var);
-
     if (!changed) return result;
-
-    auto patched_if = MutableCopy(new_if);
-    patched_if->return_vars_ = std::move(patched);
-    return patched_if;
+    auto canonical = MutableCopy(new_if);
+    canonical->return_vars_ = std::move(patched);
+    return canonical;
   }
 
  private:
@@ -987,6 +997,7 @@ class InitMemRefMutator : public IRMutator {
  * Variables without memory_space default to DDR.
  */
 FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
+  BufferIRFunctionScope buffer_scope(func);
   // Lowering may introduce constant SSA aliases after the early Simplify pass.
   // Normalize them with the shared transformation before building addresses,
   // including when InitMemRef is invoked outside the default pipeline.
@@ -1107,6 +1118,37 @@ namespace {
 class HasMemRefsVerifier : public IRVisitor {
  public:
   explicit HasMemRefsVerifier(std::vector<Diagnostic>& diagnostics) : diagnostics_(diagnostics) {}
+
+  void VisitStmt_(const ForStmtPtr& loop) override { VisitLoop(loop); }
+  void VisitStmt_(const WhileStmtPtr& loop) override { VisitLoop(loop); }
+
+  template <typename LoopPtr>
+  void VisitLoop(const LoopPtr& loop) {
+    // Native loop bindings, like If results, forward incoming references. Mark
+    // them before visiting the body so aliases/writebacks inherit non-ownership.
+    for (const auto& argument : loop->iter_args_) {
+      if (auto tile = As<TileType>(argument->GetType()); tile && !tile->memref_) {
+        buffer_less_.insert(argument.get());
+      }
+    }
+    IRVisitor::VisitStmt_(loop);
+    for (const auto& result : loop->return_vars_) {
+      if (auto tile = As<TileType>(result->GetType()); tile && !tile->memref_) {
+        buffer_less_.insert(result.get());
+      }
+    }
+  }
+
+  void VisitStmt_(const IfStmtPtr& op) override {
+    IRVisitor::VisitStmt_(op);
+    // Non-owning If results forward an incoming Tile handle. Subsequent
+    // aliases/views may forward it, just as they forward a pipe-owned Tile.
+    for (const auto& result : op->return_vars_) {
+      if (auto tile = As<TileType>(result->GetType()); tile && !tile->memref_) {
+        buffer_less_.insert(result.get());
+      }
+    }
+  }
 
   void VisitStmt_(const AssignStmtPtr& op) override {
     if (!op || !op->var_ || !op->var_->GetType()) return;

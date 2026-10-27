@@ -205,29 +205,30 @@ inline std::optional<TileView> RemapTileViewExprs(const std::optional<TileView>&
                   tile_view->compact);
 }
 
-/// Rewrite the SSA values a *pinned* MemRef's slot index names.
+/// Rewrite SSA values named by an explicitly indexed MemRef.
 ///
 /// A declared allocation's slot index may be a runtime expression (`l0c[i & 1]`),
 /// which makes it the only MemRef field that substitution has to follow: rename
 /// `i` and the index must follow, or it dangles on a stale Var.
 ///
-/// Restricted to pinned MemRefs on purpose. `byte_offset_` needs no remap — it is
-/// `ConstInt(0)` until InitMemRef and a concrete address after — and confining
-/// rebuilds to the pinned window keeps them strictly before every pass that keys
-/// on MemRef *pointer* identity (`AllocateMemoryAddr` matches old→new by raw
-/// pointer). Rebuilding one of those later would silently split a shared MemRef.
+/// Before InitMemRef the declaration has no byte offset. After resolution an
+/// indexed MemRef can still contain runtime SSA values in both its slot and
+/// placed byte offset. Address assignment and Simplify must keep those uses in
+/// sync with rebuilt IterArgs. Ordinary unindexed MemRefs retain their pointer
+/// identity, which allocation planning uses as its lookup key.
 template <typename RemapExprFn>
 inline std::optional<MemRefPtr> RemapPinnedMemRefExprs(const std::optional<MemRefPtr>& memref,
                                                        const RemapExprFn& remap_expr, bool& changed) {
-  if (!memref.has_value() || !(*memref)->is_pinned_) return memref;
+  if (!memref.has_value()) return memref;
   const auto& slot_index = (*memref)->slot_index_;
   if (!slot_index.has_value() || !*slot_index) return memref;
   auto new_index = remap_expr(*slot_index);
-  if (new_index == *slot_index) return memref;
-  changed = true;
   const auto& old = *memref;
+  auto new_offset = old->is_pinned_ ? old->byte_offset_ : remap_expr(old->byte_offset_);
+  if (new_index == *slot_index && new_offset == old->byte_offset_) return memref;
+  changed = true;
   return std::make_optional<MemRefPtr>(
-      std::make_shared<MemRef>(old->name_hint_, old->base_, old->byte_offset_, old->size_, old->span_,
+      std::make_shared<MemRef>(old->name_hint_, old->base_, new_offset, old->size_, old->span_,
                                old->is_pinned_, old->slot_count_, std::make_optional(std::move(new_index))));
 }
 

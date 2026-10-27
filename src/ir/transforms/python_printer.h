@@ -220,6 +220,7 @@ class IRPythonPrinter : public IRVisitor {
   // print as `i` and `i_1`), and a fresh printer would emit the bare name_hint_
   // and rebind it to the wrong Var on reparse.
   std::string PrintSubExpr(const ExprPtr& expr, bool typed_index = false) const;
+  void PrintLoopInitializer(const IterArgPtr& argument);
 
   // Build var_rename_map_ from a body stmt (and optional params).
   // Assigns unique suffixed names (e.g., "i", "i_1") when two distinct Vars share a name.

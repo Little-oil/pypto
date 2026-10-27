@@ -76,12 +76,11 @@ class MemRef : public Var {
   /// index and `AllocateMemoryAddr` may rebase it onto a physical address, so the
   /// index is the author's selection and the offset is its resolved location.
   ///
-  /// Because the index may name SSA values, it is the one MemRef field that
-  /// substitution must rewrite; `CloneTypeWithMemRefAndRemapExprs` does so, and
-  /// only for a pinned MemRef. That restriction keeps rebuilds out of the passes
-  /// that key on MemRef pointer identity (`AllocateMemoryAddr`). After InitMemRef
-  /// the index is exposed to the same staleness as the SSA values already inside
-  /// `byte_offset_`, which substitution likewise leaves alone.
+  /// Indexed MemRefs can name SSA values after resolution too. Substitution
+  /// rewrites both the index and its resolved byte offset so rebuilt loop
+  /// binders remain consistent. Unindexed MemRefs retain pointer identity for
+  /// allocation planning. Compiler-owned reference pools use the same fields
+  /// to select an existing allocation slot without copying its payload.
   std::optional<ExprPtr> slot_index_;
 
   /**

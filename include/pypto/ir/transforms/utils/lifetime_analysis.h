@@ -48,6 +48,8 @@ struct LifetimeAnalysisResult {
   std::vector<LifetimeInterval> lifetimes;
   std::map<VarPtr, std::vector<VarPtr>> var_sharing_groups;
   std::map<const Var*, std::set<int>> phi_family_ids;
+  // Individual definition / last payload use, including logical IterArgs that
+  // own no allocation. Producer-version planning compares these same orders.
   std::map<const Var*, std::pair<int, int>> var_liveness;
   std::map<const Var*, std::vector<std::pair<int32_t, int32_t>>> pipeline_membership;
   std::set<const Var*> pipeline_load_tiles;

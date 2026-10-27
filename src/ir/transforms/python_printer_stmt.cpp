@@ -35,6 +35,7 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/type.h"
 #include "src/ir/transforms/python_printer.h"
@@ -155,6 +156,15 @@ void IRPythonPrinter::VisitStmt_(const ReturnStmtPtr& op) {
   }
 }
 
+void IRPythonPrinter::PrintLoopInitializer(const IterArgPtr& argument) {
+  // Region references have their own descriptors; an initializer's storage
+  // metadata must not be inferred onto a native carry when reparsing a dump.
+  const bool explicit_type = !structural_equal(argument->GetType(), argument->initValue_->GetType());
+  if (explicit_type) stream_ << prefix_ << "._dump.iter_arg(";
+  VisitExpr(argument->initValue_);
+  if (explicit_type) stream_ << ", " << Print(argument->GetType()) << ")";
+}
+
 void IRPythonPrinter::VisitStmt_(const ForStmtPtr& op) {
   CHECK_SPAN(op->hardware_loop_policy_ == HardwareLoopPolicy::Auto, op->span_)
       << "HardwareLoopPolicy.Require Python DSL printing is not supported yet; use serialization";
@@ -247,7 +257,7 @@ void IRPythonPrinter::VisitStmt_(const ForStmtPtr& op) {
     stream_ << ", init_values=(";
     for (size_t i = 0; i < op->iter_args_.size(); ++i) {
       if (i > 0) stream_ << ", ";
-      VisitExpr(op->iter_args_[i]->initValue_);
+      PrintLoopInitializer(op->iter_args_[i]);
     }
     // Add trailing comma for single-element tuple
     if (op->iter_args_.size() == 1) stream_ << ",";
@@ -316,7 +326,7 @@ void IRPythonPrinter::VisitStmt_(const WhileStmtPtr& op) {
     // Add init_values for iter_args
     for (size_t i = 0; i < op->iter_args_.size(); ++i) {
       if (i > 0) stream_ << ", ";
-      VisitExpr(op->iter_args_[i]->initValue_);
+      PrintLoopInitializer(op->iter_args_[i]);
     }
     // Add trailing comma for single-element tuple
     if (op->iter_args_.size() == 1) stream_ << ",";

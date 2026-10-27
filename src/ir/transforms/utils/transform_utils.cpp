@@ -36,11 +36,28 @@ namespace {
 template <typename ValueT>
 class SubstituteMutator : public IRMutator {
  public:
-  explicit SubstituteMutator(const std::unordered_map<const Var*, ValueT>& var_map) {
+  explicit SubstituteMutator(const std::unordered_map<const Var*, ValueT>& var_map,
+                             bool references_only = false)
+      : references_only_(references_only) {
     for (const auto& [k, v] : var_map) {
       var_remap_[k] = v;
     }
   }
+
+ protected:
+  ExprPtr VisitExpr_(const IterArgPtr& value) override {
+    // Expression substitution sees a use, not the loop binder. Rewriting an
+    // unmapped carry's initializer would manufacture a detached IterArg when
+    // folding a named constant in a MemRef offset.
+    if (!references_only_) return IRMutator::VisitExpr_(value);
+    auto found = var_remap_.find(value.get());
+    // Explicit replacements still follow the base mutator's transitive,
+    // type-aware resolution, including its cycle guard.
+    return found == var_remap_.end() ? value : ResolveVarRemapHit(value.get(), found->second);
+  }
+
+ private:
+  bool references_only_;
 };
 
 class CallLikeFinder : public IRVisitor {
@@ -99,7 +116,7 @@ StmtPtr RewriteLastYieldStmt(const StmtPtr& body,
 
 // Var* → VarPtr
 ExprPtr Substitute(const ExprPtr& expr, const std::unordered_map<const Var*, VarPtr>& var_map) {
-  SubstituteMutator<VarPtr> mutator(var_map);
+  SubstituteMutator<VarPtr> mutator(var_map, true);
   return mutator.VisitExpr(expr);
 }
 StmtPtr Substitute(const StmtPtr& body, const std::unordered_map<const Var*, VarPtr>& var_map) {
@@ -109,7 +126,7 @@ StmtPtr Substitute(const StmtPtr& body, const std::unordered_map<const Var*, Var
 
 // Var* → ExprPtr
 ExprPtr Substitute(const ExprPtr& expr, const std::unordered_map<const Var*, ExprPtr>& var_map) {
-  SubstituteMutator<ExprPtr> mutator(var_map);
+  SubstituteMutator<ExprPtr> mutator(var_map, true);
   return mutator.VisitExpr(expr);
 }
 StmtPtr Substitute(const StmtPtr& body, const std::unordered_map<const Var*, ExprPtr>& var_map) {

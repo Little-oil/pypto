@@ -4,13 +4,14 @@ Materializes compiler-owned PTO level3 scratch, initializes MemRef for all varia
 
 ## Overview
 
-This pass performs five tasks:
+This pass performs six tasks:
 
 1. **Normalizes scalar constants** using the shared [Simplify](05-simplify.md) helper in constant-only mode
 2. **Normalizes statement structure** (calls NormalizeStmtStructure internally)
 3. **Materializes compiler-owned level3 scratch** for the A2/A3 `tile.ci` and narrowing `tile.cast` ABIs, plus required `tile.sort32` forms on A2/A3 and A5
 4. **Initializes MemRef** for TileType and TensorType variables
 5. **Creates `tile.alloc` operations** for each non-DDR MemRef with `addr=-1` (unallocated)
+6. **Retains provisional region MemRefs** for subsequent retargeting and accumulator storage contracts; native-reference classification belongs to MaterializeSemanticAliases
 
 Memory space is read from `TileType::memory_space_` (set by InferTileMemorySpace). Variables without `memory_space` default to DDR.
 
@@ -53,11 +54,12 @@ program_with_memrefs = init_pass(program)
    - **tile.store**: result shares MemRef with the output tensor argument (specified by `output_reuses_input_arg` registry attribute)
    - **View ops** (e.g. `tile.reshape`): output shares MemRef with the input tile
    - **Reuse-input ops** (e.g. `tile.matmul_acc`, `tile.gemv_acc`): output shares MemRef with the specified input (via `output_reuses_input_arg` registry attribute)
-   - **ForStmt/IfStmt return_vars**: patched to share MemRef with corresponding yield values
+   - **If/For/While Tile bindings**: retain provisional MemRefs from branch yields or loop initializers so retargeting and accumulator coalescing can inspect their storage. MaterializeSemanticAliases later resolves native references; this annotation alone does not establish a must-alias relation
    - **Declared allocations**: the tile keeps the allocation the author declared instead of getting a fresh one
 6. **Collect non-DDR MemRefs**: Gather unique MemRef objects from TileType variables that are not in DDR
 7. **Create alloc statements**: For each non-DDR MemRef, create `tile.alloc(memspace, -1, size, id)` — with `pinned=True` when the base was declared by the author
 8. **Prepend allocs**: Insert alloc statements at the beginning of the function body's top-level `SeqStmts`
+9. **Defer native-reference classification**: keep provisional MemRefs through InitMemRef. After retargeting and accumulator coalescing, [MaterializeSemanticAliases](36-materialize_semantic_aliases.md#native-tile-references-and-producer-instances) decides which Tile references have no unique MemRef and prepares any required producer instances. Copyable fixed-storage and selected Buffer IR boundaries retain their canonical contracts.
 
 ### Constant inputs before address construction
 
@@ -277,21 +279,20 @@ gaps, listed here so the table above is not mistaken for a claim of correctness:
 
 ## ForStmt Loop-Carry Variables
 
-ForStmt has four loop-carry related variables with specific MemRef sharing rules:
+InitMemRef retains provisional storage for ForStmt and WhileStmt bindings:
 
 | Role | Description | MemRef Source |
 | ---- | ----------- | ------------- |
 | initValue | Initial value before first iteration | From producing operation |
-| iter_arg | Loop body variable | Inherited from initValue |
+| iter_arg | Loop body variable | Provisionally inherited from initValue |
 | yield value | Produced at end of each iteration | From producing operation (independent) |
-| return_var | Captures final yield value after loop | Inherited from yield value |
+| return_var | Captures final value after loop | Provisionally inherited from iter_arg |
 
-**Sharing groups**:
-
-- Group A: initValue + iter_arg (same MemRef)
-- Group B: yield value + return_var (same MemRef)
-
-Group A and B may have different MemRefs. The yield-to-iter_arg mismatch is resolved later by MemoryReuse (which inserts `tile.move` if needed).
+The logical carry still represents `phi(initValue, yield value)`, with initValue
+on a zero-trip exit. These annotations remain provisional until
+MaterializeSemanticAliases finishes retargeting and accumulator coalescing. It
+then selects native handles with optional MemRefs where eligible; copyable fixed
+storage and selected Buffer IR functions retain their canonical-copy contracts.
 
 ## Implementation
 

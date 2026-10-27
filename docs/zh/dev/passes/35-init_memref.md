@@ -4,13 +4,14 @@
 
 ## 概述
 
-此 Pass 执行五项任务：
+此 Pass 执行六项任务：
 
 1. **规范化标量常量**，以仅常量模式（constant-only mode）使用共享的 [Simplify](05-simplify.md) 辅助函数
 2. **规范化语句 (Statement) 结构**（内部调用 NormalizeStmtStructure）
 3. **物化编译器负责的 level3 scratch**：处理 A2/A3 ABI 的 `tile.ci`、窄化 `tile.cast`，以及 A2/A3 与 A5 上需要 scratch 的 `tile.sort32`；`tile.sel` / `tile.sels` / `tile.prelu` 的 caller tmp 原样保留
 4. **为 TileType 和 TensorType 变量初始化 MemRef**
 5. **为每个非 DDR 的 MemRef 创建 `tile.alloc` 操作**，地址为 `addr=-1`（未分配）
+6. **保留区域临时 MemRef**，供后续重定向和累加器存储契约使用；原生引用分类由 MaterializeSemanticAliases 完成
 
 内存空间从 `TileType::memory_space_` 读取（由 InferTileMemorySpace 设置）。无 `memory_space` 的变量默认为 DDR。
 
@@ -53,11 +54,12 @@ program_with_memrefs = init_pass(program)
    - **tile.store**：结果与输出 tensor 参数共享 MemRef（由 `output_reuses_input_arg` 注册表属性指定）
    - **View 操作**（如 `tile.reshape`）：输出与输入 tile 共享 MemRef
    - **复用输入操作**（如 `tile.matmul_acc`、`tile.gemv_acc`）：输出与指定输入共享 MemRef（由 `output_reuses_input_arg` 注册表属性指定）
-   - **ForStmt/IfStmt return_vars**：修补为与对应 yield 值共享 MemRef
+   - **If/For/While Tile 绑定**：暂时继承分支 yield 或循环初值的 MemRef，供重定向和累加器合并查询存储；后续 MaterializeSemanticAliases 再分类原生引用，该临时注解本身不建立强制别名关系
    - **用户绑定的 tile**：保留作者指定的 buffer，而不是新建一块分配
 6. **收集非 DDR MemRef**：从 TileType 变量中收集不在 DDR 中的唯一 MemRef 对象
 7. **创建 alloc 语句**：为每个非 DDR MemRef 创建 `tile.alloc(memspace, -1, size, id)`；base 属于声明式分配时带上 `pinned=True`
 8. **前置 alloc**：将 alloc 语句插入到函数体顶层 `SeqStmts` 的开头
+9. **延后原生引用分类**：InitMemRef 保留临时 MemRef。[MaterializeSemanticAliases](36-materialize_semantic_aliases.md#原生-tile-引用与生产者实例) 完成重定向和累加器合并后，再决定哪些 Tile 引用没有唯一 MemRef，并预留所需的生产者实例。可复制的固定存储和选入 Buffer IR 的边界保留规范契约。
 
 ### 构建地址前化简常量输入
 
@@ -73,6 +75,10 @@ program_with_memrefs = init_pass(program)
 输入、循环携带值和未确定的分支结果仍保持动态。该仅常量规范化由 `InitMemRef` 内部执行，
 所以直接调用和自定义流水线均能获得相同行为，无需提前单独调度 `Simplify` Pass。
 保留控制流与携带结构，可以避免改变内存 Pass 即将分析的存储关系。
+
+### 分歧存储引用
+
+InitMemRef 先保留分歧区域的临时存储信息。后续 MaterializeSemanticAliases 在重定向和累加器合并后分类符合条件的原生引用，直接传递 Tile 句柄，不传递标量槽号。读者通过引用及其别名/视图保留所有可能的载荷来源；无人读取的引用传递不算载荷读取。跨迭代生产者实例的预留及地址选择见 [MaterializeSemanticAliases](36-materialize_semantic_aliases.md#原生-tile-引用与生产者实例)。作者显式分配和修改数据的写回链沿用现有所有权处理。
 
 ## 声明式分配
 
@@ -247,21 +253,19 @@ PTO 由该 `rows` 推导块列步长，因此只有当窗口保留父张量的�
 
 ## ForStmt 循环携带变量
 
-ForStmt 有四个循环携带相关变量，遵循特定的 MemRef 共享规则：
+InitMemRef 为 ForStmt 和 WhileStmt 绑定保留临时存储：
 
 | 角色 | 描述 | MemRef 来源 |
 | ---- | ---- | ----------- |
 | initValue | 首次迭代前的初始值 | 来自产生该值的操作 |
-| iter_arg | 循环体内变量 | 继承自 initValue |
+| iter_arg | 循环体内变量 | 暂时继承 initValue |
 | yield value | 每次迭代结束时产出的值 | 来自产生该值的操作（独立分配） |
-| return_var | 循环结束后接收最终 yield 值 | 继承自 yield value |
+| return_var | 循环结束后接收最终值 | 暂时继承 iter_arg |
 
-**共享组**：
-
-- 组 A：initValue + iter_arg（共享同一 MemRef）
-- 组 B：yield value + return_var（共享同一 MemRef）
-
-组 A 和组 B 可能有不同的 MemRef。yield 与 iter_arg 之间的 MemRef 不一致由后续的 MemoryReuse 解决（必要时插入 `tile.move`）。
+逻辑携带值仍表示 `phi(initValue, yield value)`，零次退出选择 initValue。
+这些注解在 MaterializeSemanticAliases 完成重定向和累加器合并前都是临时信息。
+该 pass 随后为符合条件的引用选择原生句柄，MemRef 可选；可复制的固定存储和
+选入 Buffer IR 的函数保留规范复制契约。
 
 ## 实现
 

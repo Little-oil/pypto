@@ -221,8 +221,9 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
   const auto& valid_shape = tile_view.valid_shape;
   INTERNAL_CHECK_SPAN(valid_shape.size() == 2, op->span_) << "tile.store tile valid_shape must be 2D";
 
-  auto height_code = codegen.GetExprAsCode(valid_shape[0]);
-  auto width_code = codegen.GetExprAsCode(valid_shape[1]);
+  const auto valid_codes = GetSizeCodes(valid_shape, codegen);
+  const auto& height_code = valid_codes[0];
+  const auto& width_code = valid_codes[1];
 
   auto output_tensor = AsVarLike(op->args_[2]);
   INTERNAL_CHECK_SPAN(output_tensor, op->span_) << "tile.store output_tensor must be a Var or IterArg";
@@ -1176,6 +1177,12 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
 
   reg("tile.alloc", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeTileAllocCodegenPTO(op, codegen);
+  });
+
+  reg("tile.storage_version", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
+    auto& codegen = static_cast<codegen::PTOCodegen&>(codegen_base);
+    codegen.SetCurrentExprValue(codegen.EmitStorageVersionIndex(op));
+    return std::string{};
   });
 
   reg("tile.create", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {

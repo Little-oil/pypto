@@ -1,21 +1,21 @@
 # MaterializeSemanticAliases Pass
 
-Forces buffers that the program *semantics require* to be the same allocation to
-share one MemRef, by propagating each loop-carried `iter_arg`/`initValue` MemRef
-down the yield/producer chain.
+Materializes required storage aliases and prepares producer allocations for
+native Tile references before memory planning.
 
 ## Overview
 
 Memory planning distinguishes two kinds of buffer sharing:
 
-- **Must-alias (semantics-required):** a loop-carried accumulator, or an in-place
+- **Must-alias (semantics-required):** a registered in-place accumulator or
   op result, *has* to live in one buffer — writing the "next" value must update
   the carried buffer, or the loop does not accumulate. This is correctness, not
   optimization.
 - **May-alias (opportunistic):** two independent buffers with non-overlapping
   lifetimes *may* share storage to save memory. This is optimization.
 
-This pass handles only the **must-alias** case. It was split out of
+This pass establishes storage correctness, including **must-alias** contracts
+and the native Tile reference allocations described below. It was split out of
 [`MemoryReuse`](37-memory_reuse.md) (it is that pass's former "Step 0") so that
 the opportunistic lifetime coalescing can be skipped independently:
 
@@ -42,10 +42,10 @@ program = passes.materialize_semantic_aliases()(program)
 
 ## Algorithm
 
-`InitMemRef` already gives the loop-carried `iter_arg` and `return_var` the same
-MemRef as the `initValue` (the accumulator buffer), but the *producer* of the
-yielded value — e.g. the `tile.add` that computes `acc_next` — is still assigned
-its own fresh MemRef. This pass closes that gap:
+When a carry has one fixed storage window, a yielded producer may still have an
+independent MemRef. This pass safely retargets such producers and preserves
+required aliases. Tile references that can select different windows instead
+retain native SSA handles; they do not establish a must-alias relation to init.
 
 1. **Top-down retarget** (`TopDownRetargeter`): for each `ForStmt`, take each
    `iter_arg`'s canonical MemRef as the target and push it onto the yielded value
@@ -132,6 +132,10 @@ its own fresh MemRef. This pass closes that gap:
    the chain; no fixed-point iteration is needed. This closes lowering-created
    type drift before any memory planner observes lifetimes or PTOAS emits tile
    handles.
+4. **Prepare native reference allocations** on the Tile path: reuse the binding
+   graph, payload observations and allocation lifetimes to reserve producer
+   instances before planning. Control flow continues to carry Tile handles;
+   see [Native Tile references and producer instances](#native-tile-references-and-producer-instances).
 
 These rules cover shaped results with MemRefs, including tile and tensor
 writebacks. Bare SSA renames follow the complete source type without copying
@@ -155,9 +159,10 @@ In both legacy Tile and Buffer IR modes, `TensorType`/`DistributedTensorType`
 For/While arguments and returns are mutable views of the current initializer.
 Normalization aligns their storage while preserving each boundary result's
 shape, view metadata, and distributed-window identity, including on zero-trip
-loops. Independently produced yielded tensors keep their own storage. Tile
-carries retain their separate canonical-buffer and yield-fixup rules, including
-explicit transfers when a yielded tile needs to reach the carry buffer.
+loops. Independently produced yielded tensors keep their own storage. Native Tile
+carries select handles; copyable fixed-storage carries retain legal writebacks.
+Functions selected for Buffer IR retain their
+canonical-buffer and explicit yield-transfer contracts.
 
 The pre-yield-fixup form of normalization seeds unresolved `IfStmt` results and
 propagates that status through bare aliases, writeback results, and first-input
@@ -173,6 +178,53 @@ walks around yield fixup.
 The pass skips orchestration-like functions, including graph bodies. In other
 functions, alias normalization still runs when `Compute` returns no retargeting
 rewrites; it can repair existing type drift independently.
+
+### Native Tile references and producer instances
+
+Classification runs at the end of this pass, after retargeting and accumulator
+coalescing have consumed InitMemRef's provisional annotations. Eligible Tile-path
+If results and For/While carries then become native Tile SSA references.
+A loop argument represents `phi(init, yield)`, and a zero-trip result selects
+init. Native references retain a MemRef only for an exact common physical
+window; otherwise their forwarding aliases/views have no unique MemRef. Copyable
+fixed-storage boundaries may realize the phi with the existing canonical-buffer
+copies. Functions selected for Buffer IR keep the canonical contracts below.
+
+Different executions of one producer can have simultaneously live payloads.
+Allocation preparation counts `M` observed incoming Tile references from the
+producer's enclosing repeating loops in its binding component, including outer
+loops. References count by SSA identity, even when they share a source root.
+Preserving `M` such references needs at most `K = M + 1` instances: any surviving
+earlier execution must arrive through an enclosing backedge. Each producer
+receives its own pinned `K`-instance allocation through the existing allocator;
+the bound is conservative, not a minimum-memory packing claim. Proven fixed
+windows can use existing lifetime/no-alias facts to avoid unnecessary instances;
+ambiguous reference components retain all observed incoming handles.
+
+The pure metadata operation `tile.storage_version(anchor, refs)` selects an
+instance whose address range contains none of the protected incoming reference
+addresses. Existing MemRef slot metadata represents that selection. It neither
+copies payloads nor maintains a free list or reference counts. Borrowed inputs
+remain incoming handles rather than becoming compiler-owned instances. Explicit
+author allocations keep their ownership rules. Components containing actual
+payload-mutating writebacks stay on the prior ownership/diagnostic path;
+NoAccess metadata operations remain eligible for native references.
+An isolated, single-result If with fresh local producers can retain its
+canonical destination when runtime validity needs lexical initialization.
+External sources and loop-carried components do not meet that locality proof.
+
+Lifetime analysis completes the direct phi/view source graph before propagating
+maximum payload uses, with memoization for nested phis and loop cycles. An
+observed backedge retains its source through yield; unused forwarding does not
+read payloads. PTO codegen snapshots the yielded descriptors before rebinding
+loop arguments, including runtime valid-shape metadata when needed, without
+modifying the incoming handles. Dynamic-valid or packed-FP4 native snapshots
+require addressed PYPTO or DSA_RP planning; PTOAS reports an unsupported-case
+diagnostic instead of emitting those snapshots. Current PTOAS synchronization
+cannot follow a native Tile alias cycle without resolved constant addresses. Such loops emit
+conservative `PIPE_ALL` barriers at entry and backedges, including addressless
+PTOAS planning. This can reduce pipeline overlap; addressed constant windows
+retain their existing synchronization.
 
 ## Relationship to codegen
 
@@ -263,7 +315,7 @@ physical address for ptoas `PlanMemory`. See
   both yields' window and current binding, and scope dominance. If an earlier
   merge selected a new dominating handle, later merges use that common yielded
   binding even when the identity map still names a rejected sibling handle.
-  Distinct branch windows keep their existing handling.
+  Distinct branch windows use native Tile-handle selection on the Tile path.
 - Accumulator-phi normalization runs for every memory planner before lifetime
   planning. The legacy `PYPTO` path repeats it after opportunistic reuse because
   reuse can introduce a fresh carry/phi mismatch.

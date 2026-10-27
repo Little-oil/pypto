@@ -419,6 +419,8 @@ class PTOCodegen : public CodegenBase {
    * `dst = tuple_var[i]` AssignStmts before they are visited.
    */
   void EmitAllocTileForVar(const ir::VarPtr& tile_var, const std::shared_ptr<const ir::TileType>& tile_type);
+  bool TryEmitReferenceSlot(const ir::VarPtr& value, const ir::TileTypePtr& type);
+  std::string EmitStorageVersionIndex(const ir::CallPtr& call);
 
   /**
    * @brief Resolve the DPS element vars of a tuple-returning op call
@@ -474,7 +476,8 @@ class PTOCodegen : public CodegenBase {
   std::string EnsureTileView(
       const std::string& source, const std::string& source_type,
       const std::shared_ptr<const ir::TileType>& tile_type, const std::string& name_hint,
-      std::optional<std::pair<std::string, std::string>> mutable_valid_shape = std::nullopt);
+      std::optional<std::pair<std::string, std::string>> mutable_valid_shape = std::nullopt,
+      bool snapshot = false);
 
   /**
    * @brief Resolve and allocate every DPS destination of a multi-output call
@@ -1117,6 +1120,10 @@ class PTOCodegen : public CodegenBase {
 
     /// Eligible multi-buffer regions, keyed by the allocation's base Ptr.
     std::map<const ir::Var*, MultiBufferRegion> multi_buffer_regions;
+    /// Compiler-owned reference pools use explicit allocation roots. Native
+    /// multi-buffer regions have different co-live prefetch restrictions.
+    std::set<const ir::Var*> reference_slot_bases;
+    std::map<const ir::Var*, std::vector<std::string>> reference_slot_handles;
     /// The same regions in discovery order — the map is keyed by pointer, which
     /// is not a stable order to emit declarations in.
     std::vector<const ir::Var*> multi_buffer_region_order;
@@ -1246,6 +1253,8 @@ class PTOCodegen : public CodegenBase {
       active_tile_alloc_scopes = {0};
       next_tile_alloc_scope = 0;
       multi_buffer_regions.clear();
+      reference_slot_bases.clear();
+      reference_slot_handles.clear();
       multi_buffer_region_order.clear();
 
       tuple_element_index.clear();
@@ -1357,8 +1366,13 @@ class PTOCodegen : public CodegenBase {
   /// Helper for comparison expression visitors
   void VisitCmpExpr(const ir::BinaryExprPtr& op, const std::string& predicate);
 
-  /// Get MLIR type string for a scalar iter_arg/return_var (e.g., "index", "i1", "f32")
-  std::string GetScalarIterArgTypeString(const std::shared_ptr<const ir::ScalarType>& scalar_type) const;
+  /// Scalar values and Tile references are SSA control-flow values. Tensors
+  /// keep the backing-store binding handled by their existing codegen path.
+  std::string GetControlFlowTypeString(const ir::TypePtr& type) const;
+  void BindControlFlowVar(const ir::VarPtr& var, const std::string& name);
+  std::string PrepareControlFlowValue(const std::string& value, const ir::TypePtr& type,
+                                      bool snapshot = false, bool local_root = false);
+  std::string GetTileAddress(const std::string& value);
 };
 
 }  // namespace codegen

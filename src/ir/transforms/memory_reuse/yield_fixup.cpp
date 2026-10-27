@@ -247,6 +247,13 @@ class YieldFixupMutator : public StorageBoundaryMutator {
   }
 
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+    // A logical Tile carry forwards its actual handle. Fixed-MemRef carries
+    // retain the existing canonical-buffer lowering and ordered writebacks.
+    if (!canonical_branch_storage_ &&
+        std::none_of(op->iter_args_.begin(), op->iter_args_.end(),
+                     [](const auto& argument) { return GetTileTypeWithMemRef(argument->GetType()); })) {
+      return IRMutator::VisitStmt_(op);
+    }
     if (canonical_branch_storage_ && !LoopMayExecute(op, false)) {
       return IRMutator::VisitStmt_(As<ForStmt>(FixupCanonicalLoop(op)));
     }
@@ -273,6 +280,7 @@ class YieldFixupMutator : public StorageBoundaryMutator {
       // AsVarLike, not As<Var>: a nested loop both yields and seeds carries with
       // the enclosing loop's IterArg, whose own ObjectKind As<Var> does not match.
       // Skipping those left the nested carry with no writeback at all.
+      if (!GetTileTypeWithMemRef(for_stmt->iter_args_[i]->GetType())) continue;
       auto yield_var = AsVarLike(yield_stmt->value_[i]);
       if (!yield_var) continue;
 
@@ -397,6 +405,10 @@ class YieldFixupMutator : public StorageBoundaryMutator {
       auto then_tile = then_var ? GetTileTypeWithMemRef(then_var->GetType()) : nullptr;
       auto else_tile = else_var ? GetTileTypeWithMemRef(else_var->GetType()) : nullptr;
       auto rv_tile = As<TileType>(new_return_vars[i]->GetType());
+      // No destination exists for a reference phi. Its incoming handles may
+      // denote different live allocations; reconciling them would overwrite
+      // an input instead of selecting its reference.
+      if (rv_tile && !rv_tile->memref_) continue;
       if (!then_tile && !else_tile) continue;
 
       // PTOAS owns reconciliation of distinct branch buffers. Only propagate
@@ -726,6 +738,7 @@ class YieldFixupMutator : public StorageBoundaryMutator {
   static std::vector<MemRefPtr> CollectCarryRanges(const ForStmtPtr& for_stmt) {
     std::vector<MemRefPtr> ranges(for_stmt->iter_args_.size());
     for (size_t i = 0; i < for_stmt->iter_args_.size(); ++i) {
+      if (!GetTileTypeWithMemRef(for_stmt->iter_args_[i]->GetType())) continue;
       // AsVarLike: a nested loop seeds its carries from the enclosing loop's
       // IterArg, which As<Var> would skip -- and skipping it is exactly how two
       // nested carries seeded from one outer carry would slip past the check below.

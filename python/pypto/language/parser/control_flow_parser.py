@@ -203,7 +203,13 @@ class ControlFlowParser:
             hint="Use: for i in pl.range(n) or for i, (var1,) in pl.range(n, init_values=(...,))",
         )
 
-    def setup_iter_args(self, loop: Any, iter_args_node: ast.AST, init_values: list[ir.Expr]) -> None:
+    def setup_iter_args(
+        self,
+        loop: Any,
+        iter_args_node: ast.AST,
+        init_values: list[ir.Expr],
+        annotations: list[ast.expr | None],
+    ) -> None:
         """Set up iter_args and return_vars for Pattern A loops."""
         if not isinstance(iter_args_node, ast.Tuple):
             raise ParserSyntaxError(
@@ -226,7 +232,12 @@ class ControlFlowParser:
                     span=self.services.span_tracker.get_span(iter_arg_node),
                     hint="Use simple variable names for iteration variables",
                 )
-            iter_arg_var = loop.iter_arg(iter_arg_node.id, init_values[i])
+            annotation = annotations[i]
+            iter_arg_var = loop.iter_arg(
+                iter_arg_node.id,
+                init_values[i],
+                type=self.resolve_yield_var_type(annotation) if annotation is not None else None,
+            )
             self.services.scope_manager.define_var(iter_arg_node.id, iter_arg_var, allow_redef=True)
 
     def parse_for_loop(self, stmt: ast.For) -> None:  # noqa: PLR0912
@@ -374,7 +385,9 @@ class ControlFlowParser:
 
             if not is_simple_for:
                 assert iter_args_node is not None  # Guaranteed by _parse_for_loop_target
-                self.setup_iter_args(loop, iter_args_node, range_args["init_values"])
+                self.setup_iter_args(
+                    loop, iter_args_node, range_args["init_values"], range_args["iter_arg_annotations"]
+                )
 
             with self.yield_tracking_scope():
                 self.callbacks.body(stmt.body)
@@ -412,11 +425,33 @@ class ControlFlowParser:
                     if i < len(loop_result.return_vars):
                         self.services.scope_manager.define_var(var_name, loop_result.return_vars[i])
 
+    def parse_loop_initializers(self, values: list[ast.expr]) -> tuple[list[ir.Expr], list[ast.expr | None]]:
+        """Unwrap private dump annotations without changing initializer expressions."""
+        initializers: list[ir.Expr] = []
+        annotations: list[ast.expr | None] = []
+        for value in values:
+            annotation = None
+            if _is_dump_call(value, "iter_arg"):
+                assert isinstance(value, ast.Call)
+                if len(value.args) != 2 or value.keywords:
+                    raise ParserSyntaxError(
+                        "_dump.iter_arg requires an initializer and a type",
+                        span=self.services.span_tracker.get_span(value),
+                    )
+                value, annotation = value.args
+            initializers.append(self.callbacks.expression(value))
+            # Resolve types after entering the loop scope, just like ordinary
+            # binder annotations; range-index names are available there.
+            annotations.append(annotation)
+        return initializers, annotations
+
     def parse_range_keyword(self, keyword: ast.keyword, result: dict[str, Any], iterator_type: str) -> None:
         """Parse a single keyword argument from a range-like iterator call."""
         if keyword.arg == "init_values":
             if isinstance(keyword.value, (ast.List, ast.Tuple)):
-                result["init_values"] = [self.callbacks.expression(elt) for elt in keyword.value.elts]
+                result["init_values"], result["iter_arg_annotations"] = self.parse_loop_initializers(
+                    keyword.value.elts
+                )
             else:
                 raise ParserSyntaxError(
                     "init_values must be a list or tuple",
@@ -473,6 +508,7 @@ class ControlFlowParser:
 
         result: dict[str, Any] = {
             "init_values": [],
+            "iter_arg_annotations": [],
             "unroll": None,
             "attrs": {},
         }
@@ -532,14 +568,14 @@ class ControlFlowParser:
                 hint="Use: pl.while_(init_values=(...,)) with pl.cond(condition) as first statement in body",
             )
 
-    def parse_while_init_values(self, while_call: ast.Call) -> list[ir.Expr]:
+    def parse_while_init_values(self, while_call: ast.Call) -> tuple[list[ir.Expr], list[ast.expr | None]]:
         """Parse init_values from pl.while_() keyword arguments."""
         init_values: list[ir.Expr] = []
+        annotations: list[ast.expr | None] = []
         for keyword in while_call.keywords:
             if keyword.arg == "init_values":
                 if isinstance(keyword.value, (ast.List, ast.Tuple)):
-                    for elt in keyword.value.elts:
-                        init_values.append(self.callbacks.expression(elt))
+                    init_values, annotations = self.parse_loop_initializers(keyword.value.elts)
                 else:
                     raise ParserSyntaxError(
                         "init_values must be a tuple or list",
@@ -554,7 +590,7 @@ class ControlFlowParser:
                 hint="Provide init_values: pl.while_(init_values=(val1, val2))",
             )
 
-        return init_values
+        return init_values, annotations
 
     @classmethod
     def find_first_bare_yield(cls, stmts: list[ast.stmt]) -> ast.Expr | None:
@@ -641,7 +677,13 @@ class ControlFlowParser:
 
         return iter_args_node
 
-    def setup_while_iter_args(self, loop: Any, iter_args_node: ast.Tuple, init_values: list[ir.Expr]) -> None:
+    def setup_while_iter_args(
+        self,
+        loop: Any,
+        iter_args_node: ast.Tuple,
+        init_values: list[ir.Expr],
+        annotations: list[ast.expr | None],
+    ) -> None:
         """Set up iter_args for pl.while_() loop."""
         for i, iter_arg_node in enumerate(iter_args_node.elts):
             if not isinstance(iter_arg_node, ast.Name):
@@ -650,7 +692,12 @@ class ControlFlowParser:
                     span=self.services.span_tracker.get_span(iter_arg_node),
                     hint="Use simple variable names for iteration variables",
                 )
-            iter_arg_var = loop.iter_arg(iter_arg_node.id, init_values[i])
+            annotation = annotations[i]
+            iter_arg_var = loop.iter_arg(
+                iter_arg_node.id,
+                init_values[i],
+                type=self.resolve_yield_var_type(annotation) if annotation is not None else None,
+            )
             self.services.scope_manager.define_var(iter_arg_node.id, iter_arg_var, allow_redef=True)
 
     def parse_while_body_statements(self, stmt: ast.For) -> list[str]:
@@ -697,7 +744,7 @@ class ControlFlowParser:
         """
         # Validate and parse arguments
         self.validate_while_call_args(while_call)
-        init_values = self.parse_while_init_values(while_call)
+        init_values, annotations = self.parse_while_init_values(while_call)
         self.validate_while_body(stmt)
         iter_args_node = self.validate_while_target(stmt, init_values)
 
@@ -717,7 +764,7 @@ class ControlFlowParser:
             self.services.scope_manager.enter_scope("while")
 
             # Set up iter_args
-            self.setup_while_iter_args(loop, iter_args_node, init_values)
+            self.setup_while_iter_args(loop, iter_args_node, init_values, annotations)
 
             # Parse and set the condition (now that iter_args are in scope)
             condition = self.extract_cond_call(stmt.body[0])

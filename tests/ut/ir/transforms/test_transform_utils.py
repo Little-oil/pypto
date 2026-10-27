@@ -287,12 +287,31 @@ class TestSubstituteExpr:
         result = ir.substitute_expr(ia, [(ia, replacement)])
         assert result is replacement
 
+    def test_substitute_iter_arg_resolves_replacement_chain(self):
+        """Mapped carries resolve further replacements through other mapped carries."""
+        carry = ir.IterArg("carry", ir.ScalarType(DataType.INT64), _const(0), _span())
+        intermediate = ir.IterArg("intermediate", carry.type, _const(1), _span())
+        replacement = _var("replacement")
+        result = ir.substitute_expr(carry, [(carry, intermediate), (intermediate, replacement)])
+        assert result is replacement
+
     def test_iter_arg_no_match(self):
         """Non-matching IterArg is returned unchanged."""
         ia = ir.IterArg("ia", ir.ScalarType(DataType.INT64), _const(0), _span())
         other = _var("other")
         result = ir.substitute_expr(ia, [(other, _var("z"))])
         assert result is ia
+
+    def test_expression_substitution_keeps_unmapped_carry_binder(self):
+        """Folding an offset operand must not clone a bound carry's initializer."""
+        initial, replacement = _var("initial"), _var("replacement")
+        carry = ir.IterArg("carry", ir.ScalarType(DataType.INT64), initial, _span())
+        offset = ir.Mul(carry, initial, DataType.INT64, _span())
+        result = ir.substitute_expr(offset, [(initial, replacement)])
+        assert isinstance(result, ir.Mul)
+        assert result.left.same_as(carry)
+        assert result.right.same_as(replacement)
+        assert carry.initValue.same_as(initial)
 
     def test_substitute_in_add(self):
         """Substitutes variables inside a BinaryExpr."""
@@ -645,6 +664,32 @@ class TestSubstituteTypeEmbeddedRefs:
         assert isinstance(new_type, ir.TileType)
         assert new_type.tile_view is not None
         assert new_type.tile_view.valid_shape[0] is valid_rows_new
+
+    def test_iter_arg_replacement_type_embedded_ref_is_remapped(self):
+        """An explicit carry replacement must resolve substitutions in its descriptor."""
+        valid_rows_old = _index_var("valid_rows")
+        valid_rows_new = _index_var("valid_rows_new")
+        initial = _tile_var_with_valid_shape("initial", [valid_rows_old])
+        carry = ir.IterArg("carry", initial.type, initial, _span())
+        replacement = _tile_var_with_valid_shape("replacement", [valid_rows_old])
+
+        result = ir.substitute_expr(
+            carry,
+            [(carry, replacement), (valid_rows_old, valid_rows_new)],
+        )
+
+        assert isinstance(result, ir.Var)
+        assert result is not replacement
+        assert isinstance(result.type, ir.TileType)
+        assert result.type.tile_view is not None
+        assert result.type.tile_view.valid_shape[0] is valid_rows_new
+        # Resolving an explicit replacement rebuilds it without modifying the
+        # original descriptor or the original carry's initializer.
+        replacement_type = replacement.type
+        assert isinstance(replacement_type, ir.TileType)
+        assert replacement_type.tile_view is not None
+        assert replacement_type.tile_view.valid_shape[0] is valid_rows_old
+        assert carry.initValue.same_as(initial)
 
     def test_cyclic_substitution_does_not_infinite_recurse(self):
         """A cyclic substitution map (A→B, B→A) must not stack-overflow.

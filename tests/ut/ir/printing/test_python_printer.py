@@ -2338,6 +2338,49 @@ class Example:
     assert ir.structural_hash(program) == ir.structural_hash(reparsed)
 
 
+@pytest.mark.parametrize("loop_kind", ["for", "while"])
+@pytest.mark.parametrize("storage", ["none", "different", "same"])
+def test_loop_carry_storage_annotations_roundtrip(loop_kind, storage):
+    """A native carry's descriptor is independent of the initializer's allocation."""
+    initial_type = 'pl.Tile[[16, 32], pl.FP16, pl.MemRef("initial", 0, 1024), pl.Mem.Mat]'
+    carry_type = {
+        "none": "pl.Tile[[16, 32], pl.FP16, pl.Mem.Mat]",
+        "different": 'pl.Tile[[16, 32], pl.FP16, pl.MemRef("carry", 16, 1024), pl.Mem.Mat]',
+        "same": initial_type,
+    }[storage]
+    initializer = f"pl._dump.iter_arg(seed, {carry_type})" if storage != "same" else "seed"
+    header = (
+        f"for i, (carry,) in pl.range(2, init_values=({initializer},)):\n"
+        if loop_kind == "for"
+        else f"for (carry,) in pl.while_(init_values=({initializer},)):\n            pl.cond(count > 0)\n"
+    )
+    program = pl.parse_program(f"""@pl.program
+class Example:
+    @pl.function(type=pl.FunctionType.InCore)
+    def main(self, seed: {initial_type}, count: pl.Scalar[pl.INDEX]):
+        {header}            result: {carry_type} = pl.yield_(carry)
+        return result
+""")
+    function = program.get_function("main")
+    assert function is not None and isinstance(function.body, ir.SeqStmts)
+    loop = function.body.stmts[0]
+    assert isinstance(loop, ir.ForStmt if loop_kind == "for" else ir.WhileStmt)
+    assert loop.iter_args[0].initValue.same_as(function.params[0])
+    descriptor = loop.iter_args[0].type
+    assert isinstance(descriptor, ir.TileType)
+    if storage == "none":
+        assert descriptor.memref is None
+    else:
+        assert descriptor.memref is not None
+        assert isinstance(descriptor.memref.byte_offset_, ir.ConstInt)
+        assert descriptor.memref.byte_offset_.value == (16 if storage == "different" else 0)
+    printed = ir.python_print(program)
+    assert ("_dump.iter_arg(" in printed) == (storage != "same")
+    reparsed = pl.parse_program(printed)
+    ir.assert_structural_equal(program, reparsed)
+    assert ir.structural_hash(program) == ir.structural_hash(reparsed)
+
+
 @pytest.mark.parametrize("types", ["[]", "[pl.FP32]", "pl.FP32"])
 def test_multi_result_dump_yield_rejects_wrong_type_count(types):
     source = f"""@pl.program

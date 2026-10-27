@@ -17,6 +17,8 @@ Window descriptors use named references, for example
 ``window_ref("buf_window")``. Labels encode object sharing without adding IR
 fields. ``call`` accepts any result type supported by the type parser.
 ``submit(pl.submit(...), result_type)`` preserves a Submit result descriptor.
+``iter_arg(initial, type)`` preserves a loop carry's descriptor independently
+of its initializer, without changing ordinary loop authoring syntax.
 Multi-result ``yield_(..., types=[...])`` preserves each region result's type,
 including allocation metadata that differs from the yielded operands.
 """

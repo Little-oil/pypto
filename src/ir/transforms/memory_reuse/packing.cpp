@@ -152,6 +152,8 @@ ReuseMap IdentifyReuseOpportunities(
     const std::map<MemorySpace, uint64_t>& reserved_end_by_space, const std::set<const Var*>& pinned_bases,
     const FunctionPtr& func, std::vector<Diagnostic>* out_hints) {
   ReuseMap reuse_map;
+  std::function<bool(const VarPtr&, const VarPtr&)> reference_overlap;
+  bool refine_reference_paths = false;
   std::vector<BufferRootCompatibility::Root> buffer_roots(lifetimes.size());
   const auto* buffer_context = PassContext::Current();
   if (buffer_context && buffer_context->GetEnableBufferIR()) {
@@ -233,12 +235,12 @@ ReuseMap IdentifyReuseOpportunities(
       for (const auto& y : (gb ? *gb : sb)) {
         if (same_phi_family_var(x.get(), y.get())) {
           family_pair = true;
-        } else if (var_overlap(x.get(), y.get())) {
+        } else if (var_overlap(x.get(), y.get()) && (!refine_reference_paths || reference_overlap(x, y))) {
           return true;  // genuine non-family conflict
         }
       }
     }
-    return !family_pair;  // no phi relation -> block exactly as the coarse gate did
+    return !family_pair && !refine_reference_paths;
   };
 
   // Maps a tile's *original* MemRef base to the base its buffer is coalesced
@@ -626,6 +628,7 @@ ReuseMap IdentifyReuseOpportunities(
       return buffers;
     };
 
+    refine_reference_paths = false;
     std::vector<PackedBuffer> buffers = pack(/*allow_subranges=*/false);
 
     // Capacity relief uses the exact allocator footprint (SpaceFootprint, Primitive A). First retry with
@@ -647,6 +650,19 @@ ReuseMap IdentifyReuseOpportunities(
         }
         return fp.HighWater();
       };
+      // Preserve the existing fitting layout. Before subdividing allocations
+      // or reducing pipeline depth, make one bounded retry using the same
+      // branch/version proof as semantic retargeting.
+      if (cap != 0 && footprint(buffers) > cap && !phi_family_ids.empty()) {
+        if (!reference_overlap) reference_overlap = BuildReferenceInterference(func->body_);
+        refine_reference_paths = true;
+        auto refined = pack(/*allow_subranges=*/false);
+        if (footprint(refined) < footprint(buffers)) {
+          buffers = std::move(refined);
+        } else {
+          refine_reference_paths = false;
+        }
+      }
       auto retry_with_subranges = [&]() {
         if (!subrange_space_safe || cap == 0 || footprint(buffers) <= cap) return;
         auto subdivided = pack(/*allow_subranges=*/true);

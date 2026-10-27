@@ -1287,6 +1287,27 @@ REGISTER_OP("tile.write")
 // Registration Function for Block Memory Operations
 // ============================================================================
 
+// Internal allocation expression: dependencies are explicit SSA references,
+// but inspecting their addresses does not read the Tile payload.
+REGISTER_OP("tile.storage_version")
+    .set_op_category("TileOp")
+    .set_description("Select a producer allocation instance avoiding live incoming Tile references")
+    .set_core_affinity(core_affinity::CoreAffinity::SHARED)
+    .add_argument("anchor", "Constant-instance descriptor of the compiler-owned allocation")
+    .add_argument("live_refs", "Tuple of incoming references whose storage must be preserved")
+    .no_execution_memory_access()
+    .no_memory_spec()
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) -> TypePtr {
+      INTERNAL_CHECK(args.size() == 2 && kwargs.empty() && As<TileType>(args[0]->GetType()) &&
+                     As<MakeTuple>(args[1]))
+          << "storage_version requires an allocation anchor and a tuple of Tile references";
+      for (const auto& reference : As<MakeTuple>(args[1])->elements_) {
+        INTERNAL_CHECK(As<TileType>(reference->GetType())) << "Allocation references must be Tiles";
+      }
+      return std::make_shared<ScalarType>(DataType::INDEX);
+    });
+
 REGISTER_OP("tile.get_block_idx")
     .set_op_category("TileOp")
     .no_execution_memory_access()
