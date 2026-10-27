@@ -599,7 +599,7 @@ class AccStorePhaseVisitor : public IRVisitor {
     const auto storage = storage_.Result(call);
     producers_.push_back(FinalProducer{call->op_->name_, call->span_, storage});
     pending_.insert(token);
-    if (storage) pending_storage_[*storage] = token;
+    if (storage) pending_storage_[*storage].insert(token);
     return token;
   }
 
@@ -610,7 +610,8 @@ class AccStorePhaseVisitor : public IRVisitor {
   void CheckUndrainedStorage(const CallPtr& call, std::optional<StorageId> storage) {
     if (!storage) return;
     const auto pending = pending_storage_.find(*storage);
-    if (pending == pending_storage_.end() || !unsafe_use_reported_.insert(pending->second).second) return;
+    if (pending == pending_storage_.end()) return;
+    if (!unsafe_use_reported_.insert(*pending->second.begin()).second) return;
     // Diagnose the first unsafe use; aliases of that use must not create a
     // cascade. Keep the obligation live so a later missing drain is still seen.
     diagnostics_.emplace_back(
@@ -626,7 +627,13 @@ class AccStorePhaseVisitor : public IRVisitor {
 
   bool ConsumePending(TokenId token) {
     if (pending_.erase(token) == 0) return false;
-    if (const auto storage = producers_[token].storage) pending_storage_.erase(*storage);
+    if (const auto storage = producers_[token].storage) {
+      const auto pending = pending_storage_.find(*storage);
+      INTERNAL_CHECK_SPAN(pending != pending_storage_.end(), producers_[token].span)
+          << "Internal error: live Final token has no pending storage entry";
+      pending->second.erase(token);
+      if (pending->second.empty()) pending_storage_.erase(pending);
+    }
     return true;
   }
 
@@ -732,7 +739,10 @@ class AccStorePhaseVisitor : public IRVisitor {
   std::set<TokenId> reported_;
   std::unordered_map<const Var*, TokenId> var_tokens_;
   AccumulatorStorageLineage storage_;
-  std::unordered_map<StorageId, TokenId> pending_storage_;
+  // Conservative lineage can merge several fresh producers in a region. Each
+  // exact-value drain removes only its own token; another live Final must keep
+  // the storage guarded. Entries are removed only when their token set is empty.
+  std::unordered_map<StorageId, std::set<TokenId>> pending_storage_;
   std::set<TokenId> unsafe_use_reported_;
   bool tuple_provenance_reported_ = false;
 };

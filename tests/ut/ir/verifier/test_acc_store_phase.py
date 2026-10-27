@@ -790,5 +790,59 @@ class FinalTupleProjection:
     assert any("must consume the exact SSA value" in d.message for d in diagnostics)
 
 
+@pytest.mark.parametrize("region", ["for step in pl.range(2):", "if choose_first:"])
+@pytest.mark.parametrize("producer_count", [2, 3])
+@pytest.mark.parametrize("newest_first", [False, True])
+@pytest.mark.parametrize("drain_all_before_use", [False, True])
+def test_draining_merged_storage_preserves_other_final_tokens(
+    region, producer_count, newest_first, drain_all_before_use
+):
+    # Pre-SSA rebindings inside a region conservatively merge fresh storage
+    # identities. Each exact Final value still has its own drain obligation;
+    # draining one must not hide an unsafe read of another in either order.
+    statements = []
+    for index in range(producer_count):
+        statements.extend(
+            [
+                "c = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final)",
+                f"held{index} = c",
+            ]
+        )
+    order = list(range(producer_count))
+    if newest_first:
+        order.reverse()
+    stores = [f"out = pl.store(held{i}, [0, 0], out, st_phase=pl.STPhase.Final)" for i in order]
+    update = f"pl.tile.matmul_acc(held{order[-1]}, lhs, rhs, acc_phase=pl.AccPhase.Partial)"
+    if drain_all_before_use:
+        statements.extend([*stores, update])
+    else:
+        statements.extend([stores[0], update, *stores[1:]])
+    # After the last drain, the same abstract storage can begin a fresh pair.
+    statements.extend(
+        [
+            f"next_final = pl.tile.matmul_acc(held{order[-1]}, lhs, rhs, acc_phase=pl.AccPhase.Final)",
+            "out = pl.store(next_final, [0, 0], out, st_phase=pl.STPhase.Final)",
+        ]
+    )
+    body = "\n".join(f"            {statement}" for statement in statements)
+    program = pl.parse_program(f"""
+@pl.program
+class MergedFinalTokens:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]], choose_first: pl.Scalar[pl.BOOL]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        {region}
+{body}
+""")
+    diagnostics = _verify(program)
+    if drain_all_before_use:
+        assert diagnostics == []
+    else:
+        assert len(diagnostics) == 1
+        assert "undrained final accumulator producer" in diagnostics[0].message
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
