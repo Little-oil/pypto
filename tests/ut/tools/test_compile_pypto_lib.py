@@ -589,5 +589,76 @@ def test_native_compile_cli_receives_isolated_artifact_dirs(
     )
 
 
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+@pytest.mark.parametrize("inactive", [False, True], ids=["replay-selector", "unused-parser"])
+def test_compile_cli_keeps_optional_runtime_defaults(library, tmp_path, platform, inactive):
+    """A same-named replay option or unused parser does not request artifact output."""
+    option = (
+        "unused = argparse.ArgumentParser()\nunused.add_argument('--runtime-dir')\n"
+        if inactive
+        else "parser.add_argument('--runtime-dir')\n"
+    )
+    (library / "models/case.py").write_text(
+        "import argparse\n"
+        "from golden import run\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('-p')\n"
+        "parser.add_argument('--compile-only', action='store_true')\n"
+        f"{option}"
+        "args = parser.parse_args()\n"
+        "if getattr(args, 'runtime_dir', None) is not None:\n"
+        "    parser.error('replay requires selecting one --op')\n"
+        "run('ok', [])\n"
+    )
+    output = tmp_path / "out"
+    result = audit.run_case(library, "models/case.py", platform, output, 10)
+    assert result["passed"], (output / result["log"]).read_text()
+    assert len(result["compilations"]) == 1
+
+
+@pytest.mark.parametrize("compiler_result", ["ok", "bad"])
+def test_missing_artifact_directory_after_compilation_is_not_retried(library, tmp_path, compiler_result):
+    """A late CLI error must not run a successful or failed compilation twice."""
+    (library / "models/case.py").write_text(
+        "import argparse\n"
+        "from golden import run\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('-p')\n"
+        "parser.add_argument('--compile-only', action='store_true')\n"
+        "parser.add_argument('--runtime-dir')\n"
+        "args = parser.parse_args()\n"
+        "print('COMPILE_ONCE', flush=True)\n"
+        f"run({compiler_result!r}, [])\n"
+        "if args.runtime_dir is None:\n"
+        "    parser.error('--compile-only requires --runtime-dir')\n"
+    )
+    output = tmp_path / "out"
+    result = audit.run_case(library, "models/case.py", "a2a3", output, 10)
+    assert not result["passed"]
+    assert result["exit_code"] == 2
+    assert len(result["compilations"]) == 1
+    assert (output / result["log"]).read_text().count("COMPILE_ONCE") == 1
+
+
+def test_required_artifact_argument_is_supplied_after_validation(library, tmp_path):
+    """Argparse's required-option diagnostic can request the same bounded retry."""
+    (library / "models/case.py").write_text(
+        "import argparse\n"
+        "from pathlib import Path\n"
+        "from golden import run\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('-p')\n"
+        "parser.add_argument('--compile-only', action='store_true')\n"
+        "parser.add_argument('--runtime-dir', type=Path, required=True)\n"
+        "args = parser.parse_args()\n"
+        "assert args.compile_only\n"
+        "args.runtime_dir.mkdir(parents=True)\n"
+        "run('ok', [])\n"
+    )
+    result = audit.run_case(library, "models/case.py", "a5", tmp_path / "out with spaces", 10)
+    assert result["passed"]
+    assert len(result["compilations"]) == 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

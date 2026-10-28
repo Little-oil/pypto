@@ -107,10 +107,9 @@ def entry_args(path: Path, platform: str, artifact_dir: Path | None = None) -> l
     if "--compile-only" in declared_options:
         args += ["--compile-only"]
         if artifact_dir is not None and "--runtime-dir" in declared_options:
-            # Native model compile CLIs can require a manifest/artifact output
-            # directory before golden.run is reached. Isolate it per entry;
-            # execution-only runtime selectors must keep their original default.
-            args += ["--runtime-dir", str(artifact_dir)]
+            # The caller supplies this only after the active CLI requests it.
+            # Declarations alone may describe replay options or unused parsers.
+            args += ["--runtime-dir", str(artifact_dir.resolve())]
     return args
 
 
@@ -125,6 +124,26 @@ def read_receipt(receipt: Path) -> list[dict[str, Any]]:
     ):
         return []
     return results
+
+
+def _requires_artifact_directory(receipt: Path, log_path: Path) -> bool:
+    """Recognize an explicit CLI request before any compilation has been recorded."""
+    try:
+        # Require the worker's valid, empty receipt: an absent or malformed
+        # record must remain a failure rather than being hidden by a retry.
+        if receipt.read_bytes().strip() != b"[]":
+            return False
+        output = log_path.read_text(errors="replace")
+    except OSError:
+        return False
+    return (
+        re.search(
+            r"(?m)^.*: error: (?:--compile-only requires --runtime-dir|"
+            r"the following arguments are required: --runtime-dir)\r?$",
+            output,
+        )
+        is not None
+    )
 
 
 def compile_entry(lib: Path, entry: str, platform: str, receipt: Path, argv: list[str] | None = None) -> None:
@@ -285,16 +304,32 @@ def run_case(lib: Path, entry: str, platform: str, output: Path, timeout: int) -
     start = time.monotonic()
     timed_out = False
     with log_path.open("w") as log:
-        with subprocess.Popen(
-            command, cwd=lib, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
-        ) as proc:
-            try:
-                code = proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                os.killpg(proc.pid, signal.SIGKILL)
-                code = proc.wait()
-                log.write(f"\nTimed out after {timeout}s\n")
+        # Start with the entry's normal defaults. A same-named runtime option
+        # can select replay, or belong to a parser this invocation never uses.
+        # Only an explicit pre-compilation CLI validation request permits one
+        # retry, and both attempts share the original per-entry time budget.
+        for attempt in range(2):
+            with subprocess.Popen(
+                command, cwd=lib, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+            ) as proc:
+                try:
+                    remaining = max(0.0, timeout - (time.monotonic() - start))
+                    code = proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    code = proc.wait()
+                    log.write(f"\nTimed out after {timeout}s\n")
+            log.flush()
+            if attempt or timed_out or code != 2 or not _requires_artifact_directory(receipt, log_path):
+                break
+            argv = entry_args((lib / entry).resolve(), platform, artifact_dir=case_dir / "runtime")
+            if "--compile-only" not in argv or "--runtime-dir" not in argv:
+                break
+            command += ["--entry-args", json.dumps(argv[1:])]
+            receipt.unlink(missing_ok=True)
+            log.write("\nRetrying CLI validation with an isolated artifact directory\n")
+            log.flush()
     results = read_receipt(receipt)
     passed = code == 0 and bool(results) and all(result["passed"] for result in results)
     return {
