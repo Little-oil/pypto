@@ -38,6 +38,10 @@ Tensor 源的 assemble，也能保留局部标量更新，避免引入不支持�
 并生成 `tile.col_sum(input, scratch)`。Tensor 层的策略属性在这里消费，
 codegen 根据额外的 Tile 参数选择 `isBinary=true`。
 
+`tensor.cmp` 先降级为打包谓词 `tile.cmp`/`tile.cmps`，再由 `tile.sel`
+从生成的 1/0 数据 tile 中选择结果。这些数据 tile 保留比较输入的逻辑有效区域，
+包括动态行数和列数；谓词存储按字节向上取整不能扩大数据的有效区域。
+
 对于支持的 physical shape 签名，每个调用在分配输出或传播返回类型前，同时绑定显式
 scalar 和 tensor 类型中的隐式维度。替换是同时进行的：`[N, M] -> [M, 128]` 的
 第一个结果仍为 M，不能把调用者表达式继续按 callee 符号递归替换。
