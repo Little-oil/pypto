@@ -2941,7 +2941,7 @@ class TestTileMatMulOps:
             assert len(call.args) == 4
             assert isinstance(call.args[3], ir.ConstBool) and call.args[3].value
             assert len(dsl_call.args) == 4
-            assert isinstance(dsl_call.args[3], ir.ConstInt) and dsl_call.args[3].value == 1
+            assert isinstance(dsl_call.args[3], ir.ConstBool) and dsl_call.args[3].value
             assert dsl_call.args[3].dtype == DataType.BOOL
             default_call = tile.matmul_acc(acc, lhs, rhs)
         else:

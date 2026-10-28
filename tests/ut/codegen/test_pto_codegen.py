@@ -494,8 +494,12 @@ def test_pto_codegen_matmul_acc_accepts_acc_valid_shape_containment():
 
 
 @pytest.mark.parametrize("phase", [pl.AccPhase.Unspecified, pl.AccPhase.Partial, pl.AccPhase.Final])
-def test_pto_codegen_matmul_unit_flag_phase(phase):
+@pytest.mark.parametrize("tf32_mode", [None, "round_even", "round_away"])
+def test_pto_codegen_matmul_unit_flag_phase(phase, tf32_mode):
     """Exercise the default pipeline, including the matching final FIX drain."""
+    if tf32_mode is not None:
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend950)
     store_phase = pl.STPhase.Final if phase == pl.AccPhase.Final else pl.STPhase.Unspecified
 
     @pl.program
@@ -509,7 +513,7 @@ def test_pto_codegen_matmul_unit_flag_phase(phase):
         ) -> pl.Tensor[[16, 16], pl.FP32]:
             lhs = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
             rhs = pl.load(b, [0, 0], [16, 16], target_memory=pl.Mem.Mat)
-            result = pl.tile.matmul(lhs, rhs, acc_phase=phase)
+            result = pl.tile.matmul(lhs, rhs, tf32_mode=tf32_mode, acc_phase=phase)
             return pl.store(result, [0, 0], out, st_phase=store_phase)
 
     mlir_code = _generate_default_mlir(MatmulPhaseProgram)
@@ -519,6 +523,9 @@ def test_pto_codegen_matmul_unit_flag_phase(phase):
         assert "accPhase" not in matmul_lines[0]
     else:
         assert f"#pto<acc_phase {phase.name.lower()}>" in matmul_lines[0]
+    if tf32_mode is not None:
+        assert f"tf32_mode = #pto<tf32_mode {tf32_mode}>" in matmul_lines[0]
+        assert matmul_lines[0].count("{") == 1
     assert ("#pto<st_phase final>" in mlir_code) == (phase == pl.AccPhase.Final)
 
 

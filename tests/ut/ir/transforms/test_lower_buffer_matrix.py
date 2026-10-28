@@ -535,23 +535,26 @@ def test_matmul_kwargs_are_rejected_rather_than_dropped():
 
 @pytest.mark.parametrize("phase", [pl.AccPhase.Unspecified, pl.AccPhase.Partial, pl.AccPhase.Final])
 @pytest.mark.parametrize("accumulate", [False, True], ids=["base", "acc"])
-def test_explicit_matrix_lowering_rejects_phases_it_cannot_preserve(phase, accumulate):
+@pytest.mark.parametrize("tf32_mode", [None, "round_even", "round_away"])
+def test_explicit_matrix_lowering_rejects_phases_it_cannot_preserve(phase, accumulate, tf32_mode):
     """The direct lowering API must reject synchronization absent from BufferIR."""
     kernel = _PlannedMatrixKernel()
+    input_dtype = DataType.FP16 if tf32_mode is None else DataType.FP32
+    input_bytes = 2 if tf32_mode is None else 4
     lhs = kernel.tile(
         "lhs",
-        kernel.allocation("left", ir.MemorySpace.Left, 2048),
+        kernel.allocation("left", ir.MemorySpace.Left, 16 * 64 * input_bytes),
         0,
         (16, 64),
-        DataType.FP16,
+        input_dtype,
         ir.MemorySpace.Left,
     )
     rhs = kernel.tile(
         "rhs",
-        kernel.allocation("right", ir.MemorySpace.Right, 4096),
+        kernel.allocation("right", ir.MemorySpace.Right, 64 * 32 * input_bytes),
         0,
         (64, 32),
-        DataType.FP16,
+        input_dtype,
         ir.MemorySpace.Right,
     )
     acc = kernel.tile(
@@ -567,12 +570,18 @@ def test_explicit_matrix_lowering_rejects_phases_it_cannot_preserve(phase, accum
     args = [acc, lhs, rhs] if accumulate else [lhs, rhs]
     # Construct explicit Unspecified metadata too: it must stay a legal no-op
     # even though the Python wrapper normally omits this default attribute.
-    call = ir.Call(ir.get_op(op_name), args, {"acc_phase": int(phase)}, product.type, _SPAN)
+    kwargs: dict[str, int | str] = {"acc_phase": int(phase)}
+    if tf32_mode is not None:
+        kwargs["tf32_mode"] = tf32_mode
+    call = ir.Call(ir.get_op(op_name), args, kwargs, product.type, _SPAN)
     kernel.body.append(ir.AssignStmt(product, call, _SPAN))
     if phase == pl.AccPhase.Unspecified:
         lowered = _lower_planned(kernel.program(), passes.MemoryPlanner.PTOAS)
         expected = "buffer.matmul_acc" if accumulate else "buffer.matmul"
         assert _call_names(lowered)[ir.get_op(expected).name] == 1
+        if tf32_mode is not None:
+            assert f'tf32_mode="{tf32_mode}"' in ir.python_print(lowered)
+        assert "acc_phase" not in ir.python_print(lowered)
     else:
         with pytest.raises(ValueError, match="nondefault acc_phase is not supported by BufferIR"):
             _lower_planned(kernel.program(), passes.MemoryPlanner.PTOAS)

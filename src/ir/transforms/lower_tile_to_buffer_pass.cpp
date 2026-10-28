@@ -1258,7 +1258,8 @@ class TileToBufferMutator : public IRMutator {
       // Keep the lowering contract closed while native Matmul kwargs remain
       // open for compiler metadata. Only the no-op phase may be discarded.
       using AccPhaseValue = std::underlying_type_t<AccPhase>;
-      ValidateKwargs(call->kwargs_, {{"tf32_mode", typeid(std::string)}, {"acc_phase", typeid(AccPhaseValue)}},
+      ValidateKwargs(call->kwargs_,
+                     {{"tf32_mode", typeid(std::string)}, {"acc_phase", typeid(AccPhaseValue)}},
                      call->op_->name_);
       CHECK_SPAN(call->GetKwarg<int>("acc_phase", static_cast<int>(AccPhase::kUnspecified)) ==
                      static_cast<int>(AccPhase::kUnspecified),
