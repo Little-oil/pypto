@@ -72,7 +72,7 @@ def select_entries(lib: Path, platform: str) -> list[str]:
     return entries
 
 
-def entry_args(path: Path, platform: str, runtime_dir: Path | None = None) -> list[str]:
+def entry_args(path: Path, platform: str, artifact_dir: Path | None = None) -> list[str]:
     """Supply platform and declared logical ranks without acquiring devices."""
     source = path.read_text()
     args = [str(path), "-p", platform]
@@ -98,13 +98,19 @@ def entry_args(path: Path, platform: str, runtime_dir: Path | None = None) -> li
         for node in options
     ):
         args += ["-d", "0"]
-    if any(
-        any(isinstance(arg, ast.Constant) and arg.value == "--compile-only" for arg in node.args)
+    declared_options = {
+        arg.value
         for node in options
-    ):
+        for arg in node.args
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+    }
+    if "--compile-only" in declared_options:
         args += ["--compile-only"]
-        if runtime_dir is not None:
-            args += ["--runtime-dir", str(runtime_dir)]
+        if artifact_dir is not None and "--runtime-dir" in declared_options:
+            # Native model compile CLIs can require a manifest/artifact output
+            # directory before golden.run is reached. Isolate it per entry;
+            # execution-only runtime selectors must keep their original default.
+            args += ["--runtime-dir", str(artifact_dir)]
     return args
 
 

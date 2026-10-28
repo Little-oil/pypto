@@ -137,6 +137,10 @@ Repeat with `--platform a5`. Each entry has a 1200-second timeout (override with
 `--timeout`). Compilation failures, process failures, timeouts, and zero recorded
 compilations fail the job. Malformed or unreadable receipts fail their entry
 without aborting the remaining entries or losing the matrix summary.
+Entries declaring both `--compile-only` and `--runtime-dir` receive an isolated
+artifact directory beside their compilation receipts. This satisfies native
+model compile CLIs without sharing output between entries; execution-only
+runtime selectors keep their default.
 When an entry dispatches cases by launching its own script with the current
 Python interpreter, each child runs through the same compile-only adapter.
 Child environment, working directory, and process isolation are preserved,

@@ -534,5 +534,60 @@ def test_manifest_uses_library_selector(library, tmp_path, monkeypatch, kernel, 
     assert json.loads((output / "results.json").read_text())[0]["passed"] is (status == 0)
 
 
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+@pytest.mark.parametrize(
+    "compile_cli,artifact_cli", [(True, True), (True, False), (False, True), (False, False)]
+)
+def test_native_compile_cli_receives_isolated_artifact_dirs(
+    library, tmp_path, platform, compile_cli, artifact_cli
+):
+    """Native model compilation needs an output directory before golden.run is called.
+
+    Older entries also use --runtime-dir to select an execution runtime, so it
+    must only be populated alongside an advertised native --compile-only mode.
+    Distinct entries must not share their generated artifacts.
+    """
+    options = ""
+    checks = ""
+    if compile_cli:
+        options += "parser.add_argument('--compile-only', action='store_true')\n"
+        checks += "assert args.compile_only\n"
+    if artifact_cli:
+        options += "parser.add_argument('--runtime-dir', type=Path)\n"
+        if compile_cli:
+            checks += (
+                "if args.runtime_dir is None:\n"
+                "    parser.error('--compile-only requires --runtime-dir')\n"
+                "assert args.runtime_dir.is_relative_to(Path(os.environ['PYPTO_PROG_BUILD_DIR']).parent)\n"
+                "args.runtime_dir.mkdir(parents=True)\n"
+                "(args.runtime_dir / 'manifest.json').write_text(__file__)\n"
+            )
+        else:
+            checks += "assert args.runtime_dir is None\n"
+    source = (
+        "import argparse, os\n"
+        "from pathlib import Path\n"
+        "from golden import run\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('-p')\n"
+        f"{options}"
+        "args = parser.parse_args()\n"
+        f"{checks}"
+        "run('ok', [])\n"
+    )
+    output = tmp_path / "artifacts with spaces"
+    for name in ("first", "second"):
+        entry = f"models/{name}.py"
+        (library / entry).write_text(source)
+        result = audit.run_case(library, entry, platform, output, 10)
+        assert result["passed"], (output / result["log"]).read_text()
+        assert len(result["compilations"]) == 1
+    manifests = list(output.rglob("manifest.json"))
+    assert len(manifests) == (2 if compile_cli and artifact_cli else 0)
+    assert {Path(path.read_text()).stem for path in manifests} == (
+        {"first", "second"} if compile_cli and artifact_cli else set()
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
