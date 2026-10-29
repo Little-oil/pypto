@@ -28,19 +28,6 @@ MemRefs) and before the selected memory planner. It always runs. `PYPTO` follows
 it with [`MemoryReuse`](37-memory_reuse.md); `DSA_RP` consumes its allocation
 identities in [`AllocateMemoryAddr`](38-allocate_memory_addr.md).
 
-## Logical Tile selections
-
-On the Tile path, two compatible compiler-owned values selected by an If can use
-one allocation with disjoint slots. Both yields and the result carry a scalar
-slot index; `tile.create` reconstructs the selected descriptor without copying
-payloads. This also applies when a same-space move would be hardware-legal.
-An If exit barrier completes asynchronous producers before the selected view is used.
-The lowering retains full implicit descriptors in Vec/Mat/Acc and leaves explicit,
-borrowed, writeback, loop-touched and Buffer IR storage on their existing paths.
-All planners use the existing multi-buffer representation for the two slots.
-Compiler-created pools retain their full allocation capacity and slot identities,
-and participate in lifetime reuse as whole allocations.
-
 ## API
 
 | C++ | Python | Level |
@@ -189,6 +176,41 @@ rewrites; it can repair existing type drift independently.
 
 ## Relationship to codegen
 
+### Native Tile results from `IfStmt`
+
+A Tile-valued `IfStmt` selects the Tile handle yielded by the executed arm.
+The arms retain their own storage; neither `MaterializeSemanticAliases` nor
+`MemoryReuse` inserts a `tile.move` to make their addresses equal. PTO codegen
+uses PTOAS's native region results:
+
+```mlir
+%selected = scf.if %cond -> (!T) {
+  scf.yield %a : !T
+} else {
+  scf.yield %b : !T
+}
+```
+
+This selects a descriptor, without copying Tile contents. There is no selection
+pool, slot index, fixed two-slot layout, or restriction to a particular memory
+space. Borrowed inputs, author-declared allocations, branch-local producers,
+and dynamic valid shapes use the same path. Yielded descriptors must have the
+same PTO type; descriptor-only views reconcile compatible valid-shape type
+representations without a data transfer.
+
+The lifetime analysis records both possible sources and follows aliases and
+views. A later use of `%selected` keeps both candidates alive through that use;
+after their last use, ordinary memory reuse applies to each allocation. The
+candidates are not unconditional aliases and must not be merged just because
+one of them represents the result's MemRef metadata.
+
+`SelectBufferIRFunctions` retains loop-free functions with Tile-valued If results
+on the Tile path, including when Buffer IR is enabled: Buffer lowering currently
+erases Tile region results and cannot represent this dynamic handle choice.
+This preserves native selection for branch-only kernels in the default pipeline.
+Kernels containing For/While retain their existing Buffer eligibility and carry
+lowering; changing their whole-kernel route would also change loop semantics.
+
 ### Staged Buffer IR pipeline
 
 `PassContext(enable_buffer_ir=True)` enables the storage-legalization portion of
@@ -264,19 +286,6 @@ physical address for ptoas `PlanMemory`. See
   behavior of the former single `MemoryReuse` pass.
 - `DSA_RP` and `PTOAS` both skip opportunistic MemRef coalescing here; neither
   may undo a must-alias relation established by this pass.
-- On the legacy `PTOAS` path, if both branches yield the same tile byte window
-  (allocation, offset, size, slot count, and slot index), and both yields and the
-  result have the same known memory space, the merged result retains that window
-  without a copy. Semantic aliases follow the repaired result while preserving
-  their type/view metadata. Registered views rebase their relative byte offset
-  onto the repaired source, preserving their own extent and inheriting its
-  pipeline slot identity;
-  subsequent whole-window writeback results follow that view. Reusing an existing
-  mixed-type codegen handle additionally requires matching its declared SSA type,
-  both yields' window and current binding, and scope dominance. If an earlier
-  merge selected a new dominating handle, later merges use that common yielded
-  binding even when the identity map still names a rejected sibling handle.
-  Distinct branch windows keep their existing handling.
 - Accumulator-phi normalization runs for every memory planner before lifetime
   planning. The legacy `PYPTO` path repeats it after opportunistic reuse because
   reuse can introduce a fresh carry/phi mismatch.
