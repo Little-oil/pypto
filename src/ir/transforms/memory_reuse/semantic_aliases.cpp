@@ -590,8 +590,9 @@ StorageSelectionPlan BuildStorageSelectionPlan(const StmtPtr& body, const std::v
     }
   } contracts;
   for (const auto& parameter : parameters) {
-    if (const auto memory = GetTypeMemRef(parameter->GetType()))
+    if (const auto memory = GetTypeMemRef(parameter->GetType())) {
       contracts.bases.insert((*memory)->base_.get());
+    }
   }
   contracts.VisitStmt(body);
 
@@ -754,8 +755,9 @@ StorageSelectionPlan BuildStorageSelectionPlan(const StmtPtr& body, const std::v
     plan.allocations.push_back(CreateAllocStatement(
         allocation, *As<TileType>(members.front()->GetType())->GetMemorySpace(), /*pinned=*/true));
     std::function<ExprPtr(const VarPtr&)> slot = [&](const VarPtr& value) -> ExprPtr {
-      if (const auto found = plan.indices.find(value.get()); found != plan.indices.end())
+      if (const auto found = plan.indices.find(value.get()); found != plan.indices.end()) {
         return found->second;
+      }
       const auto& definition = index.defs.at(value);
       ExprPtr result;
       if (definition.kind == VarDef::kAssign) {

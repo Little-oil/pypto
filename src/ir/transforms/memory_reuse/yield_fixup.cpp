@@ -381,12 +381,13 @@ class YieldFixupMutator : public StorageBoundaryMutator {
       // A logical if result selects a source window; it does not require either
       // arm to copy its payload onto the other arm. Rewrite the signature and
       // both yields together, retaining the original condition and body order.
+      const auto& plan = *selections_;
       auto selected = MutableCopy(if_stmt);
-      selected->then_body_ = RewriteSelectionYield(if_stmt->then_body_, op->return_vars_);
+      selected->then_body_ = RewriteSelectionYield(if_stmt->then_body_, op->return_vars_, plan);
       if (if_stmt->else_body_) {
-        selected->else_body_ = RewriteSelectionYield(*if_stmt->else_body_, op->return_vars_);
+        selected->else_body_ = RewriteSelectionYield(*if_stmt->else_body_, op->return_vars_, plan);
       }
-      return FinishSelection(op->return_vars_, selected);
+      return FinishSelection(op->return_vars_, selected, plan);
     }
     if (canonical_branch_storage_) return FixupCanonicalIf(if_stmt);
 
@@ -507,36 +508,41 @@ class YieldFixupMutator : public StorageBoundaryMutator {
     return std::make_shared<EvalStmt>(OpRegistry::GetInstance().Create("system.bar_all", {}, {}, span), span);
   }
 
-  StmtPtr SelectionDescriptor(const VarPtr& original) {
-    const auto& variable = selections_->tiles.at(original.get());
+  StmtPtr SelectionDescriptor(const VarPtr& original, const StorageSelectionPlan& plan) {
+    const auto& variable = plan.tiles.at(original.get());
     const auto tile = As<TileType>(variable->GetType());
+    const auto memory_space = tile->GetMemorySpace();
+    INTERNAL_CHECK_SPAN(memory_space.has_value(), original->span_)
+        << "Storage selection descriptor must have a memory space";
     const auto create = OpRegistry::GetInstance().Create(
         "tile.create", {std::make_shared<MakeTuple>(tile->shape_, original->span_)},
-        {{"dtype", tile->dtype_}, {"target_memory", *tile->GetMemorySpace()}}, original->span_);
+        {{"dtype", tile->dtype_}, {"target_memory", memory_space.value()}}, original->span_);
     return std::make_shared<AssignStmt>(variable, create, original->span_);
   }
 
-  StmtPtr RewriteSelectionYield(const StmtPtr& body, const std::vector<VarPtr>& results) {
+  StmtPtr RewriteSelectionYield(const StmtPtr& body, const std::vector<VarPtr>& results,
+                                const StorageSelectionPlan& plan) {
     return transform_utils::RewriteLastYieldStmt(body, [&](const YieldStmtPtr& yield) -> StmtPtr {
       auto values = yield->value_;
       bool changed = false;
       for (size_t i = 0; i < values.size() && i < results.size(); ++i) {
-        if (!selections_->tiles.count(results[i].get())) continue;
+        if (!plan.tiles.count(results[i].get())) continue;
         const auto source = AsVarLike(values[i]);
         INTERNAL_CHECK_SPAN(source, yield->span_) << "Storage selection must yield a storage variable";
-        values[i] = selections_->indices.at(source.get());
+        values[i] = plan.indices.at(source.get());
         changed = true;
       }
       return changed ? std::make_shared<YieldStmt>(values, yield->span_) : yield;
     });
   }
 
-  StmtPtr FinishSelection(const std::vector<VarPtr>& original, const std::shared_ptr<IfStmt>& rewritten) {
+  StmtPtr FinishSelection(const std::vector<VarPtr>& original, const std::shared_ptr<IfStmt>& rewritten,
+                          const StorageSelectionPlan& plan) {
     std::vector<StmtPtr> suffix;
     for (size_t i = 0; i < original.size(); ++i) {
-      if (!selections_->tiles.count(original[i].get())) continue;
-      rewritten->return_vars_[i] = AsVarLike(selections_->indices.at(original[i].get()));
-      suffix.push_back(SelectionDescriptor(original[i]));
+      if (!plan.tiles.count(original[i].get())) continue;
+      rewritten->return_vars_[i] = AsVarLike(plan.indices.at(original[i].get()));
+      suffix.push_back(SelectionDescriptor(original[i], plan));
     }
     if (suffix.empty()) return rewritten;
     // Wait after the region so branch-local asynchronous producers are also
