@@ -41,6 +41,16 @@ FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func);
 StmtPtr RefreshStorageTypes(const StmtPtr& body);
 StmtPtr CoalesceAccumulatorIfPhis(const StmtPtr& body);
 
+// Function-local plan for descriptor selection. Keys are original Tile Vars;
+// indices also maps replacement Tile Vars to the same scalar slot expression.
+struct StorageSelectionPlan {
+  std::map<const Var*, VarPtr> tiles;
+  std::map<const Var*, ExprPtr> indices;
+  std::vector<StmtPtr> allocations;
+};
+StmtPtr MaterializeStorageSelections(const StmtPtr& body, const std::vector<VarPtr>& parameters,
+                                     StorageSelectionPlan plan);
+
 using HazardInputs = AllocationHazardInputs;
 using ForbidAliasMap = AllocationForbidAliasMap;
 

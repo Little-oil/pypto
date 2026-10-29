@@ -24,6 +24,14 @@ carried 的 `iter_arg`/`initValue` MemRef 沿 yield/producer 链向下传播来�
 [`MemoryReuse`](37-memory_reuse.md)；`DSA_RP` 在
 [`AllocateMemoryAddr`](38-allocate_memory_addr.md) 中消费这些分配身份。
 
+## 逻辑 Tile 选择
+
+在 Tile 路径中，If 选择的两个兼容、由编译器拥有的值可以使用同一 allocation 的不同 slot。
+两支 yield 与返回值都传递标量 slot 索引，再用 `tile.create` 重建描述符，不复制数据；
+即使同空间 TMOV 在硬件上合法，也不因选择而插入它。If 出口的 barrier 保证异步 producer
+完成后再使用所选视图。当前处理 Vec/Mat/Acc 的完整隐式描述符；显式分配、借用、写回、
+循环涉及的存储及 Buffer IR 保持原有路径。所有 planner 均复用既有 multi-buffer 表达。
+
 ## API
 
 | C++ | Python | 级别 |

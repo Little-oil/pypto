@@ -39,6 +39,7 @@
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/memref_collectors.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
@@ -186,8 +187,15 @@ class YieldFixupMutator : public StorageBoundaryMutator {
 
   StmtPtr Run(const StmtPtr& body, const std::vector<VarPtr>& parameters) {
     if (canonical_branch_storage_) names_.Collect(body, parameters);
+    if (selections_) {
+      for (const auto& [old_var, replacement] : selections_->tiles) {
+        var_remap_[old_var] = replacement;
+      }
+    }
     return VisitStmt(body);
   }
+
+  explicit YieldFixupMutator(StorageSelectionPlan selections) : selections_(std::move(selections)) {}
 
   /// `fixup_if_stmts=false` reconciles ForStmt carries and preserves already
   /// shared tile windows across if results, without inserting branch copies. Used under
@@ -201,7 +209,7 @@ class YieldFixupMutator : public StorageBoundaryMutator {
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     auto result = IRMutator::VisitStmt_(op);
-    if (fixup_if_stmts_) return result;
+    if (selections_ || fixup_if_stmts_) return result;
 
     // Follow semantic aliases of a repaired phi. Registered views re-derive
     // their relative window; writeback results keep their input's whole window.
@@ -247,6 +255,7 @@ class YieldFixupMutator : public StorageBoundaryMutator {
   }
 
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+    if (selections_) return op;  // Loop-touched storage is excluded from the plan.
     if (canonical_branch_storage_ && !LoopMayExecute(op, false)) {
       return IRMutator::VisitStmt_(As<ForStmt>(FixupCanonicalLoop(op)));
     }
@@ -354,6 +363,7 @@ class YieldFixupMutator : public StorageBoundaryMutator {
   }
 
   StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
+    if (selections_) return op;
     if (canonical_branch_storage_ && !LoopMayExecute(op, false)) {
       return IRMutator::VisitStmt_(As<WhileStmt>(FixupCanonicalLoop(op)));
     }
@@ -367,6 +377,17 @@ class YieldFixupMutator : public StorageBoundaryMutator {
     auto result = IRMutator::VisitStmt_(op);
     auto if_stmt = As<IfStmt>(result);
     if (!if_stmt || if_stmt->return_vars_.empty()) return result;
+    if (selections_) {
+      // A logical if result selects a source window; it does not require either
+      // arm to copy its payload onto the other arm. Rewrite the signature and
+      // both yields together, retaining the original condition and body order.
+      auto selected = MutableCopy(if_stmt);
+      selected->then_body_ = RewriteSelectionYield(if_stmt->then_body_, op->return_vars_);
+      if (if_stmt->else_body_) {
+        selected->else_body_ = RewriteSelectionYield(*if_stmt->else_body_, op->return_vars_);
+      }
+      return FinishSelection(op->return_vars_, selected);
+    }
     if (canonical_branch_storage_) return FixupCanonicalIf(if_stmt);
 
     // Find yield statements in each branch
@@ -480,6 +501,51 @@ class YieldFixupMutator : public StorageBoundaryMutator {
   std::vector<StmtPtr> TakePendingAllocs() { return std::move(pending_allocs_); }
 
  private:
+  std::optional<StorageSelectionPlan> selections_;
+
+  static StmtPtr SelectionBarrier(const Span& span) {
+    return std::make_shared<EvalStmt>(OpRegistry::GetInstance().Create("system.bar_all", {}, {}, span), span);
+  }
+
+  StmtPtr SelectionDescriptor(const VarPtr& original) {
+    const auto& variable = selections_->tiles.at(original.get());
+    const auto tile = As<TileType>(variable->GetType());
+    const auto create = OpRegistry::GetInstance().Create(
+        "tile.create", {std::make_shared<MakeTuple>(tile->shape_, original->span_)},
+        {{"dtype", tile->dtype_}, {"target_memory", *tile->GetMemorySpace()}}, original->span_);
+    return std::make_shared<AssignStmt>(variable, create, original->span_);
+  }
+
+  StmtPtr RewriteSelectionYield(const StmtPtr& body, const std::vector<VarPtr>& results) {
+    return transform_utils::RewriteLastYieldStmt(body, [&](const YieldStmtPtr& yield) -> StmtPtr {
+      auto values = yield->value_;
+      bool changed = false;
+      for (size_t i = 0; i < values.size() && i < results.size(); ++i) {
+        if (!selections_->tiles.count(results[i].get())) continue;
+        const auto source = AsVarLike(values[i]);
+        INTERNAL_CHECK_SPAN(source, yield->span_) << "Storage selection must yield a storage variable";
+        values[i] = selections_->indices.at(source.get());
+        changed = true;
+      }
+      return changed ? std::make_shared<YieldStmt>(values, yield->span_) : yield;
+    });
+  }
+
+  StmtPtr FinishSelection(const std::vector<VarPtr>& original, const std::shared_ptr<IfStmt>& rewritten) {
+    std::vector<StmtPtr> suffix;
+    for (size_t i = 0; i < original.size(); ++i) {
+      if (!selections_->tiles.count(original[i].get())) continue;
+      rewritten->return_vars_[i] = AsVarLike(selections_->indices.at(original[i].get()));
+      suffix.push_back(SelectionDescriptor(original[i]));
+    }
+    if (suffix.empty()) return rewritten;
+    // Wait after the region so branch-local asynchronous producers are also
+    // complete before a selected descriptor is consumed.
+    std::vector<StmtPtr> statements{rewritten, SelectionBarrier(rewritten->span_)};
+    statements.insert(statements.end(), suffix.begin(), suffix.end());
+    return SeqStmts::Flatten(statements, rewritten->span_);
+  }
+
   bool fixup_if_stmts_ = true;
   bool canonical_branch_storage_ = false;
   std::set<const Var*> repaired_tile_aliases_;
@@ -1398,6 +1464,15 @@ StmtPtr FixupYields(const StmtPtr& body, const std::vector<VarPtr>& parameters, 
   YieldFixupMutator fixup(fixup_if_stmts, canonical_branch_storage);
   auto result = fixup.Run(body, parameters);
   return InsertAllocsIntoBody(result, fixup.TakePendingAllocs());
+}
+
+StmtPtr MaterializeStorageSelections(const StmtPtr& body, const std::vector<VarPtr>& parameters,
+                                     StorageSelectionPlan selections) {
+  if (selections.tiles.empty()) return body;
+  auto allocations = std::move(selections.allocations);
+  auto rewritten = YieldFixupMutator(std::move(selections)).Run(body, parameters);
+  rewritten = InsertAllocsIntoBody(rewritten, allocations);
+  return RemoveUnusedAllocStatements(rewritten, memref_collectors::CollectUsedBasePtrs(rewritten));
 }
 
 StmtPtr StripPipelineMembership(const StmtPtr& body) {

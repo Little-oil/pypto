@@ -28,6 +28,17 @@ MemRefs) and before the selected memory planner. It always runs. `PYPTO` follows
 it with [`MemoryReuse`](37-memory_reuse.md); `DSA_RP` consumes its allocation
 identities in [`AllocateMemoryAddr`](38-allocate_memory_addr.md).
 
+## Logical Tile selections
+
+On the Tile path, two compatible compiler-owned values selected by an If can use
+one allocation with disjoint slots. Both yields and the result carry a scalar
+slot index; `tile.create` reconstructs the selected descriptor without copying
+payloads. This also applies when a same-space move would be hardware-legal.
+An If exit barrier completes asynchronous producers before the selected view is used.
+The lowering retains full implicit descriptors in Vec/Mat/Acc and leaves explicit,
+borrowed, writeback, loop-touched and Buffer IR storage on their existing paths.
+All planners use the existing multi-buffer representation for the two slots.
+
 ## API
 
 | C++ | Python | Level |
