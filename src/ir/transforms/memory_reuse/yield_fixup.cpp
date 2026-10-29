@@ -23,6 +23,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -80,7 +81,8 @@ namespace {
  */
 class AlignLoopCarriesToInitMutator : public IRMutator {
  public:
-  StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+  template <typename LoopPtr>
+  StmtPtr AlignLoop(const LoopPtr& op) {
     if (op->iter_args_.empty()) return IRMutator::VisitStmt_(op);
 
     std::vector<IterArgPtr> new_iter_args = op->iter_args_;
@@ -151,6 +153,10 @@ class AlignLoopCarriesToInitMutator : public IRMutator {
 
     // Recurse into the body AFTER seeding var_remap_ so nested loops observe
     // the corrected outer iter_args as their init.
+    ExprPtr new_condition;
+    if constexpr (std::is_same_v<LoopPtr, WhileStmtPtr>) {
+      new_condition = VisitExpr(op->condition_);
+    }
     auto new_body = VisitStmt(op->body_);
 
     // iter_arg references are confined to the loop body; drop them so a sibling
@@ -160,13 +166,21 @@ class AlignLoopCarriesToInitMutator : public IRMutator {
       var_remap_.erase(old_iter_arg.get());
     }
 
+    if constexpr (std::is_same_v<LoopPtr, WhileStmtPtr>) {
+      changed |= new_condition != op->condition_;
+    }
     if (!changed && new_body == op->body_) return op;
     auto new_for = MutableCopy(op);
     new_for->iter_args_ = std::move(new_iter_args);
     new_for->return_vars_ = std::move(new_return_vars);
     new_for->body_ = new_body;
+    if constexpr (std::is_same_v<LoopPtr, WhileStmtPtr>) {
+      new_for->condition_ = new_condition;
+    }
     return new_for;
   }
+  StmtPtr VisitStmt_(const ForStmtPtr& op) override { return AlignLoop(op); }
+  StmtPtr VisitStmt_(const WhileStmtPtr& op) override { return AlignLoop(op); }
 };
 
 /**
