@@ -1,19 +1,19 @@
 # MaterializeSemanticAliases Pass
 
-将**语义要求**必须是同一块分配的 buffer 归一到同一个 MemRef —— 通过把每个循环
-carried 的 `iter_arg`/`initValue` MemRef 沿 yield/producer 链向下传播来实现。
+在内存规划前落实必要的存储契约。兼容的循环 producer 直接写入 carry 存储；
+兼容的逻辑选择通过标量存储索引传值，无论同空间 TMOV 是否合法，都不为选择复制 payload。
 
 ## 概述
 
 内存规划区分两种 buffer 共享：
 
-- **强制别名（语义要求）：** 循环累加器、或原地算子的结果**必须**落在同一块
-  buffer——写"下一个"值必须更新 carried buffer，否则循环无法累加。这是正确性,
-  不是优化。
+- **必要的存储契约：** 原地算子的结果与输入共享存储。固定 buffer 的循环
+  lowering 也要求 yield 值到达 carry 的 buffer；逻辑循环值也可以通过选择
+  存储来传递，并非天然要求把 payload 复制回 initializer。
 - **机会别名（可选）：** 生命周期不冲突的两块独立 buffer *可以*共享存储以省内存,
   属于优化。
 
-本 pass 只处理**强制别名**。它从 [`MemoryReuse`](37-memory_reuse.md) 中拆出
+本 pass 处理必要的别名及控制流传值。它从 [`MemoryReuse`](37-memory_reuse.md) 中拆出
 （原来是那个 pass 的 "Step 0"），以便机会性的生命周期复用可以被独立跳过：
 
 - `MemoryPlanner.DSA_RP` 保留独立分配身份，交给进程内 DSA-RP 求解器放置。
@@ -23,6 +23,34 @@ carried 的 `iter_arg`/`initValue` MemRef 沿 yield/producer 链向下传播来�
 规划器之前运行。它总是运行。`PYPTO` 随后运行
 [`MemoryReuse`](37-memory_reuse.md)；`DSA_RP` 在
 [`AllocateMemoryAddr`](38-allocate_memory_addr.md) 中消费这些分配身份。
+
+## 逻辑存储选择
+
+If 的逻辑返回值可以选择已有存储，无须把一支的数据复制到另一支的地址。
+这同样适用于 Vec、Mat 和 Acc：硬件合法的复制也可能没有语义上的必要。
+
+`BuildStorageSelectionPlan` 复用已有定义／绑定索引，返回普通映射：旧 Tile 到新 Tile、
+Tile 到标量 slot 表达式、重复 producer 到 `(incoming slot, first private slot)`，
+以及新增 allocation。`YieldFixupMutator` 的选择阶段保留原 If 条件，同时将两支
+的 yield 及对应 return_var 改成 INDEX，再用只构造描述符的 `tile.create` 重建所选
+Tile。Tile 路径与真正启用的 Buffer IR 路径都执行这一阶段。
+
+每个兼容值族使用一个由编译器拥有的 pool。不同返回位置允许不同 Shape，分别规划
+存储池。各 slot 不重叠；合流 Tile 别名到被选中的 slot。注册为独立输出的 producer，
+包括算术和 matmul，直接写入自己的 slot；没有两个 load、FP16/BF16 或二维的特判。
+当前池要求已知且相同的内存空间、兼容的物理描述符、静态 shape/valid_shape，以及
+无 stride 的视图。借用输入、显式固定分配、跨族共享窗口、可变写回、While carry
+和多 carry 值族不会被迁入池。
+
+单个 For carry 传递 slot 索引，同时处理 initializer 和零次循环结果。
+current/next 预取保留 seed，为每个重复 producer 分配两个私有 slot，选择未被
+incoming carry 占用的一个。原 producer／consumer 顺序保留。保守 barrier 保护
+存储复用，包括外层标量循环；最小容量与流水重叠属于后续优化。
+
+PYPTO/DSA_RP 使用索引地址。PTOAS 对编译器池使用独立无地址 allocation 与
+描述符选择，用户显式 multi-buffer region 保留已有约束。剩余不支持的传输在
+创建 `tile.move` 前诊断，codegen fallback 也检查；合法性是最后防线，不是判断
+是否需要复制的依据。修复 phi 后，先传播其 view/alias，再处理后续 phi。
 
 ## API
 
@@ -237,7 +265,8 @@ pipeline-slot 元数据）的变量渲染成同一个 `tile_buf` handle，因此
 如果所需的同空间复制无法实现，会提前报错。例如，不能通过 Acc 到 Acc 的复制
 保留仍然活跃的 Acc 输入。兼容 carry 仍可使用已有的带条件检查的累加器生产者
 合并。无法判定的视图地址和同时重叠的目标窗口必须在最终 Buffer lowering 前
-解决。未选中 kernel 和显式 Off 模式保持原有 Tile 行为。
+解决。未选中 kernel 和显式 Off 模式使用 Tile 路径，包括上文逻辑
+存储选择降低。
 
 默认 Buffer 路径在存储合法化前选择完整支持的 kernel，详见
 [整函数选择](55-lower_tile_to_buffer.md#默认整函数选择)。

@@ -39,6 +39,7 @@
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/memref_collectors.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
@@ -186,8 +187,15 @@ class YieldFixupMutator : public StorageBoundaryMutator {
 
   StmtPtr Run(const StmtPtr& body, const std::vector<VarPtr>& parameters) {
     if (canonical_branch_storage_) names_.Collect(body, parameters);
+    if (selections_) {
+      for (const auto& [old_var, replacement] : selections_->tiles) {
+        var_remap_[old_var] = replacement;
+      }
+    }
     return VisitStmt(body);
   }
+
+  explicit YieldFixupMutator(StorageSelectionPlan selections) : selections_(std::move(selections)) {}
 
   /// `fixup_if_stmts=false` reconciles ForStmt carries and preserves already
   /// shared tile windows across if results, without inserting branch copies. Used under
@@ -201,11 +209,32 @@ class YieldFixupMutator : public StorageBoundaryMutator {
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     auto result = IRMutator::VisitStmt_(op);
-    if (fixup_if_stmts_) return result;
+    if (selections_) {
+      const auto repeated = selections_->repeated.find(op->var_.get());
+      if (repeated != selections_->repeated.end()) {
+        const auto& [carry_slot, first_slot] = repeated->second;
+        // A producer must not overwrite the instance still selected by the
+        // incoming carry. Its two slots are distinct from one-shot seeds.
+        auto choose = std::make_shared<IfStmt>(
+            MakeEq(carry_slot, Slot(first_slot, op->span_), op->span_),
+            std::make_shared<YieldStmt>(std::vector<ExprPtr>{Slot(first_slot + 1, op->span_)}, op->span_),
+            std::make_shared<YieldStmt>(std::vector<ExprPtr>{Slot(first_slot, op->span_)}, op->span_),
+            std::vector<VarPtr>{AsVarLike(selections_->indices.at(op->var_.get()))}, op->span_);
+        return SeqStmts::Flatten({choose, result}, op->span_);
+      }
+      if (selections_->producers.count(op->var_.get())) {
+        // A seed may run again in an outer scalar loop. Finish the preceding
+        // invocation before this compiler-owned window is written again.
+        return SeqStmts::Flatten({SelectionBarrier(op->span_), result}, op->span_);
+      }
+      return result;
+    }
 
     // Follow semantic aliases of a repaired phi. Registered views re-derive
     // their relative window; writeback results keep their input's whole window.
     // A new SSA input alone does not refresh either result's stored MemRef.
+    // This must run for addressed planners too: a later phi otherwise sees a
+    // stale view window and inserts a copy despite both inputs already aliasing.
     VarPtr input = AsVarLike(op->value_);
     bool is_aliasing_view = false;
     if (auto call = As<Call>(op->value_); call && call->op_) {
@@ -247,6 +276,27 @@ class YieldFixupMutator : public StorageBoundaryMutator {
   }
 
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+    if (selections_) {
+      auto loop = MutableCopy(op);
+      std::vector<StmtPtr> prefix;
+      for (size_t i = 0; i < op->iter_args_.size(); ++i) {
+        const auto& argument = op->iter_args_[i];
+        if (!selections_->tiles.count(argument.get())) continue;
+        loop->iter_args_[i] = As<IterArg>(selections_->indices.at(argument.get()));
+        prefix.push_back(SelectionDescriptor(argument));
+      }
+      if (prefix.empty()) return IRMutator::VisitStmt_(op);
+      // The scalar carry is the storage choice. Reconstruct its Tile view only
+      // inside the body, where that carry is in scope.
+      auto body = RewriteSelectionYield(VisitStmt(op->body_), op->return_vars_);
+      prefix.push_back(body);
+      loop->body_ = SeqStmts::Flatten(prefix, op->span_);
+      const auto yield = transform_utils::GetLastYieldStmt(loop->body_);
+      if (yield) {
+        loop->body_ = InsertMovesAndReplaceYield(loop->body_, yield, {SelectionBarrier(yield->span_)});
+      }
+      return FinishSelection(op->return_vars_, loop);
+    }
     if (canonical_branch_storage_ && !LoopMayExecute(op, false)) {
       return IRMutator::VisitStmt_(As<ForStmt>(FixupCanonicalLoop(op)));
     }
@@ -354,6 +404,7 @@ class YieldFixupMutator : public StorageBoundaryMutator {
   }
 
   StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
+    if (selections_) return IRMutator::VisitStmt_(op);
     if (canonical_branch_storage_ && !LoopMayExecute(op, false)) {
       return IRMutator::VisitStmt_(As<WhileStmt>(FixupCanonicalLoop(op)));
     }
@@ -367,6 +418,17 @@ class YieldFixupMutator : public StorageBoundaryMutator {
     auto result = IRMutator::VisitStmt_(op);
     auto if_stmt = As<IfStmt>(result);
     if (!if_stmt || if_stmt->return_vars_.empty()) return result;
+    if (selections_) {
+      // A logical if result selects a source window; it does not require either
+      // arm to copy its payload onto the other arm. Rewrite the signature and
+      // both yields together, retaining the original condition and body order.
+      auto selected = MutableCopy(if_stmt);
+      selected->then_body_ = RewriteSelectionYield(if_stmt->then_body_, op->return_vars_);
+      if (if_stmt->else_body_) {
+        selected->else_body_ = RewriteSelectionYield(*if_stmt->else_body_, op->return_vars_);
+      }
+      return FinishSelection(op->return_vars_, selected);
+    }
     if (canonical_branch_storage_) return FixupCanonicalIf(if_stmt);
 
     // Find yield statements in each branch
@@ -447,7 +509,7 @@ class YieldFixupMutator : public StorageBoundaryMutator {
           new_return_vars[i] =
               std::make_shared<Var>(new_return_vars[i]->name_hint_, new_rv_type, new_return_vars[i]->span_);
           var_remap_[if_stmt->return_vars_[i].get()] = new_return_vars[i];
-          if (!fixup_if_stmts_) repaired_tile_aliases_.insert(new_return_vars[i].get());
+          repaired_tile_aliases_.insert(new_return_vars[i].get());
           body_changed = true;
         }
       }
@@ -480,6 +542,61 @@ class YieldFixupMutator : public StorageBoundaryMutator {
   std::vector<StmtPtr> TakePendingAllocs() { return std::move(pending_allocs_); }
 
  private:
+  std::optional<StorageSelectionPlan> selections_;
+
+  static ExprPtr Slot(uint64_t value, const Span& span) {
+    return std::make_shared<ConstInt>(static_cast<int64_t>(value), DataType::INDEX, span);
+  }
+
+  static StmtPtr SelectionBarrier(const Span& span) {
+    return std::make_shared<EvalStmt>(OpRegistry::GetInstance().Create("system.bar_all", {}, {}, span), span);
+  }
+
+  StmtPtr SelectionDescriptor(const VarPtr& original) {
+    const auto& variable = selections_->tiles.at(original.get());
+    const auto tile = As<TileType>(variable->GetType());
+    auto create = OpRegistry::GetInstance().Create(
+        "tile.create", {std::make_shared<MakeTuple>(tile->shape_, original->span_)},
+        {{"dtype", tile->dtype_}, {"target_memory", *tile->GetMemorySpace()}}, original->span_);
+    return std::make_shared<AssignStmt>(variable, create, original->span_);
+  }
+
+  StmtPtr RewriteSelectionYield(const StmtPtr& body, const std::vector<VarPtr>& results) {
+    return transform_utils::RewriteLastYieldStmt(body, [&](const YieldStmtPtr& yield) -> StmtPtr {
+      auto values = yield->value_;
+      bool changed = false;
+      for (size_t i = 0; i < values.size() && i < results.size(); ++i) {
+        if (!selections_->tiles.count(results[i].get())) continue;
+        const auto source = AsVarLike(values[i]);
+        INTERNAL_CHECK_SPAN(source, yield->span_) << "Storage selection must yield a storage variable";
+        values[i] = selections_->indices.at(source.get());
+        changed = true;
+      }
+      return changed ? std::make_shared<YieldStmt>(values, yield->span_) : yield;
+    });
+  }
+
+  template <typename RegionPtr>
+  StmtPtr FinishSelection(const std::vector<VarPtr>& original, const RegionPtr& rewritten) {
+    std::vector<StmtPtr> suffix;
+    for (size_t i = 0; i < original.size(); ++i) {
+      if (!selections_->tiles.count(original[i].get())) continue;
+      rewritten->return_vars_[i] = AsVarLike(selections_->indices.at(original[i].get()));
+      suffix.push_back(SelectionDescriptor(original[i]));
+    }
+    if (suffix.empty()) return rewritten;
+    // Wait after the region so branch-local asynchronous producers are also
+    // complete before a selected descriptor is consumed. A loop additionally
+    // waits at entry before the first use of its incoming seed.
+    std::vector<StmtPtr> statements;
+    const StmtPtr region = rewritten;
+    if (As<ForStmt>(region)) statements.push_back(SelectionBarrier(rewritten->span_));
+    statements.push_back(rewritten);
+    statements.push_back(SelectionBarrier(rewritten->span_));
+    statements.insert(statements.end(), suffix.begin(), suffix.end());
+    return SeqStmts::Flatten(statements, rewritten->span_);
+  }
+
   bool fixup_if_stmts_ = true;
   bool canonical_branch_storage_ = false;
   std::set<const Var*> repaired_tile_aliases_;
@@ -1398,6 +1515,15 @@ StmtPtr FixupYields(const StmtPtr& body, const std::vector<VarPtr>& parameters, 
   YieldFixupMutator fixup(fixup_if_stmts, canonical_branch_storage);
   auto result = fixup.Run(body, parameters);
   return InsertAllocsIntoBody(result, fixup.TakePendingAllocs());
+}
+
+StmtPtr MaterializeStorageSelections(const StmtPtr& body, const std::vector<VarPtr>& parameters,
+                                     StorageSelectionPlan selections) {
+  if (selections.tiles.empty()) return body;
+  auto allocations = std::move(selections.allocations);
+  auto rewritten = YieldFixupMutator(std::move(selections)).Run(body, parameters);
+  rewritten = InsertAllocsIntoBody(rewritten, allocations);
+  return RemoveUnusedAllocStatements(rewritten, memref_collectors::CollectUsedBasePtrs(rewritten));
 }
 
 StmtPtr StripPipelineMembership(const StmtPtr& body) {
