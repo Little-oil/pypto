@@ -752,8 +752,8 @@ StorageSelectionPlan BuildStorageSelectionPlan(const StmtPtr& body, const std::v
     const auto base =
         std::make_shared<Var>(names.Fresh("mem_storage_selection_"), GetPtrType(), first->span_);
     const auto allocation = std::make_shared<MemRef>(base, int64_t{0}, bytes * count, first->span_);
-    plan.allocations.push_back(CreateAllocStatement(
-        allocation, *As<TileType>(members.front()->GetType())->GetMemorySpace(), /*pinned=*/true));
+    plan.allocations.push_back(
+        CreateAllocStatement(allocation, *As<TileType>(members.front()->GetType())->GetMemorySpace()));
     std::function<ExprPtr(const VarPtr&)> slot = [&](const VarPtr& value) -> ExprPtr {
       if (const auto found = plan.indices.find(value.get()); found != plan.indices.end()) {
         return found->second;

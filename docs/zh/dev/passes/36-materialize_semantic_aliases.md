@@ -31,6 +31,7 @@ carried 的 `iter_arg`/`initValue` MemRef 沿 yield/producer 链向下传播来�
 即使同空间 TMOV 在硬件上合法，也不因选择而插入它。If 出口的 barrier 保证异步 producer
 完成后再使用所选视图。当前处理 Vec/Mat/Acc 的完整隐式描述符；显式分配、借用、写回、
 循环涉及的存储及 Buffer IR 保持原有路径。所有 planner 均复用既有 multi-buffer 表达。
+编译器创建的池保留完整分配容量与各 slot 身份，并以整个 allocation 为单位参与生命周期复用。
 
 ## API
 

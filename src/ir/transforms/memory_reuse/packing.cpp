@@ -47,6 +47,7 @@
 #include "pypto/ir/transforms/utils/buffer_valid_analysis.h"
 #include "pypto/ir/transforms/utils/lifetime_analysis.h"
 #include "pypto/ir/transforms/utils/memory_footprint.h"
+#include "pypto/ir/transforms/utils/memref_collectors.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/type.h"
@@ -810,12 +811,14 @@ ReuseMap IdentifyReuseOpportunities(
  */
 StmtPtr ApplyMemRefSharing(const StmtPtr& stmt, const ReuseMap& reuse_map,
                            const std::map<VarPtr, std::vector<VarPtr>>& var_sharing_groups) {
+  const auto allocation_sizes = memref_collectors::CollectAllocSizes(stmt);
   // Custom IRMutator for MemRef sharing
   class MemRefSharingMutator : public IRMutator {
    public:
     explicit MemRefSharingMutator(const ReuseMap& reuse_map,
-                                  const std::map<VarPtr, std::vector<VarPtr>>& sharing_groups)
-        : reuse_map_(reuse_map), sharing_groups_(sharing_groups) {}
+                                  const std::map<VarPtr, std::vector<VarPtr>>& sharing_groups,
+                                  const std::map<const Var*, uint64_t>& allocation_sizes)
+        : reuse_map_(reuse_map), sharing_groups_(sharing_groups), allocation_sizes_(allocation_sizes) {}
 
     StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
       // Check if this variable should reuse another's MemRef
@@ -834,7 +837,12 @@ StmtPtr ApplyMemRefSharing(const StmtPtr& stmt, const ReuseMap& reuse_map,
           return IRMutator::VisitStmt_(op);
         }
 
-        std::optional<MemRefPtr> source_memref = source_tile_type->memref_;
+        const auto source_memref = GetDefinedMemRef(source_tile_type);
+        const auto allocation = allocation_sizes_.find(source_memref->base_.get());
+        const uint64_t source_capacity =
+            source_memref->slot_count_ <= 1 || allocation == allocation_sizes_.end()
+                ? source_memref->size_
+                : std::max(source_memref->size_, allocation->second);
 
         // Get current variable's TileType
         auto curr_tile_type = As<TileType>(op->var_->GetType());
@@ -872,26 +880,29 @@ StmtPtr ApplyMemRefSharing(const StmtPtr& stmt, const ReuseMap& reuse_map,
             }
             auto placement_expr = std::make_shared<ConstInt>(static_cast<int64_t>(placement.byte_offset),
                                                              DataType::INDEX, Span::unknown());
-            auto target_offset = AddByteOffsets((*source_memref)->byte_offset_, placement_expr);
+            auto target_offset = AddByteOffsets(source_memref->byte_offset_, placement_expr);
             auto rebased_offset = AddByteOffsets(target_offset, relative);
-            return std::make_shared<MemRef>((*source_memref)->base_, rebased_offset, old->size_, old->span_,
-                                            (*source_memref)->is_pinned_, (*source_memref)->slot_count_,
-                                            (*source_memref)->slot_index_);
+            return std::make_shared<MemRef>(source_memref->base_, rebased_offset, old->size_, old->span_,
+                                            old->is_pinned_, old->slot_count_, old->slot_index_);
           }
           const __int128 wide_rel = static_cast<__int128>(old_off->value_) - curr_off->value_;
           const __int128 wide_placement = placement.byte_offset;
           INTERNAL_CHECK_SPAN(wide_rel >= 0 && wide_rel <= std::numeric_limits<int64_t>::max() &&
-                                  wide_placement + wide_rel + old->size_ <= (*source_memref)->size_,
+                                  wide_placement + wide_rel + old->size_ <= source_capacity,
                               old->span_)
               << "Internal error: sharing-group member offset " << old_off->value_
-              << " cannot be represented inside reuse target (size " << (*source_memref)->size_ << ")";
+              << " cannot be represented inside reuse target (capacity " << source_capacity << ")";
           const int64_t placed_rel = static_cast<int64_t>(wide_placement + wide_rel);
-          if (placed_rel == 0 && old->size_ == (*source_memref)->size_) return source_memref;
+          // Reusing bytes must not replace a pool member's own slot identity,
+          // or turn an ordinary tile into a slot of its former allocation.
+          if (placed_rel == 0 && old->size_ == source_memref->size_ && old->slot_count_ == 1 &&
+              source_memref->slot_count_ == 1 && !old->slot_index_ && !source_memref->slot_index_) {
+            return source_memref;
+          }
           auto rel_expr = std::make_shared<ConstInt>(placed_rel, DataType::INDEX, Span::unknown());
-          return std::make_shared<MemRef>((*source_memref)->base_,
-                                          AddByteOffsets((*source_memref)->byte_offset_, rel_expr),
-                                          old->size_, old->span_, (*source_memref)->is_pinned_,
-                                          (*source_memref)->slot_count_, (*source_memref)->slot_index_);
+          return std::make_shared<MemRef>(source_memref->base_,
+                                          AddByteOffsets(source_memref->byte_offset_, rel_expr), old->size_,
+                                          old->span_, old->is_pinned_, old->slot_count_, old->slot_index_);
         };
 
         // Rebase the representative through the same path as every member of
@@ -956,13 +967,14 @@ StmtPtr ApplyMemRefSharing(const StmtPtr& stmt, const ReuseMap& reuse_map,
    private:
     const ReuseMap& reuse_map_;
     const std::map<VarPtr, std::vector<VarPtr>>& sharing_groups_;  // var -> sharing group
+    const std::map<const Var*, uint64_t>& allocation_sizes_;
     // Maps old variable objects to new variable objects (with reused MemRef)
     // This is needed because IR nodes are immutable, so we create new Var objects
     // and need to replace all references to the old ones
     std::map<VarPtr, VarPtr> var_substitution_map_;
   };
 
-  MemRefSharingMutator mutator(reuse_map, var_sharing_groups);
+  MemRefSharingMutator mutator(reuse_map, var_sharing_groups, allocation_sizes);
   return mutator.VisitStmt(stmt);
 }
 

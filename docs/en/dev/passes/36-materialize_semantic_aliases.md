@@ -38,6 +38,8 @@ An If exit barrier completes asynchronous producers before the selected view is 
 The lowering retains full implicit descriptors in Vec/Mat/Acc and leaves explicit,
 borrowed, writeback, loop-touched and Buffer IR storage on their existing paths.
 All planners use the existing multi-buffer representation for the two slots.
+Compiler-created pools retain their full allocation capacity and slot identities,
+and participate in lifetime reuse as whole allocations.
 
 ## API
 
