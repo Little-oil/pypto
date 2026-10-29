@@ -36,11 +36,13 @@ move is still unnecessary when the boundary only selects storage.
 
 `BuildStorageSelectionPlan` uses the existing definition/binding index and returns
 plain maps: original Tile to rewritten Tile, Tile to scalar slot expression,
-repeated producer to `(incoming slot, first private slot)`, plus new allocations.
+repeated producer to its protected incoming slots and private slot range, plus new allocations.
 The selection phase of `YieldFixupMutator` retains each If condition and rewrites
 both arm yields and the matching return variable to INDEX together. It then
 reconstructs the selected Tile with `tile.create`, a descriptor-only operation.
-The same phase runs for both Tile and selected Buffer IR functions.
+The phase runs regardless of the requested emission mode. Functions that acquire
+selection pools use Tile emission because the Buffer ABI cannot represent their
+indexed multi-slot descriptors; ordinary supported functions keep Buffer emission.
 
 Each compatible family has one compiler-owned pool. Distinct result positions
 may have different shapes and receive independent pools. Slots are disjoint;
@@ -49,14 +51,26 @@ arithmetic and matmul outputs, write directly to their slots. This is not limite
 to two loads, FP16/BF16, or rank two. The current pool contract requires one known
 memory space, matching physical descriptors, static shapes/valid shapes, and no
 strided views. Borrowed inputs, explicitly pinned allocations, shared windows,
-mutating writebacks, While carries and multi-carry families are not migrated.
+and mutating writebacks are not migrated.
 
-A single For carry transports its slot index, including the initializer and
-zero-trip result. Current/next prefetch keeps the seed and gives each repeated
-producer two private slots, choosing the one not occupied by the incoming carry.
-The producer/consumer order is preserved. Conservative barriers protect reuse,
-including enclosing scalar loops; optimal capacity and pipeline overlap are
-separate optimizations.
+For and While carries transport slot indices, including their initializers and
+zero-trip results. This also covers pure permutations without an If. Current/next
+prefetch keeps the seed and gives each repeated producer K+1 private slots for K
+incoming carries, choosing a slot not referenced by any incoming carry. A single
+carry uses two slots; two carries use a bounded scalar search over three slots.
+Repeated-producer families currently support at most two carries to keep the
+generated plan linear; producer-free permutations have no such limit. A family
+cannot span multiple Tile-carry loops, and a While condition must not read its
+selected Tile payload. The producer/consumer order is preserved. Conservative
+barriers at loop entry, backedges and exit protect reuse, including enclosing
+scalar loops; optimal capacity and pipeline overlap are separate optimizations.
+
+Residual fixed-buffer For and While loops share parallel backedge repair. A
+different yielded window is copied only when the memory-space pair permits it;
+unsupported transfers are diagnosed rather than silently retaining the seed.
+Before residual Tile While backedges are repaired, borrowed or independently
+observed seeds receive a private entry snapshot. Proven zero-trip and identity
+carries need no snapshot; selected INDEX carries keep the original seed slot.
 
 PYPTO/DSA_RP use indexed addresses. PTOAS uses separate addressless allocations
 plus descriptor selection for compiler-generated pools. Author-declared

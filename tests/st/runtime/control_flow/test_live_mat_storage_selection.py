@@ -64,7 +64,7 @@ def mat_phi_core(
         selected = pl.yield_(b)
     product = pl.matmul(selected, rhs, out_dtype=pl.FP32)
     pl.store(product, [0, 0], out)
-    # a/b 在选择后仍分别使用，不能通过把它们强制合并成同一物理地址来修复。
+    # Both inputs remain live after selection and must keep independent storage.
     keep_a = pl.matmul(a, rhs, out_dtype=pl.FP32)
     pl.store(keep_a, [16, 0], out)
     keep_b = pl.matmul(b, rhs, out_dtype=pl.FP32)

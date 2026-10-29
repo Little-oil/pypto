@@ -559,8 +559,8 @@ class DefMapVisitor : public IRVisitor {
 // Plan uniform compiler-owned storage selections before YieldFixup. The plan
 // separates slot ownership/lifetime decisions from the structured-SSA rewrite.
 // Definitions and binding edges are indexed once; union/find and cached slot
-// resolution keep the analysis O(N log N). Each repeated producer gets two
-// private slots, so its previous value can remain the incoming For carry.
+// resolution keep the analysis O(N log N). Repeated producers use disjoint
+// private ranges with one more slot than the protected incoming loop references.
 StorageSelectionPlan BuildStorageSelectionPlan(const StmtPtr& body, const std::vector<VarPtr>& parameters) {
   DefMapVisitor index;
   index.Run(body);
@@ -618,9 +618,12 @@ StorageSelectionPlan BuildStorageSelectionPlan(const StmtPtr& body, const std::v
   for (const auto& [value, definition] : index.defs) {
     if (definition.kind == VarDef::kIterArg) {
       if (const auto initial = AsVarLike(definition.iter_arg->initValue_)) join(value.get(), initial.get());
-    } else if (definition.kind == VarDef::kForReturn) {
-      const auto loop = As<ForStmt>(definition.control_stmt);
-      join(value.get(), loop->iter_args_[definition.return_idx].get());
+    } else if (definition.kind == VarDef::kForReturn || definition.kind == VarDef::kWhileReturn) {
+      if (const auto loop = As<ForStmt>(definition.control_stmt)) {
+        join(value.get(), loop->iter_args_[definition.return_idx].get());
+      } else if (const auto loop = As<WhileStmt>(definition.control_stmt)) {
+        join(value.get(), loop->iter_args_[definition.return_idx].get());
+      }
     }
   }
   std::map<const Var*, std::vector<VarPtr>> components;
@@ -638,15 +641,24 @@ StorageSelectionPlan BuildStorageSelectionPlan(const StmtPtr& body, const std::v
     }
   }
 
+  // A While condition executes before its body descriptor definitions. Index
+  // payload observations by binding component once, rather than scanning every
+  // condition for every member of every selection family.
+  std::map<const Stmt*, std::set<const Var*>> condition_components;
+  for (const auto& [statement, reads] : index.condition_reads) {
+    for (const auto& value : reads) {
+      if (As<TileType>(value->GetType())) condition_components[statement].insert(find(value.get()));
+    }
+  }
+
   StorageSelectionPlan plan;
   const auto integer = [](uint64_t value, const Span& span) -> ExprPtr {
     return std::make_shared<ConstInt>(static_cast<int64_t>(value), DataType::INDEX, span);
   };
   for (const auto& [root, members] : components) {
-    (void)root;
     struct Group {
-      VarPtr carry;
-      ForStmtPtr loop;
+      std::vector<VarPtr> carries;
+      StmtPtr loop;
       std::map<const Var*, uint64_t> first_slot;
       std::set<const Var*> repeated;
       uint64_t count = 0;
@@ -706,21 +718,21 @@ StorageSelectionPlan BuildStorageSelectionPlan(const StmtPtr& body, const std::v
           producers.push_back(value);
         }
       } else {
-        selection |= definition.kind == VarDef::kIfReturn;
-        // Keep the verified single-For contract. nearest_loop below also
-        // rejects producers repeated by While instead of treating them as seeds.
-        if (definition.kind == VarDef::kWhileReturn ||
-            (definition.kind == VarDef::kIterArg && !As<ForStmt>(definition.control_stmt))) {
-          valid = false;
-          break;
-        }
+        // A pure loop recurrence is a storage selection too, even without an
+        // IfStmt in its body (for example, parallel swapping of two seeds).
+        selection |= definition.kind == VarDef::kIfReturn || definition.kind == VarDef::kForReturn ||
+                     definition.kind == VarDef::kWhileReturn || definition.kind == VarDef::kIterArg;
         if (definition.kind == VarDef::kIterArg) {
-          if (group.carry || !index.defs.count(AsVarLike(definition.iter_arg->initValue_))) {
+          // A family may contain several simultaneous carries of one For or
+          // While. Crossing nested or sequential Tile-carry loops needs a
+          // separate proof of which incoming references each producer protects.
+          if ((group.loop && group.loop != definition.control_stmt) ||
+              !index.defs.count(AsVarLike(definition.iter_arg->initValue_))) {
             valid = false;
             break;
           }
-          group.carry = value;
-          group.loop = As<ForStmt>(definition.control_stmt);
+          group.carries.push_back(value);
+          group.loop = definition.control_stmt;
         }
       }
     }
@@ -733,6 +745,16 @@ StorageSelectionPlan BuildStorageSelectionPlan(const StmtPtr& body, const std::v
       }
     }
     if (!valid || !selection || !divergent || producers.empty()) continue;
+    if (group.loop && As<WhileStmt>(group.loop)) {
+      const auto condition = condition_components.find(group.loop.get());
+      CHECK_SPAN(condition == condition_components.end() || condition->second.count(root) == 0,
+                 group.loop->span_)
+          << "While storage selection requires a scalar condition that does not read the selected "
+             "Tile payload; a Tile-reading condition needs a descriptor in the loop's before region";
+    }
+    std::sort(group.carries.begin(), group.carries.end(), [&](const VarPtr& a, const VarPtr& b) {
+      return index.defs.at(a).return_idx < index.defs.at(b).return_idx;
+    });
     std::sort(producers.begin(), producers.end(), [&](const VarPtr& a, const VarPtr& b) {
       return index.defs.at(a).order < index.defs.at(b).order;
     });
@@ -747,9 +769,22 @@ StorageSelectionPlan BuildStorageSelectionPlan(const StmtPtr& body, const std::v
         valid = false;  // Nested producer loops need a separate lifetime proof.
         break;
       }
+      // Expanding every repeated producer against an unbounded number of
+      // carries would construct O(producers * carries) slots and selector
+      // comparisons. Bound this initial contract at two carries per repeating
+      // family, keeping plan/IR size linear. Pure permutations have no repeated
+      // producers and may carry arbitrarily many already existing seeds.
+      CHECK_SPAN(!repeats || group.carries.size() <= 2, group.loop ? group.loop->span_ : producer->span_)
+          << "Storage selection with repeated producers supports at most two simultaneous Tile carries "
+             "in one family; split independent storage families or use existing producer-free seeds";
+      const uint64_t producer_slots = repeats ? group.carries.size() + 1 : 1;
+      if (group.count > std::numeric_limits<uint64_t>::max() - producer_slots) {
+        valid = false;
+        break;
+      }
       group.first_slot[producer.get()] = group.count;
       if (repeats) group.repeated.insert(producer.get());
-      group.count += repeats ? 2 : 1;
+      group.count += producer_slots;
     }
     if (!valid || group.count < 2 ||
         first->size_ > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / group.count) {
@@ -806,7 +841,11 @@ StorageSelectionPlan BuildStorageSelectionPlan(const StmtPtr& body, const std::v
     for (const auto& producer : producers) {
       plan.producers.insert(producer.get());
       if (group.repeated.count(producer.get())) {
-        plan.repeated[producer.get()] = {slot(group.carry), group.first_slot.at(producer.get())};
+        RepeatedStorageProducer repeated;
+        for (const auto& carry : group.carries) repeated.protected_slots.push_back(slot(carry));
+        repeated.first_slot = group.first_slot.at(producer.get());
+        repeated.slot_count = group.carries.size() + 1;
+        plan.repeated[producer.get()] = std::move(repeated);
       }
     }
   }
@@ -1083,8 +1122,10 @@ class LoopInputIsolation : public IRVisitor {
   std::map<const Stmt*, std::vector<StmtPtr>> entries;
   std::vector<StmtPtr> allocations;
 
-  void Plan(const StmtPtr& body, const std::vector<VarPtr>& parameters, bool recurrence_only = false) {
+  void Plan(const StmtPtr& body, const std::vector<VarPtr>& parameters, bool recurrence_only = false,
+            bool while_only = false) {
     recurrence_only_ = recurrence_only;
+    while_only_ = while_only;
     names_.Collect(body, parameters);
     DefMapVisitor demand;
     demand.Run(body);
@@ -1099,6 +1140,10 @@ class LoopInputIsolation : public IRVisitor {
       }
     }
     VisitStmt(body);
+    for (auto& [base, positions] : physical_writes_) {
+      (void)base;
+      std::sort(positions.begin(), positions.end());
+    }
     struct Observation {
       const Var* base;
       size_t position;
@@ -1153,6 +1198,15 @@ class LoopInputIsolation : public IRVisitor {
     current_statement_ = saved_statement;
   }
   void VisitStmt_(const AssignStmtPtr& statement) override {
+    if (while_only_) {
+      const auto call = As<Call>(statement->value_);
+      auto& registry = OpRegistry::GetInstance();
+      if (call && (!call->op_ || !registry.IsRegistered(call->op_->name_) ||
+                   registry.GetEntry(call->op_->name_).GetExecutionMemoryAccessEvidence() !=
+                       ExecutionMemoryAccessEvidence::NoAccess)) {
+        RecordPhysicalWrite(statement->var_);
+      }
+    }
     auto source = AsVarLike(statement->value_);
     bool identity = source != nullptr;
     if (auto call = As<Call>(statement->value_); call && call->op_ && !call->args_.empty() &&
@@ -1194,6 +1248,39 @@ class LoopInputIsolation : public IRVisitor {
     VisitLoop(loop);
   }
   void VisitStmt_(const WhileStmtPtr& loop) override { VisitLoop(loop); }
+  void VisitExpr_(const CallPtr& call) override {
+    if (while_only_) {
+      auto& registry = OpRegistry::GetInstance();
+      const auto* entry = call->op_ && registry.IsRegistered(call->op_->name_)
+                              ? &registry.GetEntry(call->op_->name_)
+                              : nullptr;
+      if (!entry || entry->GetExecutionMemoryAccessEvidence() != ExecutionMemoryAccessEvidence::NoAccess) {
+        if (const auto writeback = op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size())) {
+          RecordPhysicalWrite(call->args_[*writeback]);
+        }
+        // An unclassified execution contract cannot prove that Tile arguments
+        // stay unchanged. Registered effects also cover write-only scratch.
+        const bool unknown =
+            !entry || entry->GetIRStage() != OpIRStage::Functional ||
+            (entry->GetExecutionMemoryAccessEvidence() == ExecutionMemoryAccessEvidence::Unknown &&
+             !entry->HasDeclaredArgEffects());
+        for (size_t i = 0; i < call->args_.size(); ++i) {
+          if (unknown || ArgEffectWrites(entry->GetArgEffect(i, call->kwargs_))) {
+            RecordPhysicalWrite(call->args_[i]);
+          }
+        }
+      }
+    }
+    IRVisitor::VisitExpr_(call);
+  }
+  void VisitExpr_(const SubmitPtr& submit) override {
+    // Task bodies have no local execution-effect contract. A submitted task
+    // may write any Tile argument, so it cannot justify an identity fast path.
+    if (while_only_) {
+      for (const auto& argument : submit->args_) RecordPhysicalWrite(argument);
+    }
+    IRVisitor::VisitExpr_(submit);
+  }
   void VisitExpr_(const IterArgPtr& value) override { VisitVarLike_(value); }
   void VisitVarLike_(const VarPtr& value) override {
     const auto observation = payload_observations_.find(current_statement_);
@@ -1214,9 +1301,27 @@ class LoopInputIsolation : public IRVisitor {
 
  private:
   bool recurrence_only_ = false;
+  bool while_only_ = false;
   const Stmt* current_statement_ = nullptr;
   std::map<const Stmt*, std::set<VarPtr>> payload_observations_;
   std::map<const Var*, VarPtr> identity_roots_;
+  std::map<const Var*, std::vector<size_t>> physical_writes_;
+
+  void RecordPhysicalWrite(const ExprPtr& value) {
+    if (auto tile = GetTileTypeWithMemRef(value->GetType())) {
+      physical_writes_[GetDefinedMemRef(tile)->base_.get()].push_back(current_);
+    }
+  }
+
+  [[nodiscard]] bool HasPhysicalWrite(const VarPtr& value, const StmtPtr& loop) const {
+    const auto tile = GetTileTypeWithMemRef(value->GetType());
+    if (!tile) return true;
+    const auto found = physical_writes_.find(GetDefinedMemRef(tile)->base_.get());
+    if (found == physical_writes_.end()) return false;
+    const auto position =
+        std::lower_bound(found->second.begin(), found->second.end(), positions_.at(loop.get()) + 1);
+    return position != found->second.end() && *position <= loop_ends_.at(loop.get());
+  }
 
   [[nodiscard]] VarPtr IdentityRoot(const VarPtr& value) const {
     auto root = identity_roots_.find(value.get());
@@ -1246,6 +1351,9 @@ class LoopInputIsolation : public IRVisitor {
 
   template <typename LoopPtr>
   void PlanLoop(const LoopPtr& loop) {
+    if constexpr (!std::is_same_v<LoopPtr, WhileStmtPtr>) {
+      if (while_only_) return;
+    }
     // A loop that cannot enter returns its initializer without modifying it.
     // Even independently observed inputs need no private copy on that path.
     if (!LoopMayExecute(loop, false)) return;
@@ -1253,14 +1361,23 @@ class LoopInputIsolation : public IRVisitor {
     if (auto sequence = As<SeqStmts>(body); sequence && sequence->stmts_.size() == 1) {
       body = sequence->stmts_[0];
     }
-    if (auto yield = As<YieldStmt>(body); yield && yield->value_.size() == loop->iter_args_.size()) {
+    const auto yield = while_only_ ? transform_utils::GetLastYieldStmt(loop->body_) : As<YieldStmt>(body);
+    if (yield && yield->value_.size() == loop->iter_args_.size()) {
       bool unchanged = true;
       for (size_t i = 0; i < yield->value_.size(); ++i) {
         const auto source = AsVarLike(yield->value_[i]);
         const auto& argument = loop->iter_args_[i];
+        // The extra legacy While pass protects Tile payloads. Updating a
+        // scalar counter cannot modify an otherwise identity Tile carry.
+        if (while_only_ && !As<TileType>(argument->GetType())) continue;
         const auto initial = AsVarLike(argument->initValue_);
         unchanged = unchanged && source &&
-                    (source == argument || (initial && IdentityRoot(source) == IdentityRoot(initial)));
+                    (source == argument || (while_only_ && IdentityRoot(source) == argument) ||
+                     (initial && IdentityRoot(source) == IdentityRoot(initial)));
+        if (while_only_) {
+          unchanged =
+              unchanged && initial && !HasPhysicalWrite(argument, loop) && !HasPhysicalWrite(initial, loop);
+        }
       }
       // Forwarding a carry, its initializer, or an immutable alias of that
       // initializer cannot overwrite input payloads,
@@ -1336,7 +1453,8 @@ class LoopInputIsolation : public IRVisitor {
       const auto tile = GetTileTypeWithMemRef(source->GetType());
       const auto memory = tile->GetMemorySpace();
       CHECK_SPAN(memory && IsTileMoveEverSupported(*memory, *memory), loop->span_)
-          << "Buffer IR cannot preserve an independently live loop input without a same-space copy; "
+          << (while_only_ ? "Tile While" : "Buffer IR")
+          << " cannot preserve an independently live loop input without a same-space copy; "
              "produce an independent initial tile for this carry";
       auto base = std::make_shared<Var>(names_.Fresh("mem_carry_input_"), GetPtrType(), source->span_);
       auto memref = std::make_shared<MemRef>(base, int64_t{0}, GetDefinedMemRef(tile)->size_, source->span_);
@@ -2809,12 +2927,17 @@ class RetypeApplier : public IRMutator {
   }
 
   StmtPtr VisitStmt_(const ForStmtPtr& op) override { return RetypeLoop(op); }
-  StmtPtr VisitStmt_(const WhileStmtPtr& op) override { return RetypeLoop(op); }
+  StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
+    // Fixed-buffer While codegen binds both the carry and its zero-trip result
+    // to the initializer, even when an identity body needs no entry isolation.
+    return RetypeLoop(op, /*refresh_storage=*/true);
+  }
 
   template <typename LoopPtr>
-  StmtPtr RetypeLoop(const LoopPtr& op) {
+  StmtPtr RetypeLoop(const LoopPtr& op, bool refresh_storage = false) {
     const auto* context = PassContext::Current();
-    if ((context == nullptr || !context->GetEnableBufferIR()) && entries_.empty() && initializers_.empty()) {
+    if (!refresh_storage && (context == nullptr || !context->GetEnableBufferIR()) && entries_.empty() &&
+        initializers_.empty()) {
       // An isolation application normalizes every dependent loop binding,
       // including nested loops without an entry copy of their own. Ordinary
       // legacy retypes without isolation retain their old behavior.
@@ -3001,13 +3124,33 @@ FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func) {
   // re-pointing a branch-local producer at the if-phi handle. DSA-RP instead
   // materializes both IfStmt and ForStmt fixups and repairs bare-Var identity
   // copies before lifetime analysis and placement.
+  bool has_storage_selection = false;
   {
-    // Selection lowering is shared by Tile and Buffer paths. Selected regions
-    // now return scalar indices, so later canonical storage repair leaves them alone.
+    // Selection is discovered after whole-function Buffer eligibility was
+    // checked. The pool introduces indexed, multi-slot Tile descriptors that
+    // the current Buffer lowering cannot express; keep this function on the
+    // Tile path instead of sending those descriptors to an incompatible ABI.
     auto selection_plan = BuildStorageSelectionPlan(new_body, func->params_);
+    has_storage_selection = !selection_plan.tiles.empty();
     new_body = MaterializeStorageSelections(new_body, func->params_, std::move(selection_plan));
   }
-  if (ctx != nullptr && ctx->GetEnableBufferIR()) {
+  if (has_storage_selection || ctx == nullptr || !ctx->GetEnableBufferIR()) {
+    // A residual Tile While still writes its backedge into the initializer's
+    // window. Preserve borrowed or independently observed seeds before that
+    // write. Selected loops carry INDEX values and need no entry copy; keep
+    // the existing For isolation contract unchanged.
+    new_body = RetypeApplier({}).VisitStmt(new_body);
+    LoopInputIsolation isolation;
+    isolation.Plan(new_body, func->params_, /*recurrence_only=*/false, /*while_only=*/true);
+    if (!isolation.initializers.empty()) {
+      RetypeApplier applier(std::move(isolation.rewrites), std::move(isolation.initializers),
+                            std::move(isolation.entries));
+      new_body = applier.VisitStmt(new_body);
+      new_body = InsertAllocsIntoBody(new_body, isolation.allocations);
+      new_body = NormalizeIdentityCopyBuffersBeforeYieldFixup(new_body);
+    }
+  }
+  if (!has_storage_selection && ctx != nullptr && ctx->GetEnableBufferIR()) {
     // The Buffer path cannot rely on codegen to repair branch producers or
     // invent copies. Establish independent phi destinations while storage can
     // still be allocated, before any of the three planners sees the program.
@@ -3039,10 +3182,20 @@ FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func) {
 
   if (new_body == func->body_) return func;
 
-  return std::make_shared<const Function>(func->name_, func->params_, func->param_directions_,
-                                          func->return_types_, new_body, func->span_, func->func_type_,
-                                          func->level_, func->role_, func->attrs_,
-                                          func->requires_runtime_binding_, func->ir_stage_);
+  auto transformed =
+      std::make_shared<Function>(func->name_, func->params_, func->param_directions_, func->return_types_,
+                                 new_body, func->span_, func->func_type_, func->level_, func->role_,
+                                 func->attrs_, func->requires_runtime_binding_, func->ir_stage_);
+  if (has_storage_selection) {
+    auto selected = std::find_if(transformed->attrs_.begin(), transformed->attrs_.end(),
+                                 [](const auto& attr) { return attr.first == kAttrBufferIrSelected; });
+    if (selected == transformed->attrs_.end()) {
+      transformed->attrs_.emplace_back(kAttrBufferIrSelected, false);
+    } else {
+      selected->second = false;
+    }
+  }
+  return transformed;
 }
 
 }  // namespace memory_reuse
