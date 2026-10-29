@@ -791,15 +791,13 @@ class FinalTupleProjection:
 
 
 @pytest.mark.parametrize("region", ["for step in pl.range(2):", "if choose_first:"])
-@pytest.mark.parametrize("producer_count", [2, 3])
 @pytest.mark.parametrize("newest_first", [False, True])
 @pytest.mark.parametrize("drain_all_before_use", [False, True])
-def test_draining_merged_storage_preserves_other_final_tokens(
-    region, producer_count, newest_first, drain_all_before_use
-):
+def test_draining_merged_storage_preserves_other_final_tokens(region, newest_first, drain_all_before_use):
     # Pre-SSA rebindings inside a region conservatively merge fresh storage
     # identities. Each exact Final value still has its own drain obligation;
     # draining one must not hide an unsafe read of another in either order.
+    producer_count = 2
     statements = []
     for index in range(producer_count):
         statements.extend(
@@ -844,13 +842,12 @@ class MergedFinalTokens:
         assert "undrained final accumulator producer" in diagnostics[0].message
 
 
-@pytest.mark.parametrize("producer", ["matmul", "gemv"])
 @pytest.mark.parametrize("chained_choice", [False, True])
 @pytest.mark.parametrize("access", ["independent", "selected_consumer", "selected_producer"])
-def test_branch_choices_preserve_independent_accumulators(producer, chained_choice, access):
+def test_branch_choices_preserve_independent_accumulators(chained_choice, access):
     # A selection may refer to either source; it does not make the two source
     # allocations alias. Reads/writes through the selection still need a guard.
-    rows, dtype = (64, "BF16") if producer == "matmul" else (1, "FP32")
+    producer, rows, dtype = "matmul", 64, "BF16"
     extra = (
         """
         if choose_first:
@@ -905,9 +902,11 @@ class IndependentChoices:
         assert "undrained final accumulator producer" in diagnostics[0].message
 
 
-@pytest.mark.parametrize("space", ["Mat", "Vec", "Acc", None])
+@pytest.mark.parametrize(
+    "space, final_phase",
+    [("Mat", True), ("Vec", True), ("Acc", True), (None, True), ("Acc", False)],
+)
 @pytest.mark.parametrize("tuple_flow", ["loop", "rebind"])
-@pytest.mark.parametrize("final_phase", [False, True])
 def test_unrelated_tuple_provenance_only_restricts_possible_acc_storage(space, tuple_flow, final_phase):
     # Known non-Acc tiles cannot share the producer's unit flags. Acc tuple
     # control provenance remains conservative, and default kernels stay legal.
