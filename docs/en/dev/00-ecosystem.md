@@ -137,11 +137,6 @@ Repeat with `--platform a5`. Each entry has a 1200-second timeout (override with
 `--timeout`). Compilation failures, process failures, timeouts, and zero recorded
 compilations fail the job. Malformed or unreadable receipts fail their entry
 without aborting the remaining entries or losing the matrix summary.
-If a native compile-only CLI explicitly reports a missing `--runtime-dir`,
-the adapter retries once with an isolated artifact directory beside its receipt.
-The retry requires argument-validation exit code 2 and a valid empty compilation
-receipt; both attempts share the original timeout. Other invocations use their
-normal defaults, including replay options and inactive parsers.
 When an entry dispatches cases by launching its own script with the current
 Python interpreter, each child runs through the same compile-only adapter.
 Child environment, working directory, and process isolation are preserved,
