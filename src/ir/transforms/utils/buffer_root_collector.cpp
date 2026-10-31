@@ -13,8 +13,6 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <memory>
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,7 +25,6 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
-#include "pypto/ir/transforms/utils/result_alias_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
@@ -50,25 +47,7 @@ void BufferRootCollector::Initialize(const std::vector<VarPtr>& params) {
 }
 
 void BufferRootCollector::VisitStmt_(const IfStmtPtr& if_stmt) {
-  if (track_tile_storage_) {
-    static_cast<void>(StorageValue(if_stmt->condition_));
-    const auto then_values = StorageRegion(if_stmt->then_body_);
-    const auto else_values =
-        if_stmt->else_body_ ? StorageRegion(*if_stmt->else_body_) : std::vector<std::optional<StorageId>>{};
-    for (size_t i = 0; i < if_stmt->return_vars_.size(); ++i) {
-      const auto& var = if_stmt->return_vars_[i];
-      if (As<TupleType>(var->GetType())) {
-        MarkUnresolvedTileTuple(var->GetType());
-        continue;
-      }
-      auto storage = i < then_values.size() ? then_values[i] : std::nullopt;
-      if (i < else_values.size()) storage = StorageChoice(storage, else_values[i]);
-      if (!if_stmt->else_body_) storage = StorageChoice(storage, StorageValue(var));
-      BindStorage(var, storage);
-    }
-  } else {
-    IRVisitor::VisitStmt_(if_stmt);
-  }
+  IRVisitor::VisitStmt_(if_stmt);
   if (if_stmt->return_vars_.empty() || !if_stmt->else_body_.has_value()) return;
 
   auto then_yield = transform_utils::GetLastYieldStmt(if_stmt->then_body_);
@@ -92,26 +71,14 @@ void BufferRootCollector::VisitStmt_(const IfStmtPtr& if_stmt) {
 
 void BufferRootCollector::VisitStmt_(const ForStmtPtr& for_stmt) {
   auto init_roots = InitializeLoopCarryRoots(for_stmt->iter_args_);
-  if (track_tile_storage_) {
-    static_cast<void>(StorageValue(for_stmt->start_));
-    static_cast<void>(StorageValue(for_stmt->stop_));
-    static_cast<void>(StorageValue(for_stmt->step_));
-    StorageLoop(for_stmt->iter_args_, for_stmt->return_vars_, for_stmt->body_);
-  } else {
-    IRVisitor::VisitStmt_(for_stmt);
-  }
+  IRVisitor::VisitStmt_(for_stmt);
   RecordLoopReturnRoots(for_stmt->body_, for_stmt->return_vars_, init_roots,
                         transform_utils::EvalConstTripCount(for_stmt).value_or(0) > 0);
 }
 
 void BufferRootCollector::VisitStmt_(const WhileStmtPtr& while_stmt) {
   auto init_roots = InitializeLoopCarryRoots(while_stmt->iter_args_);
-  if (track_tile_storage_) {
-    static_cast<void>(StorageValue(while_stmt->condition_));
-    StorageLoop(while_stmt->iter_args_, while_stmt->return_vars_, while_stmt->body_);
-  } else {
-    IRVisitor::VisitStmt_(while_stmt);
-  }
+  IRVisitor::VisitStmt_(while_stmt);
   // A while condition may be false before the first iteration, so both the
   // initial and yielded roots remain possible.
   RecordLoopReturnRoots(while_stmt->body_, while_stmt->return_vars_, init_roots,
@@ -152,13 +119,6 @@ void BufferRootCollector::RecordLoopReturnRoots(const StmtPtr& body, const std::
 }
 
 void BufferRootCollector::VisitStmt_(const AssignStmtPtr& assign) {
-  if (track_tile_storage_) {
-    if (As<TupleType>(assign->var_->GetType())) {
-      BindTileTuple(assign->var_, TileTuple(assign->value_));
-    } else {
-      BindStorage(assign->var_, StorageValue(assign->value_));
-    }
-  }
   // Submit (pl.submit inside a pl.manual_scope) is a sibling call-like kind;
   // route it through the Call-shaped view so a task launch's Out/InOut roots are
   // tracked identically to a plain Call (results keyed on the stable binding
@@ -201,7 +161,7 @@ void BufferRootCollector::VisitStmt_(const AssignStmtPtr& assign) {
   } else if (AsVarLike(assign->value_)) {
     RecordRootCandidates(assign->var_, ResolveRootCandidates(assign->value_), IsAmbiguous(assign->value_));
   }
-  if (!track_tile_storage_) IRVisitor::VisitStmt_(assign);
+  IRVisitor::VisitStmt_(assign);
 }
 
 BufferRootCollector::RootCandidates BufferRootCollector::ResolveRootCandidates(const ExprPtr& expr) const {
@@ -302,309 +262,6 @@ bool BufferRootCollector::TypesMatchShapeDtype(const TypePtr& a, const TypePtr& 
     if (!AreExprsEqual(ta->shape_[i], tb->shape_[i])) return false;
   }
   return true;
-}
-
-BufferRootCollector::StorageId BufferRootCollector::StorageAliasGroup(StorageId storage) {
-  return FindStorage(group_parents_, storage);
-}
-
-bool BufferRootCollector::IsAmbiguousStorage(StorageId storage) {
-  return ambiguous_[FindStorage(parents_, storage)];
-}
-
-std::optional<BufferRootCollector::StorageId> BufferRootCollector::CallArgumentStorage(const CallPtr& call,
-                                                                                       size_t index) {
-  const auto found = calls_.find(call.get());
-  if (found == calls_.end() || index >= found->second.args.size()) return std::nullopt;
-  return StorageRoot(found->second.args[index]);
-}
-
-std::optional<BufferRootCollector::StorageId> BufferRootCollector::CallResultStorage(const CallPtr& call) {
-  const auto found = calls_.find(call.get());
-  return found == calls_.end() ? std::nullopt : StorageRoot(found->second.result);
-}
-
-void BufferRootCollector::VisitExpr_(const CallPtr& call) {
-  if (track_tile_storage_) {
-    static_cast<void>(StorageValue(call));
-  } else {
-    IRVisitor::VisitExpr_(call);
-  }
-}
-
-void BufferRootCollector::VisitExpr_(const IterArgPtr& arg) {
-  if (!track_tile_storage_) IRVisitor::VisitExpr_(arg);
-}
-
-void BufferRootCollector::VisitStmt_(const YieldStmtPtr& yield) {
-  if (!track_tile_storage_) {
-    IRVisitor::VisitStmt_(yield);
-    return;
-  }
-  for (size_t i = 0; i < yield->value_.size(); ++i) {
-    const auto storage = StorageValue(yield->value_[i]);
-    if (yields_.empty()) continue;
-    auto& values = yields_.back();
-    if (values.size() <= i) values.resize(i + 1);
-    values[i] = StorageChoice(values[i], storage);
-  }
-}
-
-bool BufferRootCollector::MayContainTile(const TypePtr& type) {
-  const auto cached = tile_types_.find(type.get());
-  if (cached != tile_types_.end()) return cached->second;
-  bool contains = As<TileType>(type) != nullptr;
-  if (const auto tuple = As<TupleType>(type)) {
-    for (const auto& element : tuple->types_) contains |= MayContainTile(element);
-  }
-  tile_types_.emplace(type.get(), contains);
-  return contains;
-}
-
-void BufferRootCollector::MarkUnresolvedTileTuple(const TypePtr& type) {
-  if (MayContainTile(type) && unresolved_tuple_type_set_.insert(type.get()).second) {
-    unresolved_tuple_types_.push_back(type);
-  }
-}
-
-BufferRootCollector::TupleStoragePtr BufferRootCollector::UnknownTileTuple(const TypePtr& type) {
-  MarkUnresolvedTileTuple(type);
-  return std::make_shared<TupleStorage>(TupleStorage{{}, std::nullopt, MayContainTile(type)});
-}
-
-BufferRootCollector::TupleStoragePtr BufferRootCollector::FreshTileTuple(const TypePtr& type) {
-  TupleStorage value;
-  if (As<TileType>(type)) {
-    value.storage = FreshStorage();
-    value.may_contain_tile = MayContainTile(type);
-  } else if (const auto tuple = As<TupleType>(type)) {
-    for (const auto& element : tuple->types_) {
-      auto child = FreshTileTuple(element);
-      value.may_contain_tile |= child->may_contain_tile;
-      value.elements.push_back(std::move(child));
-    }
-  }
-  return std::make_shared<TupleStorage>(std::move(value));
-}
-
-void BufferRootCollector::BindTileTuple(const VarPtr& var, const TupleStoragePtr& tuple) {
-  const auto old = tuple_variables_.find(var.get());
-  if (!yields_.empty() && old != tuple_variables_.end() && old->second != tuple &&
-      (old->second->may_contain_tile || tuple->may_contain_tile)) {
-    // Joining different tuple trees would require a separate tuple CFG
-    // analysis. Leave the rejection policy to the consumer.
-    MarkUnresolvedTileTuple(var->GetType());
-  }
-  tuple_variables_[var.get()] = tuple;
-}
-
-BufferRootCollector::TupleStoragePtr BufferRootCollector::ProjectTileTuple(
-    const std::shared_ptr<const TupleGetItemExpr>& projection) {
-  const auto tuple = TileTuple(projection->tuple_);
-  if (projection->index_ < 0 || static_cast<size_t>(projection->index_) >= tuple->elements.size()) {
-    return UnknownTileTuple(projection->GetType());
-  }
-  return tuple->elements[static_cast<size_t>(projection->index_)];
-}
-
-BufferRootCollector::TupleStoragePtr BufferRootCollector::TileTuple(const ExprPtr& expr) {
-  if (const auto var = AsVarLike(expr)) {
-    const auto found = tuple_variables_.find(var.get());
-    if (found != tuple_variables_.end()) return found->second;
-    auto tuple = UnknownTileTuple(var->GetType());
-    tuple_variables_.emplace(var.get(), tuple);
-    return tuple;
-  }
-  if (const auto projection = As<TupleGetItemExpr>(expr)) return ProjectTileTuple(projection);
-  if (const auto tuple = As<MakeTuple>(expr)) {
-    TupleStorage result;
-    for (const auto& element : tuple->elements_) {
-      TupleStoragePtr provenance;
-      if (As<TupleType>(element->GetType())) {
-        provenance = TileTuple(element);
-      } else {
-        const auto storage = StorageValue(element);
-        provenance =
-            std::make_shared<TupleStorage>(TupleStorage{{}, storage, MayContainTile(element->GetType())});
-      }
-      result.may_contain_tile |= provenance->may_contain_tile;
-      result.elements.push_back(std::move(provenance));
-    }
-    return std::make_shared<TupleStorage>(std::move(result));
-  }
-  if (const auto call = As<Call>(expr)) {
-    static_cast<void>(StorageValue(call));
-    const auto* entry = LookupOpEntry(call->op_);
-    // Registered value-returning multi-output ops own their outputs; the
-    // registry forbids them from declaring a reused destination argument.
-    // Quantization/gather tuples therefore have independent tile storage,
-    // rather than making all provenance in the function unresolved.
-    if (entry && entry->GetOutputArity() > 1 &&
-        !op_predicates::OutputInheritsSourceBuffer(call->op_->name_)) {
-      const auto found = call_tuples_.find(call.get());
-      if (found != call_tuples_.end()) return found->second;
-      auto result = FreshTileTuple(call->GetType());
-      call_tuples_.emplace(call.get(), result);
-      return result;
-    }
-  } else {
-    VisitExpr(expr);
-  }
-  return UnknownTileTuple(expr->GetType());
-}
-
-BufferRootCollector::StorageId BufferRootCollector::FreshStorage() {
-  const auto id = parents_.size();
-  parents_.push_back(id);
-  ranks_.push_back(0);
-  group_parents_.push_back(id);
-  group_ranks_.push_back(0);
-  ambiguous_.push_back(false);
-  return id;
-}
-
-BufferRootCollector::StorageId BufferRootCollector::FindStorage(std::vector<StorageId>& parents,
-                                                                StorageId id) {
-  while (parents[id] != id) {
-    parents[id] = parents[parents[id]];
-    id = parents[id];
-  }
-  return id;
-}
-
-std::optional<BufferRootCollector::StorageId> BufferRootCollector::StorageRoot(
-    std::optional<StorageId> storage) {
-  return storage ? std::make_optional(FindStorage(parents_, *storage)) : std::nullopt;
-}
-
-BufferRootCollector::StorageId BufferRootCollector::UniteStorage(std::vector<StorageId>& parents,
-                                                                 std::vector<size_t>& ranks, StorageId lhs,
-                                                                 StorageId rhs) {
-  lhs = FindStorage(parents, lhs);
-  rhs = FindStorage(parents, rhs);
-  if (lhs == rhs) return lhs;
-  if (ranks[lhs] < ranks[rhs]) std::swap(lhs, rhs);
-  parents[rhs] = lhs;
-  if (ranks[lhs] == ranks[rhs]) ++ranks[lhs];
-  return lhs;
-}
-
-void BufferRootCollector::ConnectStorageChoices(StorageId lhs, StorageId rhs) {
-  static_cast<void>(UniteStorage(group_parents_, group_ranks_, lhs, rhs));
-}
-
-std::optional<BufferRootCollector::StorageId> BufferRootCollector::StorageChoice(
-    std::optional<StorageId> lhs, std::optional<StorageId> rhs) {
-  lhs = StorageRoot(lhs);
-  rhs = StorageRoot(rhs);
-  if (!lhs) return rhs;
-  if (!rhs || lhs == rhs) return lhs;
-  const auto choice = FreshStorage();
-  ambiguous_[choice] = true;
-  ConnectStorageChoices(choice, *lhs);
-  ConnectStorageChoices(choice, *rhs);
-  return choice;
-}
-
-std::optional<BufferRootCollector::StorageId> BufferRootCollector::MergeStorage(
-    std::optional<StorageId> lhs, std::optional<StorageId> rhs) {
-  lhs = StorageRoot(lhs);
-  rhs = StorageRoot(rhs);
-  if (!lhs) return rhs;
-  if (!rhs || lhs == rhs) return lhs;
-  // Loop carries can name the yielded storage on a later iteration. Update
-  // earlier call operands through the identity forest before storage queries.
-  ConnectStorageChoices(*lhs, *rhs);
-  const bool ambiguous = ambiguous_[*lhs] || ambiguous_[*rhs];
-  const auto root = UniteStorage(parents_, ranks_, *lhs, *rhs);
-  ambiguous_[root] = ambiguous;
-  return root;
-}
-
-void BufferRootCollector::BindStorage(const VarPtr& var, std::optional<StorageId> storage) {
-  if (!var || !As<TileType>(var->GetType()) || !storage) return;
-  const auto old = variables_.find(var.get());
-  // A rebind changes this name's candidates without changing earlier aliases
-  // of either source. Loop init/yield identities are joined separately.
-  if (!yields_.empty() && old != variables_.end()) storage = StorageChoice(old->second, storage);
-  if (storage.has_value()) {
-    variables_[var.get()] = *storage;
-  }
-}
-
-std::optional<BufferRootCollector::StorageId> BufferRootCollector::StorageValue(const ExprPtr& expr) {
-  if (!expr) return std::nullopt;
-  if (auto var = AsVarLike(expr)) {
-    if (As<TupleType>(var->GetType())) {
-      static_cast<void>(TileTuple(var));
-      return std::nullopt;
-    }
-    if (!As<TileType>(var->GetType())) return std::nullopt;
-    const auto found = variables_.find(var.get());
-    if (found != variables_.end()) return found->second;
-    const auto storage = FreshStorage();
-    variables_.emplace(var.get(), storage);
-    return storage;
-  }
-  if (auto projection = As<TupleGetItemExpr>(expr)) return ProjectTileTuple(projection)->storage;
-  if (As<MakeTuple>(expr)) {
-    static_cast<void>(TileTuple(expr));
-    return std::nullopt;
-  }
-  if (auto call = As<Call>(expr)) {
-    CallStorage storage;
-    for (const auto& arg : call->args_) storage.args.push_back(StorageValue(arg));
-    if (As<TileType>(call->GetType())) {
-      if (const auto reused = ResultAliasedArgIndex(call)) {
-        storage.result = storage.args[*reused];
-      } else if (call->op_ && op_predicates::IsBufferAliasingViewOp(call->op_->name_) &&
-                 !storage.args.empty()) {
-        storage.result = storage.args[0];
-      }
-      if (!storage.result) storage.result = FreshStorage();
-    }
-    const auto [position, inserted] = calls_.emplace(call.get(), storage);
-    if (!inserted) {
-      // A shared expression can occur more than once in hand-built IR.
-      // Conservatively retain every operand/storage interpretation.
-      for (size_t i = 0; i < storage.args.size(); ++i) {
-        position->second.args[i] = StorageChoice(position->second.args[i], storage.args[i]);
-      }
-      position->second.result = StorageChoice(position->second.result, storage.result);
-    }
-    return position->second.result;
-  }
-  VisitExpr(expr);
-  return std::nullopt;
-}
-
-std::vector<std::optional<BufferRootCollector::StorageId>> BufferRootCollector::StorageRegion(
-    const StmtPtr& body) {
-  yields_.emplace_back();
-  if (body) VisitStmt(body);
-  auto values = std::move(yields_.back());
-  yields_.pop_back();
-  return values;
-}
-
-void BufferRootCollector::StorageLoop(const std::vector<IterArgPtr>& arguments,
-                                      const std::vector<VarPtr>& results, const StmtPtr& body) {
-  std::vector<std::optional<StorageId>> initial;
-  for (const auto& argument : arguments) {
-    if (argument && As<TupleType>(argument->GetType())) {
-      BindTileTuple(argument, TileTuple(argument->initValue_));
-      MarkUnresolvedTileTuple(argument->GetType());
-      initial.emplace_back(std::nullopt);
-      continue;
-    }
-    initial.push_back(argument ? StorageValue(argument->initValue_) : std::nullopt);
-    BindStorage(argument, initial.back());
-  }
-  const auto yielded = StorageRegion(body);
-  for (size_t i = 0; i < arguments.size(); ++i) {
-    auto storage = i < yielded.size() ? MergeStorage(initial[i], yielded[i]) : initial[i];
-    if (i < results.size()) BindStorage(results[i], storage);
-  }
 }
 
 }  // namespace buffer_root

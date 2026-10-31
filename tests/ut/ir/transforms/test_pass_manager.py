@@ -57,6 +57,7 @@ TENSOR_OPTIMIZATION_PASSES = [
     "InitMemRef",
     "SelectBufferIRFunctions",
     "MaterializeSemanticAliases",
+    "IRVerifier",
     "MemoryReuse",
     "VerifyTileStorage",
     "AllocateMemoryAddr",
@@ -78,6 +79,7 @@ TENSOR_OPTIMIZATION_PASSES = [
     "ClassifyIterArgCarry",
     "InsertCommFence",
     "MaterializeValidShapeSymbols",
+    "IRVerifier",
     "LowerTileToBuffer",
 ]
 

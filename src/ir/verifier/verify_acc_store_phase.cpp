@@ -39,11 +39,16 @@
  * pre-SSA form (including rebindings and an immediately nested
  * ``store(gemv(..., final), ..., final)``) and the normalized three-address form
  * seen by later verification instrumentation.
- * Logical storage provenance is indexed once before token checking. Overall
- * complexity is O(N log N), where N is the IR size.
+ * After MaterializeSemanticAliases, the same checker reads canonical MemRefs
+ * to guard storage reuse. It does not infer aliases or change the IR. Pending
+ * disjoint windows are indexed by allocation and byte offset, so both stages
+ * take O(N log N) time and O(N) space.
  */
 
 #include <cstddef>
+#include <cstdint>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -57,13 +62,16 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_space.h"
+#include "pypto/ir/memref.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/phase.h"
 #include "pypto/ir/program.h"
+#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
-#include "pypto/ir/transforms/utils/buffer_root_collector.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/verifier.h"
 
@@ -73,12 +81,11 @@ namespace ir {
 namespace {
 
 using TokenId = size_t;
-using StorageId = buffer_root::BufferRootCollector::StorageId;
 
 struct FinalProducer {
   std::string op_name;
   Span span;
-  std::optional<StorageId> storage;
+  MemRefPtr storage;
 };
 
 bool IsPhasedAccumulatorProducer(const CallPtr& call) {
@@ -103,11 +110,10 @@ bool IsFinalAccumulatorProducer(const CallPtr& call) {
  */
 class AccStorePhaseVisitor : public IRVisitor {
  public:
-  AccStorePhaseVisitor(std::vector<Diagnostic>& diagnostics, std::string func_name, ProgramPtr program)
-      : diagnostics_(diagnostics), func_name_(std::move(func_name)), storage_(std::move(program)) {}
+  AccStorePhaseVisitor(std::vector<Diagnostic>& diagnostics, std::string func_name)
+      : diagnostics_(diagnostics), func_name_(std::move(func_name)) {}
 
   void Run(const StmtPtr& body) {
-    body_ = body;
     if (body) VisitStmt(body);
     FlushPending("before leaving function '" + func_name_ + "'");
   }
@@ -117,7 +123,8 @@ class AccStorePhaseVisitor : public IRVisitor {
 
   void VisitStmt_(const AssignStmtPtr& op) override {
     if (!op || !op->var_) return;
-    auto token = ProcessValue(op->value_);
+    // The binding type is authoritative: a deduced Call type may omit MemRef.
+    auto token = ProcessValue(op->value_, AccumulatorStorage(op->var_->GetType()));
     if (token.has_value()) {
       var_tokens_[op->var_.get()] = *token;
     } else {
@@ -217,13 +224,13 @@ class AccStorePhaseVisitor : public IRVisitor {
   void VisitStmt_(const ContinueStmtPtr& /*op*/) override { FlushPending("before continuing a loop"); }
 
  private:
-  std::optional<TokenId> ProcessValue(const ExprPtr& expr) {
+  std::optional<TokenId> ProcessValue(const ExprPtr& expr, const MemRefPtr& destination = nullptr) {
     if (!expr) return std::nullopt;
     if (auto var = AsVarLike(expr)) {
       auto it = var_tokens_.find(var.get());
       return it == var_tokens_.end() ? std::nullopt : std::make_optional(it->second);
     }
-    if (auto call = As<Call>(expr)) return ProcessCall(call);
+    if (auto call = As<Call>(expr)) return ProcessCall(call, destination);
     // Any final producer buried in another expression is still recorded and
     // will be reported as unmatched. Its containing expression is not a plain
     // alias, so it cannot carry the token to a store.
@@ -231,66 +238,53 @@ class AccStorePhaseVisitor : public IRVisitor {
     return std::nullopt;
   }
 
-  std::optional<TokenId> ProcessCall(const CallPtr& call) {
+  std::optional<TokenId> ProcessCall(const CallPtr& call, MemRefPtr destination = nullptr) {
     if (!call) return std::nullopt;
 
     if (IsOp(call, "tile.store")) {
       std::optional<TokenId> source_token;
       if (!call->args_.empty()) source_token = ProcessValue(call->args_[0]);
       for (size_t i = 1; i < call->args_.size(); ++i) ScanExpr(call->args_[i]);
-      // A pre-existing alias of an in-place Final has no exact-value token,
-      // but cannot be read by a plain store before the matching Final drains.
+      // An earlier alias has no token, or a consumed token from a prior Final.
+      // Neither permits a plain store while this storage has a newer live Final.
       // A final store of that alias is already rejected by exact-value checks.
-      if (!source_token && call->GetKwarg<int>("st_phase", static_cast<int>(STPhase::kUnspecified)) ==
-                               static_cast<int>(STPhase::kUnspecified)) {
-        CheckUndrainedStorage(call, storage_.CallArgumentStorage(call, 0));
+      if ((!source_token || pending_.count(*source_token) == 0) && !call->args_.empty() &&
+          call->GetKwarg<int>("st_phase", static_cast<int>(STPhase::kUnspecified)) ==
+              static_cast<int>(STPhase::kUnspecified)) {
+        CheckUndrainedStorage(call, AccumulatorStorage(call->args_[0]->GetType()));
       }
       CheckStore(call, source_token);
       return std::nullopt;
     }
 
-    const bool is_final = IsFinalAccumulatorProducer(call);
-    if (is_final && !storage_built_) {
-      // Build the whole index once, including aliases before this producer and
-      // later loop yields. Unphased functions never allocate this analysis.
-      storage_.EnableTileStorageTracking();
-      storage_.VisitStmt(body_);
-      storage_built_ = true;
+    for (const auto& arg : call->args_) {
+      const auto token = ProcessValue(arg);
+      // Direct Final values are already known at the post-Inline check.
+      // Earlier aliases are checked later using canonical storage, not a
+      // second pre-SSA provenance analysis.
+      if (token && pending_.count(*token) != 0) ReportUnsafeUse(call);
+      CheckUndrainedStorage(call, AccumulatorStorage(arg->GetType()));
     }
-
-    for (size_t i = 0; i < call->args_.size(); ++i) {
-      static_cast<void>(ProcessValue(call->args_[i]));
-      // Only a bare alias may carry an undrained Final value to its store.
-      // Reject other uses conservatively: an accumulating MAD writes in place,
-      // and a slice/view can hide that same storage from a later MAD. Checking
-      // only the supported accumulating op names would miss that alias escape.
-      CheckUndrainedStorage(call, storage_.CallArgumentStorage(call, i));
+    if (!destination) {
+      if (const auto reused = op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size())) {
+        destination = AccumulatorStorage(call->args_[*reused]->GetType());
+      }
     }
-    if (!is_final) return std::nullopt;
-
-    if (HasUnresolvedAccumulatorTuple() && !tuple_provenance_reported_) {
-      tuple_provenance_reported_ = true;
-      diagnostics_.emplace_back(
-          DiagnosticSeverity::Error, "AccStorePhaseValid", /*error_code=*/7,
-          "Final accumulator protocol in function '" + func_name_ +
-              "' has unresolved tile-bearing tuple provenance that may contain Acc storage across a "
-              "control-flow join, loop carry, "
-              "or opaque tuple value. Unpack the tiles into separate aliases or tile iter_args so "
-              "the compiler can verify that every accumulator is drained before storage reuse.",
-          call->span_);
-    }
+    if (!destination) destination = AccumulatorStorage(call->GetType());
+    // Also guard an explicitly bound output: fresh producers need not read
+    // the Acc window they overwrite.
+    CheckUndrainedStorage(call, destination);
+    if (!IsFinalAccumulatorProducer(call)) return std::nullopt;
 
     const TokenId token = producers_.size();
-    const auto storage = storage_.CallResultStorage(call);
-    producers_.push_back(FinalProducer{call->op_->name_, call->span_, storage});
+    producers_.push_back(FinalProducer{call->op_->name_, call->span_, destination});
     pending_.insert(token);
-    if (storage) {
-      auto& pending = pending_storage_[storage_.StorageAliasGroup(*storage)];
-      pending.all.insert(token);
-      if (storage_.IsAmbiguousStorage(*storage)) {
-        pending.ambiguous.insert(token);
+    if (destination && !storage_error_) {
+      auto& windows = pending_storage_[destination->base_.get()];
+      if (const auto offset = As<ConstInt>(destination->byte_offset_)) {
+        windows.constant.emplace(offset->value_, token);
       } else {
-        pending.concrete[*storage].insert(token);
+        windows.symbolic = token;
       }
     }
     return token;
@@ -300,73 +294,66 @@ class AccStorePhaseVisitor : public IRVisitor {
     if (expr) static_cast<void>(ProcessValue(expr));
   }
 
-  bool MayContainAccumulator(const TypePtr& type) {
-    const auto cached = accumulator_types_.find(type.get());
-    if (cached != accumulator_types_.end()) return cached->second;
+  static MemRefPtr AccumulatorStorage(const TypePtr& type) {
     const auto tile = As<TileType>(type);
-    bool contains = tile && (!tile->GetMemorySpace() || tile->GetMemorySpace() == MemorySpace::Acc);
-    if (const auto tuple = As<TupleType>(type)) {
-      for (const auto& element : tuple->types_) contains |= MayContainAccumulator(element);
-    }
-    accumulator_types_.emplace(type.get(), contains);
-    return contains;
+    if (!tile || tile->GetMemorySpace() != MemorySpace::Acc) return nullptr;
+    const auto storage = GetTypeMemRef(type).value_or(nullptr);
+    // Parser declarations are not resolved storage. Only the late invocation,
+    // after InitMemRef and semantic alias materialization, uses these windows.
+    return storage && !storage->is_pinned_ && storage->size_ > 0 ? storage : nullptr;
   }
 
-  bool HasUnresolvedAccumulatorTuple() {
-    // Evaluate once after building the immutable index; tuple policy is local
-    // to Final protocol validation, not part of generic buffer provenance.
-    if (!unresolved_acc_tuple_) {
-      bool unresolved = false;
-      for (const auto& type : storage_.UnresolvedTupleTypes()) unresolved |= MayContainAccumulator(type);
-      unresolved_acc_tuple_ = unresolved;
-    }
-    return *unresolved_acc_tuple_;
-  }
-
-  void CheckUndrainedStorage(const CallPtr& call, std::optional<StorageId> storage) {
-    if (!storage) return;
-    const auto pending = pending_storage_.find(storage_.StorageAliasGroup(*storage));
-    if (pending == pending_storage_.end()) return;
-    const auto& aliases = pending->second;
-    const auto concrete = aliases.concrete.find(*storage);
-    const auto* tokens = &aliases.ambiguous;
-    if (storage_.IsAmbiguousStorage(*storage)) {
-      tokens = &aliases.all;
-    } else if (concrete != aliases.concrete.end()) {
-      tokens = &concrete->second;
-    }
-    if (tokens->empty() || !unsafe_use_reported_.insert(*tokens->begin()).second) return;
-    // Diagnose the first unsafe use; aliases of that use must not create a
-    // cascade. Keep the obligation live so a later missing drain is still seen.
+  void ReportUnsafeUse(const CallPtr& call) {
+    if (storage_error_) return;
     diagnostics_.emplace_back(
         DiagnosticSeverity::Error, "AccStorePhaseValid", /*error_code=*/6,
-        "input to '" + call->op_->name_ + "' in function '" + func_name_ +
-            "' has an undrained final accumulator producer. Store that exact value with "
-            "st_phase=pl.STPhase.Final before using it in another operation. Only a bare alias "
-            "may carry an undrained Final value; a view or in-place update can hide accumulator "
-            "reuse before its unit flag has been cleared, including through an alias created "
-            "before the Final operation.",
+        "operation '" + call->op_->name_ + "' in function '" + func_name_ +
+            "' accesses an undrained final accumulator producer. Store that exact value with "
+            "st_phase=pl.STPhase.Final before reading or overwriting its Acc storage.",
         call->span_);
+    // A valid indexed prefix has pairwise-disjoint pending windows. After the
+    // first conflict compilation already fails; stop storage diagnostics rather
+    // than building an overlapping-interval analysis. Keep exact tokens live
+    // so missing and double drains are still diagnosed independently.
+    storage_error_ = true;
+    pending_storage_.clear();
+  }
+
+  void CheckUndrainedStorage(const CallPtr& call, const MemRefPtr& storage) {
+    if (!storage || storage_error_) return;
+    const auto found = pending_storage_.find(storage->base_.get());
+    if (found == pending_storage_.end()) return;
+    const auto& windows = found->second;
+    const auto offset = As<ConstInt>(storage->byte_offset_);
+    // Main's MayAlias treats symbolic offsets within one allocation
+    // conservatively. Valid pending windows contain at most one such token.
+    if (windows.symbolic || !offset) {
+      ReportUnsafeUse(call);
+      return;
+    }
+    auto next = windows.constant.lower_bound(offset->value_);
+    auto overlaps = [&](const auto& entry) {
+      return MemRef::MayAlias(storage, producers_[entry.second].storage);
+    };
+    if ((next != windows.constant.end() && overlaps(*next)) ||
+        (next != windows.constant.begin() && overlaps(*std::prev(next)))) {
+      ReportUnsafeUse(call);
+    }
   }
 
   bool ConsumePending(TokenId token) {
     if (pending_.erase(token) == 0) return false;
-    if (const auto storage = producers_[token].storage) {
-      const auto pending = pending_storage_.find(storage_.StorageAliasGroup(*storage));
-      INTERNAL_CHECK_SPAN(pending != pending_storage_.end(), producers_[token].span)
+    if (const auto& storage = producers_[token].storage; storage && !storage_error_) {
+      const auto found = pending_storage_.find(storage->base_.get());
+      INTERNAL_CHECK_SPAN(found != pending_storage_.end(), producers_[token].span)
           << "Internal error: live Final token has no pending storage entry";
-      auto& aliases = pending->second;
-      aliases.all.erase(token);
-      if (storage_.IsAmbiguousStorage(*storage)) {
-        aliases.ambiguous.erase(token);
+      auto& windows = found->second;
+      if (const auto offset = As<ConstInt>(storage->byte_offset_)) {
+        windows.constant.erase(offset->value_);
       } else {
-        auto concrete = aliases.concrete.find(*storage);
-        INTERNAL_CHECK_SPAN(concrete != aliases.concrete.end(), producers_[token].span)
-            << "Internal error: concrete Final token has no storage entry";
-        concrete->second.erase(token);
-        if (concrete->second.empty()) aliases.concrete.erase(concrete);
+        windows.symbolic.reset();
       }
-      if (aliases.all.empty()) pending_storage_.erase(pending);
+      if (windows.constant.empty() && !windows.symbolic) pending_storage_.erase(found);
     }
     return true;
   }
@@ -472,22 +459,15 @@ class AccStorePhaseVisitor : public IRVisitor {
   std::set<TokenId> pending_;
   std::set<TokenId> reported_;
   std::unordered_map<const Var*, TokenId> var_tokens_;
-  StmtPtr body_;
-  bool storage_built_ = false;
-  buffer_root::BufferRootCollector storage_;
   struct PendingStorage {
-    // An ambiguous access checks the whole candidate group. A concrete access
-    // checks its own storage plus ambiguous producers, preserving independence
-    // of concrete Acc buffers that merely participate in the same selection.
-    std::set<TokenId> all;
-    std::set<TokenId> ambiguous;
-    std::unordered_map<StorageId, std::set<TokenId>> concrete;
+    // Destination writes are checked before insertion, keeping a valid prefix's
+    // windows disjoint. An input query needs only its successor and predecessor
+    // in O(log P); slots in one allocation retain independent drain obligations.
+    std::map<int64_t, TokenId> constant;
+    std::optional<TokenId> symbolic;
   };
-  std::unordered_map<StorageId, PendingStorage> pending_storage_;
-  std::set<TokenId> unsafe_use_reported_;
-  bool tuple_provenance_reported_ = false;
-  std::unordered_map<const Type*, bool> accumulator_types_;
-  std::optional<bool> unresolved_acc_tuple_;
+  std::unordered_map<const Var*, PendingStorage> pending_storage_;
+  bool storage_error_ = false;
 };
 
 }  // namespace
@@ -501,7 +481,7 @@ class AccStorePhaseValidPropertyVerifierImpl : public PropertyVerifier {
     for (const auto& [global_var, func] : program->functions_) {
       static_cast<void>(global_var);
       if (!func || !func->body_) continue;
-      AccStorePhaseVisitor visitor(diagnostics, func->name_, program);
+      AccStorePhaseVisitor visitor(diagnostics, func->name_);
       visitor.Run(func->body_);
     }
   }

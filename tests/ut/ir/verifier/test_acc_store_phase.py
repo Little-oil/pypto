@@ -30,6 +30,35 @@ def _verify(program):
     return passes.PropertyVerifierRegistry.verify(props, program)
 
 
+def _verify_storage(program):
+    """Use the real storage passes before checking alias-dependent ordering."""
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910)
+    try:
+        # The raw-program property tests intentionally invoke only the passes
+        # that establish storage; a separate test below exercises scheduling
+        # through the default pipeline.
+        with passes.PassContext([], enable_buffer_ir=False):
+            for transform in (
+                passes.convert_to_ssa,
+                passes.simplify,
+                passes.normalize_stmt_structure,
+                passes.flatten_call_expr,
+                passes.infer_tile_memory_space,
+                passes.init_mem_ref,
+                passes.materialize_semantic_aliases,
+            ):
+                program = transform()(program)
+            diagnostics = _verify(program)
+            if diagnostics:
+                return diagnostics
+            program = passes.memory_reuse()(program)
+            program = passes.allocate_memory_addr()(program)
+            return _verify(program)
+    finally:
+        backend.reset_for_testing()
+
+
 def _gemv_program(
     *,
     producer_phase=pl.AccPhase.Final,
@@ -493,7 +522,7 @@ def test_view_cannot_hide_modification_of_an_undrained_final_accumulator():
 
     diagnostics = _verify(Prog)
     assert len(diagnostics) == 1
-    assert "input to 'tile.slice'" in diagnostics[0].message
+    assert "operation 'tile.slice'" in diagnostics[0].message
     assert "undrained final accumulator producer" in diagnostics[0].message
 
 
@@ -518,7 +547,7 @@ class EarlierAlias:
         final = pl.tile.matmul_acc(seed, lhs, rhs, acc_phase=pl.AccPhase.Final)
 {tail}
 """)
-    diagnostics = _verify(program)
+    diagnostics = _verify_storage(program)
     if drain_first:
         assert diagnostics == []
     else:
@@ -526,8 +555,8 @@ class EarlierAlias:
         assert "undrained final accumulator producer" in diagnostics[0].message
 
 
-def test_original_acc_input_cannot_be_used_before_final_drain():
-    program = pl.parse_program("""
+def _reuse_before_drain_program():
+    return pl.parse_program("""
 @pl.program
 class OriginalInput:
     @pl.function(type=pl.FunctionType.InCore)
@@ -540,9 +569,29 @@ class OriginalInput:
         pl.tile.matmul_acc(seed, lhs, rhs, acc_phase=pl.AccPhase.Partial)
         out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
 """)
-    diagnostics = _verify(program)
+
+
+def test_original_acc_input_cannot_be_used_before_final_drain():
+    diagnostics = _verify_storage(_reuse_before_drain_program())
     assert len(diagnostics) == 1
     assert "undrained final accumulator producer" in diagnostics[0].message
+
+
+@pytest.mark.parametrize("level", [passes.VerificationLevel.BASIC, passes.VerificationLevel.NONE])
+def test_default_pipeline_checks_old_alias_after_storage_materialization(level):
+    program = _reuse_before_drain_program()
+    # Exact pairing alone is balanced: only materialized storage reveals that
+    # the old seed still addresses Final's in-place accumulator destination.
+    assert _verify(program) == []
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910)
+    try:
+        with passes.PassContext([], verification_level=level, enable_buffer_ir=False):
+            manager = PassManager.get_strategy(OptimizationStrategy.Default)
+            with pytest.raises(pypto.Error, match="undrained final accumulator producer"):
+                manager.run_passes(program)
+    finally:
+        backend.reset_for_testing()
 
 
 def test_original_acc_input_cannot_be_plain_stored_before_final_drain():
@@ -559,9 +608,30 @@ class OriginalStore:
         out = pl.store(seed, [0, 0], out)
         out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
 """)
-    diagnostics = _verify(program)
+    diagnostics = _verify_storage(program)
     assert len(diagnostics) == 1
-    assert "input to 'tile.store'" in diagnostics[0].message
+    assert "operation 'tile.store'" in diagnostics[0].message
+
+
+def test_consumed_final_alias_cannot_plain_store_a_new_undrained_final():
+    program = pl.parse_program("""
+@pl.program
+class ReusedFinalAlias:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        first = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final)
+        out = pl.store(first, [0, 0], out, st_phase=pl.STPhase.Final)
+        second = pl.tile.matmul_acc(first, lhs, rhs, acc_phase=pl.AccPhase.Final)
+        out = pl.store(first, [0, 0], out)
+        out = pl.store(second, [0, 0], out, st_phase=pl.STPhase.Final)
+""")
+    diagnostics = _verify_storage(program)
+    assert len(diagnostics) == 1
+    assert "operation 'tile.store'" in diagnostics[0].message
+    assert "undrained final accumulator producer" in diagnostics[0].message
 
 
 def test_storage_alias_does_not_replace_exact_final_result_for_store():
@@ -597,7 +667,7 @@ class FreshRebind:
         pl.tile.matmul_acc(seed, lhs, rhs, acc_phase=pl.AccPhase.Partial)
         out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
 """)
-    assert _verify(program) == []
+    assert _verify_storage(program) == []
 
 
 def test_loop_carried_accumulator_preserves_earlier_alias_provenance():
@@ -618,12 +688,13 @@ class LoopAlias:
         pl.tile.matmul_acc(earlier, lhs, rhs, acc_phase=pl.AccPhase.Partial)
         out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
 """)
-    diagnostics = _verify(program)
+    diagnostics = _verify_storage(program)
     assert len(diagnostics) == 1
     assert "undrained final accumulator producer" in diagnostics[0].message
 
 
-def test_branch_result_retains_possible_input_storage_aliases():
+def test_branch_result_preserves_a_shared_input_storage_alias():
+    # Both branches select aliases of the same canonical Acc window.
     program = pl.parse_program("""
 @pl.program
 class BranchAlias:
@@ -633,7 +704,7 @@ class BranchAlias:
         lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
         rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
         seed0 = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
-        seed1 = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        seed1 = seed0
         if choose_first:
             selected = pl.yield_(seed0)
         else:
@@ -642,135 +713,40 @@ class BranchAlias:
         pl.tile.matmul_acc(seed0, lhs, rhs, acc_phase=pl.AccPhase.Partial)
         out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
 """)
-    diagnostics = _verify(program)
+    diagnostics = _verify_storage(program)
     assert len(diagnostics) == 1
     assert "undrained final accumulator producer" in diagnostics[0].message
 
 
-def test_loop_yields_account_for_aliasing_on_later_iterations():
-    # The two carries are initially distinct. The first yield makes them alias,
-    # so checking only the first iteration would accept a later wait-before-clear.
-    program = pl.parse_program("""
-@pl.program
-class LaterIterationAlias:
-    @pl.function(type=pl.FunctionType.InCore)
-    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
-               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
-        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
-        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
-        seed0 = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
-        seed1 = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
-        for step, (first, second) in pl.range(2, init_values=(seed0, seed1)):
-            final = pl.tile.matmul_acc(first, lhs, rhs, acc_phase=pl.AccPhase.Final)
-            pl.tile.matmul_acc(second, lhs, rhs, acc_phase=pl.AccPhase.Partial)
-            out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
-            next_first, next_second = pl.yield_(second, second)
-""")
-    diagnostics = _verify(program)
-    assert len(diagnostics) == 1
-    assert "undrained final accumulator producer" in diagnostics[0].message
-
-
-@pytest.mark.parametrize(
-    "aliases",
-    [
-        "pair = (seed, seed)\n        earlier = pair[0]",
-        "pair = (seed, (seed, seed))\n        forwarded = pair\n"
-        "        nested = forwarded[1]\n        earlier = nested[0]",
-    ],
-    ids=["tuple", "nested_tuple_alias"],
-)
 @pytest.mark.parametrize("drain_first", [False, True])
-def test_tuple_projection_created_before_final_retains_storage(aliases, drain_first):
-    drain = "out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)"
+def test_loop_carried_alias_cannot_bypass_final_drain(drain_first):
+    # The storage pass has one canonical carry; the older name must not bypass
+    # its Final state. No speculative merging of future loop yields is needed.
+    store = "out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)"
     update = "pl.tile.matmul_acc(earlier, lhs, rhs, acc_phase=pl.AccPhase.Partial)"
-    statements = [drain, update] if drain_first else [update, drain]
-    tail = "\n".join(f"        {statement}" for statement in statements)
+    statements = [store, update] if drain_first else [update, store]
+    body = "\n".join(f"            {statement}" for statement in statements)
     program = pl.parse_program(f"""
 @pl.program
-class TupleAlias:
+class LoopAliasDrain:
     @pl.function(type=pl.FunctionType.InCore)
     def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
                out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
         lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
         rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
         seed = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
-        {aliases}
-        final = pl.tile.matmul_acc(seed, lhs, rhs, acc_phase=pl.AccPhase.Final)
-{tail}
+        for step, (carried,) in pl.range(2, init_values=(seed,)):
+            earlier = carried
+            final = pl.tile.matmul_acc(carried, lhs, rhs, acc_phase=pl.AccPhase.Final)
+{body}
+            next_acc = pl.yield_(final)
 """)
-    diagnostics = _verify(program)
+    diagnostics = _verify_storage(program)
     if drain_first:
         assert diagnostics == []
     else:
         assert len(diagnostics) == 1
         assert "undrained final accumulator producer" in diagnostics[0].message
-
-
-@pytest.mark.parametrize("final_phase", [False, True])
-def test_unresolved_tile_tuple_carry_is_rejected_only_with_final_protocol(final_phase):
-    phase = "Final" if final_phase else "Partial"
-    store_phase = "Final" if final_phase else "Unspecified"
-    program = pl.parse_program(f"""
-@pl.program
-class TupleCarry:
-    @pl.function(type=pl.FunctionType.InCore)
-    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
-               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
-        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
-        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
-        seed = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
-        pair = (seed, seed)
-        for step, (carried,) in pl.range(2, init_values=(pair,)):
-            result_pair = pl.yield_(carried)
-        earlier = result_pair[0]
-        final = pl.tile.matmul_acc(seed, lhs, rhs, acc_phase=pl.AccPhase.{phase})
-        pl.tile.matmul_acc(earlier, lhs, rhs, acc_phase=pl.AccPhase.Partial)
-        out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.{store_phase})
-""")
-    diagnostics = _verify(program)
-    if final_phase:
-        assert len(diagnostics) == 1
-        assert "unresolved tile-bearing tuple provenance" in diagnostics[0].message
-        assert "Unpack the tiles" in diagnostics[0].message
-    else:
-        assert diagnostics == []
-
-
-def test_scalar_tuple_carry_does_not_restrict_final_accumulator_protocol():
-    program = pl.parse_program("""
-@pl.program
-class ScalarTupleCarry:
-    @pl.function(type=pl.FunctionType.InCore)
-    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
-               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
-        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
-        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
-        pair = (1, 2)
-        for step, (carried,) in pl.range(2, init_values=(pair,)):
-            result_pair = pl.yield_(carried)
-        final = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final)
-        out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
-""")
-    assert _verify(program) == []
-
-
-def test_registered_fresh_multioutput_tuple_does_not_restrict_final_protocol():
-    """Fresh builtin outputs cannot alias an unrelated Cube accumulator."""
-    program = pl.parse_program("""
-@pl.program
-class FreshTupleOutputs:
-    @pl.function(type=pl.FunctionType.InCore)
-    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
-               q: pl.Tensor[[64, 128], pl.FP16], out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
-        qvec = pl.load(q, [0, 0], [64, 128], target_memory=pl.Mem.Vec)
-        quantized, scales = pl.tile.quant_mx(qvec, group_axis=1)
-        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
-        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
-        final = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final)
-        out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
-""")
-    assert _verify(program) == []
 
 
 def test_tuple_projection_cannot_replace_exact_final_value_for_store():
@@ -790,51 +766,36 @@ class FinalTupleProjection:
     assert any("must consume the exact SSA value" in d.message for d in diagnostics)
 
 
-@pytest.mark.parametrize("region", ["for step in pl.range(2):", "if choose_first:"])
+def _independent_final_program(*, newest_first, drain_all_before_use):
+    # Updating an older seed bypasses exact-value tokens. Draining the other
+    # independent Final must not discard this seed's live storage obligation.
+    order = [1, 0] if newest_first else [0, 1]
+    stores = [f"out = pl.store(final{i}, [0, 0], out, st_phase=pl.STPhase.Final)" for i in order]
+    update = f"pl.tile.matmul_acc(seed{order[-1]}, lhs, rhs, acc_phase=pl.AccPhase.Partial)"
+    statements = [*stores, update] if drain_all_before_use else [stores[0], update, stores[1]]
+    tail = "\n".join(f"        {statement}" for statement in statements)
+    return pl.parse_program(f"""
+@pl.program
+class IndependentFinalTokens:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
+        seed0 = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        seed1 = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Partial)
+        final0 = pl.tile.matmul_acc(seed0, lhs, rhs, acc_phase=pl.AccPhase.Final)
+        final1 = pl.tile.matmul_acc(seed1, lhs, rhs, acc_phase=pl.AccPhase.Final)
+{tail}
+""")
+
+
 @pytest.mark.parametrize("newest_first", [False, True])
 @pytest.mark.parametrize("drain_all_before_use", [False, True])
-def test_draining_merged_storage_preserves_other_final_tokens(region, newest_first, drain_all_before_use):
-    # Pre-SSA rebindings inside a region conservatively merge fresh storage
-    # identities. Each exact Final value still has its own drain obligation;
-    # draining one must not hide an unsafe read of another in either order.
-    producer_count = 2
-    statements = []
-    for index in range(producer_count):
-        statements.extend(
-            [
-                "c = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final)",
-                f"held{index} = c",
-            ]
-        )
-    order = list(range(producer_count))
-    if newest_first:
-        order.reverse()
-    stores = [f"out = pl.store(held{i}, [0, 0], out, st_phase=pl.STPhase.Final)" for i in order]
-    update = f"pl.tile.matmul_acc(held{order[-1]}, lhs, rhs, acc_phase=pl.AccPhase.Partial)"
-    if drain_all_before_use:
-        statements.extend([*stores, update])
-    else:
-        statements.extend([stores[0], update, *stores[1:]])
-    # After the last drain, the same abstract storage can begin a fresh pair.
-    statements.extend(
-        [
-            f"next_final = pl.tile.matmul_acc(held{order[-1]}, lhs, rhs, acc_phase=pl.AccPhase.Final)",
-            "out = pl.store(next_final, [0, 0], out, st_phase=pl.STPhase.Final)",
-        ]
+def test_draining_one_accumulator_preserves_other_final_tokens(newest_first, drain_all_before_use):
+    diagnostics = _verify_storage(
+        _independent_final_program(newest_first=newest_first, drain_all_before_use=drain_all_before_use)
     )
-    body = "\n".join(f"            {statement}" for statement in statements)
-    program = pl.parse_program(f"""
-@pl.program
-class MergedFinalTokens:
-    @pl.function(type=pl.FunctionType.InCore)
-    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
-               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]], choose_first: pl.Scalar[pl.BOOL]):
-        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
-        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
-        {region}
-{body}
-""")
-    diagnostics = _verify(program)
     if drain_all_before_use:
         assert diagnostics == []
     else:
@@ -842,108 +803,45 @@ class MergedFinalTokens:
         assert "undrained final accumulator producer" in diagnostics[0].message
 
 
-@pytest.mark.parametrize("chained_choice", [False, True])
-@pytest.mark.parametrize("access", ["independent", "selected_consumer", "selected_producer"])
-def test_branch_choices_preserve_independent_accumulators(chained_choice, access):
-    # A selection may refer to either source; it does not make the two source
-    # allocations alias. Reads/writes through the selection still need a guard.
-    producer, rows, dtype = "matmul", 64, "BF16"
-    extra = (
-        """
-        if choose_first:
-            selected_again = pl.yield_(selected)
-        else:
-            selected_again = pl.yield_(seed1)
-        selected = selected_again
-"""
-        if chained_choice
-        else ""
-    )
-    acc = f"pl.tile.{producer}_acc"
-    if access == "independent":
-        body = f"""
-        final0 = {acc}(seed0, lhs, rhs, acc_phase=pl.AccPhase.Final)
-        final1 = {acc}(seed1, lhs, rhs, acc_phase=pl.AccPhase.Final)
-        out = pl.store(final0, [0, 0], out, st_phase=pl.STPhase.Final)
-        out = pl.store(final1, [0, 0], out, st_phase=pl.STPhase.Final)
-"""
-    else:
-        final_source = "selected" if access == "selected_producer" else "seed0"
-        consumer_source = "seed0" if access == "selected_producer" else "selected"
-        body = f"""
-        final = {acc}({final_source}, lhs, rhs, acc_phase=pl.AccPhase.Final)
-        {acc}({consumer_source}, lhs, rhs, acc_phase=pl.AccPhase.Partial)
-        out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
-"""
+def test_default_pipeline_accepts_independent_final_accumulators():
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910)
+    try:
+        with passes.PassContext([], enable_buffer_ir=False):
+            manager = PassManager.get_strategy(OptimizationStrategy.Default)
+            result = manager.run_passes(
+                _independent_final_program(newest_first=False, drain_all_before_use=True)
+            )
+            assert _verify(result) == []
+    finally:
+        backend.reset_for_testing()
+
+
+@pytest.mark.parametrize("second_offset", [0, 16384, 32768])
+def test_final_destination_checks_overlapping_windows_and_independent_slots(second_offset):
+    # The LHS owns canonical storage; deduced matmul result types carry no
+    # MemRef. Equal/partly overlapping output windows conflict, adjacent slots
+    # in the same allocation remain independent and can both be drained.
     program = pl.parse_program(f"""
 @pl.program
-class IndependentChoices:
+class ExplicitAccWindows:
     @pl.function(type=pl.FunctionType.InCore)
-    def kernel(self, a: pl.Tensor[[{rows}, 128], pl.{dtype}], b: pl.Tensor[[128, 128], pl.{dtype}],
-               out: pl.Out[pl.Tensor[[{rows}, 128], pl.FP32]],
-               tmp: pl.Out[pl.Tensor[[{rows}, 128], pl.FP32]], choose_first: pl.Scalar[pl.BOOL]):
-        lhs = pl.load(a, [0, 0], [{rows}, 128], target_memory=pl.Mem.Mat)
-        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
-        seed0 = pl.tile.{producer}(lhs, rhs, acc_phase=pl.AccPhase.Partial)
-        seed1 = pl.tile.{producer}(lhs, rhs, acc_phase=pl.AccPhase.Partial)
-        if choose_first:
-            selected = pl.yield_(seed0)
-        else:
-            selected = pl.yield_(seed1)
-{extra}
-        tmp = pl.store(selected, [0, 0], tmp)
-{body}
+    def kernel(self, lhs: pl.Tile[[64, 128], pl.BF16, pl.Mem.Left],
+               rhs: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right],
+               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]):
+        allocation: pl.Ptr = pl.tile.alloc(pl.Mem.Acc, 65536)
+        first: pl.Tile[[64, 128], pl.FP32, pl.MemRef(allocation, 0, 32768), pl.Mem.Acc] = (
+            pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final))
+        second: pl.Tile[[64, 128], pl.FP32, pl.MemRef(allocation, {second_offset}, 32768), pl.Mem.Acc] = (
+            pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.Final))
+        out = pl.store(first, [0, 0], out, st_phase=pl.STPhase.Final)
+        out = pl.store(second, [0, 0], out, st_phase=pl.STPhase.Final)
 """)
     diagnostics = _verify(program)
-    if access == "independent":
-        assert diagnostics == []
-    else:
+    if second_offset < 32768:
         assert len(diagnostics) == 1
+        assert "operation 'tile.matmul'" in diagnostics[0].message
         assert "undrained final accumulator producer" in diagnostics[0].message
-
-
-@pytest.mark.parametrize(
-    "space, final_phase",
-    [("Mat", True), ("Vec", True), ("Acc", True), (None, True), ("Acc", False)],
-)
-@pytest.mark.parametrize("tuple_flow", ["loop", "rebind"])
-def test_unrelated_tuple_provenance_only_restricts_possible_acc_storage(space, tuple_flow, final_phase):
-    # Known non-Acc tiles cannot share the producer's unit flags. Acc tuple
-    # control provenance remains conservative, and default kernels stay legal.
-    flow = (
-        """
-        for step, (carried,) in pl.range(2, init_values=(pair,)):
-            ignored = pl.yield_(carried)
-"""
-        if tuple_flow == "loop"
-        else """
-        if choose_first:
-            pair = (unrelated, (unrelated, 1))
-"""
-    )
-    phase = "Final" if final_phase else "Unspecified"
-    allocation = (
-        f"pl.tile.create([16, 16], pl.FP32, target_memory=pl.Mem.{space})" if space else "unknown_space"
-    )
-    program = pl.parse_program(f"""
-@pl.program
-class UnrelatedTuple:
-    @pl.function(type=pl.FunctionType.InCore)
-    def kernel(self, a: pl.Tensor[[64, 128], pl.BF16], b: pl.Tensor[[128, 128], pl.BF16],
-               out: pl.Out[pl.Tensor[[64, 128], pl.FP32]], choose_first: pl.Scalar[pl.BOOL],
-               unknown_space: pl.Tile[[16, 16], pl.FP32]):
-        lhs = pl.load(a, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
-        rhs = pl.load(b, [0, 0], [128, 128], target_memory=pl.Mem.Mat)
-        unrelated = {allocation}
-        pair = (unrelated, (unrelated, 1))
-{flow}
-        final = pl.tile.matmul(lhs, rhs, acc_phase=pl.AccPhase.{phase})
-        out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.{phase})
-""")
-    diagnostics = _verify(program)
-    if final_phase and space in ("Acc", None):
-        assert len(diagnostics) == 1
-        assert "unresolved tile-bearing tuple provenance" in diagnostics[0].message
     else:
         assert diagnostics == []
 
@@ -952,7 +850,7 @@ class UnrelatedTuple:
     "producer_phase, store_phase",
     [("Unspecified", "Unspecified"), ("Unspecified", "Final"), ("Final", "Final")],
 )
-def test_lazy_storage_index_keeps_nested_producer_and_orphan_store_checks(producer_phase, store_phase):
+def test_nested_producer_and_orphan_store_checks(producer_phase, store_phase):
     # The first Final may be nested in a store argument. Without any Final
     # producer, the verifier must still reject a store waiting on an unset flag.
     program = pl.parse_program(f"""
