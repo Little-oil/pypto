@@ -12,6 +12,9 @@
 #ifndef PYPTO_IR_TRANSFORMS_UTILS_BUFFER_ROOT_COLLECTOR_H_
 #define PYPTO_IR_TRANSFORMS_UTILS_BUFFER_ROOT_COLLECTOR_H_
 
+#include <cstddef>
+#include <memory>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -84,13 +87,90 @@ class BufferRootCollector : public IRVisitor {
     return it == root_candidates_.end() ? kNone : it->second;
   }
 
+  /// Opt in before visiting the body when lexical tile storage identities are
+  /// needed in addition to Var buffer roots. Existing tensor-root consumers
+  /// retain their original behavior and do not allocate this index.
+  void EnableTileStorageTracking() { track_tile_storage_ = true; }
+
+  /// Opaque identity valid only within this collector after its body traversal
+  /// completes. Call snapshots retain lexical inputs, including pre-SSA names;
+  /// loop-yield identities are resolved before these queries may be used.
+  using StorageId = size_t;
+  StorageId StorageAliasGroup(StorageId storage);
+  bool IsAmbiguousStorage(StorageId storage);
+  /// nullopt means no indexed tile provenance, not proof of disjointness.
+  std::optional<StorageId> CallArgumentStorage(const CallPtr& call, size_t index);
+  std::optional<StorageId> CallResultStorage(const CallPtr& call);
+
+  /// Tuple provenance the collector cannot resolve across control flow or an
+  /// opaque producer. Consumers decide which memory spaces matter to them.
+  const std::vector<TypePtr>& UnresolvedTupleTypes() const { return unresolved_tuple_types_; }
+
  protected:
+  void VisitExpr_(const CallPtr& call) override;
+  void VisitExpr_(const IterArgPtr& arg) override;
+  void VisitStmt_(const YieldStmtPtr& yield) override;
   void VisitStmt_(const IfStmtPtr& if_stmt) override;
   void VisitStmt_(const ForStmtPtr& for_stmt) override;
   void VisitStmt_(const WhileStmtPtr& while_stmt) override;
   void VisitStmt_(const AssignStmtPtr& assign) override;
 
  private:
+  struct CallStorage {
+    std::vector<std::optional<StorageId>> args;
+    std::optional<StorageId> result;
+  };
+
+  /// Persistent tile tuple provenance: aliases/projections share children instead
+  /// of copying a nested tuple tree. Each explicit tuple contributes only its
+  /// own edges, keeping repeated forwarding and nested projections linear.
+  struct TupleStorage {
+    std::vector<std::shared_ptr<const TupleStorage>> elements;
+    std::optional<StorageId> storage;
+    bool may_contain_tile = false;
+  };
+  using TupleStoragePtr = std::shared_ptr<const TupleStorage>;
+
+  // Separate identity and may-alias forests: loop carries join identities,
+  // while branch choices connect candidates without identifying independent
+  // allocations. Lexical call snapshots survive later pre-SSA rebindings.
+  // Union by rank/path compression bounds the index to O(N log N) work and
+  // O(N) space; persistent tuple nodes share children instead of copying trees.
+  std::vector<StorageId> parents_;
+  std::vector<size_t> ranks_;
+  std::vector<StorageId> group_parents_;
+  std::vector<size_t> group_ranks_;
+  std::vector<bool> ambiguous_;
+  std::unordered_map<const Var*, StorageId> variables_;
+  std::unordered_map<const Call*, CallStorage> calls_;
+  std::vector<std::vector<std::optional<StorageId>>> yields_;
+  std::unordered_map<const Var*, TupleStoragePtr> tuple_variables_;
+  std::unordered_map<const Call*, TupleStoragePtr> call_tuples_;
+  std::unordered_map<const Type*, bool> tile_types_;
+  std::vector<TypePtr> unresolved_tuple_types_;
+  std::unordered_set<const Type*> unresolved_tuple_type_set_;
+  bool track_tile_storage_ = false;
+  bool MayContainTile(const TypePtr& type);
+  void MarkUnresolvedTileTuple(const TypePtr& type);
+  TupleStoragePtr UnknownTileTuple(const TypePtr& type);
+  TupleStoragePtr FreshTileTuple(const TypePtr& type);
+  void BindTileTuple(const VarPtr& var, const TupleStoragePtr& tuple);
+  TupleStoragePtr ProjectTileTuple(const std::shared_ptr<const TupleGetItemExpr>& projection);
+  TupleStoragePtr TileTuple(const ExprPtr& expr);
+  StorageId FreshStorage();
+  static StorageId FindStorage(std::vector<StorageId>& parents, StorageId id);
+  std::optional<StorageId> StorageRoot(std::optional<StorageId> storage);
+  static StorageId UniteStorage(std::vector<StorageId>& parents, std::vector<size_t>& ranks, StorageId lhs,
+                                StorageId rhs);
+  void ConnectStorageChoices(StorageId lhs, StorageId rhs);
+  std::optional<StorageId> StorageChoice(std::optional<StorageId> lhs, std::optional<StorageId> rhs);
+  std::optional<StorageId> MergeStorage(std::optional<StorageId> lhs, std::optional<StorageId> rhs);
+  void BindStorage(const VarPtr& var, std::optional<StorageId> storage);
+  std::optional<StorageId> StorageValue(const ExprPtr& expr);
+  std::vector<std::optional<StorageId>> StorageRegion(const StmtPtr& body);
+  void StorageLoop(const std::vector<IterArgPtr>& arguments, const std::vector<VarPtr>& results,
+                   const StmtPtr& body);
+
   using RootCandidates = std::vector<const Var*>;
 
   struct RootInfo {
