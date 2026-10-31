@@ -396,6 +396,8 @@ class PassManager:
             strategy,
             analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
         )
+        phase_properties = passes.IRPropertySet()
+        phase_properties.insert(passes.IRProperty.AccStorePhaseValid)
         for pass_factory in pass_factories:
             pass_obj = pass_factory()
             if self._construction_buffer_ir and pass_obj.get_name() == "MaterializeSemanticAliases":
@@ -405,9 +407,17 @@ class PassManager:
             if pass_obj.get_name() in skipped_mem_planning_passes:
                 continue
             self._pipeline.add_pass(pass_obj)
+            if pass_obj.get_name() == "MaterializeSemanticAliases":
+                # Inline verifies exact Final/store pairing. Canonical MemRefs
+                # now let the same verifier guard old aliases and loop storage
+                # without reimplementing storage provenance before legalization.
+                self._pipeline.add_pass(passes.run_verifier(phase_properties))
             if self._construction_buffer_ir and pass_obj.get_name() == "AllocateMemoryAddr":
                 self._pipeline.add_pass(passes.verify_tile_storage(allocated=True))
 
+        # Subsequent storage rewrites may retarget MemRef windows. Recheck the
+        # final TileIR, including PTOAS paths that skip address allocation.
+        self._pipeline.add_pass(passes.run_verifier(phase_properties))
         if self._construction_buffer_ir:
             self._pipeline.add_pass(passes.lower_tile_to_buffer())
 

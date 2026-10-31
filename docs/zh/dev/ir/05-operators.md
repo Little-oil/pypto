@@ -425,11 +425,6 @@ rhs 的逻辑 K 必须覆盖 lhs 的逻辑 K。支持的 dtype 三元组为
 也必须使用相同的输出 dtype，且 bias 的 valid shape 必须覆盖逻辑输出
 `[1, N]`；物理 N 一致时，bias 的 valid N 可以更宽。
 
-`tile.gemv`、`tile.gemv_acc` 和 `tile.gemv_bias` 的 `acc_phase` 可设为
-`pl.AccPhase.Unspecified`（默认值）、`pl.AccPhase.Partial` 或
-`pl.AccPhase.Final`。后续仍有 K 分块时使用 `Partial`，最后一个分块使用
-`Final`。
-
 `tile.gemv_acc` 还接受可选的 `init_cond` 谓词 ——
 见[条件式累加器初始化](#条件式累加器初始化init_cond)。`tile.gemv_bias` 没有该操作数，
 与 `tile.matmul_bias` 一致：带 bias 的 GEMV 本身就铸造累加器，没有可被谓词化的初值。
@@ -446,6 +441,22 @@ acc = pl.tile.set_validshape(acc_raw, 1, N)  # 随后 gemv_acc(..., init_cond=(k
 在 `init_cond` 之前，这一步是由剥离的首个 K 步隐式完成的 —— 一条直线展开的
 `pl.tile.gemv` 会铸造出类型正确的累加器，代价是两个分支之间的一个 phi。
 
+### 累加器阶段（Accumulator phases，A2/A3）
+
+`tile.matmul`、`tile.matmul_acc`、`tile.gemv`、`tile.gemv_acc` 和
+`tile.gemv_bias` 的 `acc_phase` 可设为 `pl.AccPhase.Unspecified`（默认值）、
+`pl.AccPhase.Partial` 或 `pl.AccPhase.Final`。`Unspecified` 保持现有行为；
+后续仍有 K 分块时使用 `Partial`，最后一个分块使用 `Final`。Matmul DSL
+入口的 `acc_phase` 仅接受关键字传参，因此
+`pl.tile.matmul_acc(acc, lhs, rhs, init_cond, acc_phase=...)` 保留现有第 4 个
+位置参数 `init_cond`；IR wrapper 同样保留位置参数 `span`。初始化与累加
+两条代码生成分支都会携带所选择的阶段。
+
+使用 `AccPhase.Final` 时，`matmul_acc` 要求能够证明乘积的有效 M/N 矩形与
+累加器的有效矩形相等。对较宽累加器只更新较小区域会被拒绝：它的 Final
+store 会检查未更新分块，而 MAD 并未设置这些分块的 unit flag。应使用有效
+区域相匹配的累加器窗口，或保持部分更新，直到整个有效区域完成最终累加。
+
 在使用 unit flag 的路径上，最后一个累加生产者必须与
 `pl.store(..., st_phase=pl.STPhase.Final)` 配对。final 生产者负责置位，final
 store 负责检查并清位；普通 store 则有意保留默认的
@@ -453,6 +464,19 @@ store 负责检查并清位；普通 store 则有意保留默认的
 多消费者生命周期，因此 PyPTO 不对外提供该阶段。编译器会双向校验所支持的
 final 配对：应绑定 final 生产者的结果，并在同一个直线控制流区域内存储这个
 精确值。缺失或错配的配对会在代码生成前被拒绝，因为它原本会导致设备静默挂死。
+在配对 store 清除 flag 之前，只允许普通 SSA 别名转发 final 结果，其他操作
+均不得消费它。这也避免 view 或 copy 隐藏不安全的累加器复用。同一个分支或循环体内
+完整配对是受支持的；尚未排空的 final 结果跨分支、循环或 scope 边界则会被拒绝。
+[`AutoTileMatmulL0`](../passes/19-auto_tile_matmul_l0.md) 保留该契约：中间 K 分块
+使用 `Partial`，只有最后一个分块使用 `Final`。显式阶段不会删除其他自动插入的同步。
+
+存储检查遵循注册的原地操作与视图关系，包括 Final 更新之前创建的别名，以及
+直线代码中的 tuple 转发和嵌套 tuple 投影。分支选择保留可能来源，同时保留
+各个源累加器的独立身份。如果 tuple 在分支汇合、循环携带或不透明返回值处
+无法确定来源，且可能包含 Acc 存储（包括尚未确定的内存空间），使用 Final
+协议的函数会被拒绝。应将其中的 tile 拆成独立别名或 tile 循环参数。已知为
+非 Acc 的 tile tuple、纯标量 tuple 和不使用该协议的函数不受影响。存储分析
+仅在遇到 Final 生产者时建立；没有匹配生产者的 Final store 始终会被检查。
 
 ## Python 用法
 
