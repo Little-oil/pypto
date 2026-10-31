@@ -194,9 +194,13 @@ def test_runtime_predicate_branches_over_both_forms():
     )
 
 
-@pytest.mark.parametrize("phase", [pl.AccPhase.Unspecified, pl.AccPhase.Partial, pl.AccPhase.Final])
-@pytest.mark.parametrize("init_cond", [None, True, False], ids=["accumulate", "initialize", "keep"])
-@pytest.mark.parametrize("tf32_mode", [None, "round_even", "round_away"])
+# Cover phase/init semantics independently, then combine both TF32 modes with
+# the initializing and accumulating instructions; their Cartesian product adds no branch.
+@pytest.mark.parametrize(
+    "phase, init_cond, tf32_mode",
+    [(phase, init, None) for phase in pl.AccPhase for init in (None, True, False)]
+    + [(pl.AccPhase.Final, init, mode) for init in (True, False) for mode in ("round_even", "round_away")],
+)
 def test_matmul_acc_literal_init_cond_preserves_phase(phase, init_cond, tf32_mode):
     """Folding init_cond must keep the phase on the selected MAD instruction."""
     if tf32_mode is not None:
@@ -234,8 +238,15 @@ def test_matmul_acc_literal_init_cond_preserves_phase(phase, init_cond, tf32_mod
     assert ("#pto<st_phase final>" in mlir) == (phase == pl.AccPhase.Final)
 
 
-@pytest.mark.parametrize("phase", [pl.AccPhase.Partial, pl.AccPhase.Final])
-@pytest.mark.parametrize("tf32_mode", [None, "round_even", "round_away"])
+@pytest.mark.parametrize(
+    "phase, tf32_mode",
+    [
+        (pl.AccPhase.Partial, None),
+        (pl.AccPhase.Final, None),
+        (pl.AccPhase.Final, "round_even"),
+        (pl.AccPhase.Final, "round_away"),
+    ],
+)
 def test_matmul_acc_runtime_init_cond_preserves_phase_on_both_arms(phase, tf32_mode):
     """Both runtime branches execute the same producer-side unit-flag protocol."""
     if tf32_mode is not None:

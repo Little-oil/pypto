@@ -60,11 +60,6 @@ With `is_binary=True`, the converter creates Vec scratch of shape `[ceil(M/2), N
 strategy attribute is consumed here; codegen selects `isBinary=true` from
 the extra Tile operand.
 
-`tensor.cmp` lowers to a packed `tile.cmp`/`tile.cmps` predicate followed by
-`tile.sel` over materialized one/zero tiles. Those value tiles retain the
-comparison input's logical valid region, including dynamic rows and columns;
-rounding predicate storage to whole bytes must not widen that region.
-
 ## API
 
 | C++ | Python | Level |

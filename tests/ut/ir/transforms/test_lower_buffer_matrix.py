@@ -533,9 +533,14 @@ def test_matmul_kwargs_are_rejected_rather_than_dropped():
         _lower_planned(kernel.program(), passes.MemoryPlanner.PTOAS)
 
 
-@pytest.mark.parametrize("phase", [pl.AccPhase.Unspecified, pl.AccPhase.Partial, pl.AccPhase.Final])
+# Phase rejection is independent of rounding. Test all phases without TF32,
+# and both supported rounding modes on the accepted default-phase path.
+@pytest.mark.parametrize(
+    "phase, tf32_mode",
+    [(phase, None) for phase in pl.AccPhase]
+    + [(pl.AccPhase.Unspecified, mode) for mode in ("round_even", "round_away")],
+)
 @pytest.mark.parametrize("accumulate", [False, True], ids=["base", "acc"])
-@pytest.mark.parametrize("tf32_mode", [None, "round_even", "round_away"])
 def test_explicit_matrix_lowering_rejects_phases_it_cannot_preserve(phase, accumulate, tf32_mode):
     """The direct lowering API must reject synchronization absent from BufferIR."""
     kernel = _PlannedMatrixKernel()

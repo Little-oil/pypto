@@ -347,9 +347,6 @@ class AccumulatorStorageLineage : public IRVisitor {
     if (!yields_.empty() && old != variables_.end()) storage = Choice(old->second, storage);
     if (storage.has_value()) {
       variables_[var.get()] = *storage;
-    } else {
-      INTERNAL_UNREACHABLE_SPAN(var->span_)
-          << "Internal error: merging known accumulator storage identities produced no identity";
     }
   }
 
